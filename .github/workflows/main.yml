@@ -56,13 +56,13 @@ on:
         required: true
         default: "true"
       failed_deal_stage_ids:
-        description: "STAGE_ID провальных стадий через запятую. Обычно LOSE,C0:LOSE"
+        description: "STAGE_ID провальных стадий через запятую. Обычно LOSE"
         required: true
-        default: "LOSE,C0:LOSE"
+        default: "LOSE"
       failed_deal_reason_fields:
-        description: "Поля причины провала через запятую. Если причина в кастомном UF — указать его первым"
+        description: "Поля причины провала через запятую. Для текущей воронки: UF_CRM_1779448756033"
         required: true
-        default: "UF_CRM_LOST_REASON,UF_CRM_FAIL_REASON,LOSE_REASON,COMMENTS"
+        default: "UF_CRM_1779448756033"
       max_consecutive_page_errors:
         description: "Сколько подряд ошибок страниц допускаем перед остановкой"
         required: true
@@ -100,8 +100,8 @@ jobs:
       EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS: ${{ vars.EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS || '5' }}
       BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER: ${{ vars.BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER || '15' }}
       BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR: ${{ vars.BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR || 'true' }}
-      BITRIX_FAILED_DEAL_STAGE_IDS: ${{ vars.BITRIX_FAILED_DEAL_STAGE_IDS || 'LOSE,C0:LOSE' }}
-      BITRIX_FAILED_DEAL_REASON_FIELDS: ${{ vars.BITRIX_FAILED_DEAL_REASON_FIELDS || 'UF_CRM_LOST_REASON,UF_CRM_FAIL_REASON,LOSE_REASON,COMMENTS' }}
+      BITRIX_FAILED_DEAL_STAGE_IDS: ${{ vars.BITRIX_FAILED_DEAL_STAGE_IDS || 'LOSE' }}
+      BITRIX_FAILED_DEAL_REASON_FIELDS: ${{ vars.BITRIX_FAILED_DEAL_REASON_FIELDS || 'UF_CRM_1779448756033' }}
 
     steps:
       - name: Checkout repository
@@ -141,8 +141,8 @@ jobs:
             DEAL_STAGE_ID="${{ vars.BITRIX_DEAL_STAGE_ID || 'NEW' }}"
             ASSIGNMENT_LIMIT_PER_MANAGER="${{ vars.BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER || '15' }}"
             INHERIT_FAILED_DEALS_BY_DIRECTOR="${{ vars.BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR || 'true' }}"
-            FAILED_DEAL_STAGE_IDS="${{ vars.BITRIX_FAILED_DEAL_STAGE_IDS || 'LOSE,C0:LOSE' }}"
-            FAILED_DEAL_REASON_FIELDS="${{ vars.BITRIX_FAILED_DEAL_REASON_FIELDS || 'UF_CRM_LOST_REASON,UF_CRM_FAIL_REASON,LOSE_REASON,COMMENTS' }}"
+            FAILED_DEAL_STAGE_IDS="${{ vars.BITRIX_FAILED_DEAL_STAGE_IDS || 'LOSE' }}"
+            FAILED_DEAL_REASON_FIELDS="${{ vars.BITRIX_FAILED_DEAL_REASON_FIELDS || 'UF_CRM_1779448756033' }}"
             MAX_CONSECUTIVE_PAGE_ERRORS="${{ vars.EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS || '5' }}"
           else
             PAGES="${{ inputs.pages }}"
