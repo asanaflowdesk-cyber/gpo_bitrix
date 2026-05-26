@@ -31,6 +31,18 @@ class BitrixPipelineConfig:
     requisite_bin_field: str = "RQ_BIN"
     dry_run: bool = False
     assignment_limit_per_manager: int = 15
+    inherit_failed_deals_by_director: bool = True
+    failed_deal_stage_ids: str = "LOSE,C0:LOSE"
+    failed_deal_reason_fields: str = "UF_CRM_LOST_REASON,UF_CRM_FAIL_REASON,LOSE_REASON,COMMENTS"
+
+
+@dataclass(slots=True)
+class FailedDealInheritance:
+    stage_id: str
+    reason: str | None = None
+    reason_field: str | None = None
+    source_deal_id: str | None = None
+    source_deal_title: str | None = None
 
 
 class BitrixPipeline:
@@ -39,6 +51,8 @@ class BitrixPipeline:
         self.config = config
         self._director_contact_cache: dict[str, str] = {}
         self._eqazyna_companies_cache: list[dict[str, Any]] | None = None
+        self._eqazyna_deals_cache: list[dict[str, Any]] | None = None
+        self._failed_deal_by_director_cache: dict[str, FailedDealInheritance | None] = {}
         # Per-run assignment memory: one BIN / one director package must keep one manager
         # even when several e-Qazyna applications are processed in the same GitHub run.
         self._assignment_cache: dict[str, tuple[int, str]] = {}
@@ -69,6 +83,7 @@ class BitrixPipeline:
             else:
                 company_fields = self._company_fields(app, enrichment, responsible_id=target_responsible_id)
                 if self.config.dry_run:
+                    failed_inheritance = self._failed_deal_inheritance_for_director(enrichment.director)
                     return ProcessResult(
                         app,
                         enrichment,
@@ -78,6 +93,9 @@ class BitrixPipeline:
                         assigned_by_id=target_responsible_id,
                         assigned_by_name=self._user_name(target_responsible_id),
                         assignment_reason=assignment_reason,
+                        inherited_failed_stage_id=failed_inheritance.stage_id if failed_inheritance else None,
+                        inherited_failed_reason=failed_inheritance.reason if failed_inheritance else None,
+                        inherited_failed_from_deal_id=failed_inheritance.source_deal_id if failed_inheritance else None,
                     )
                 company_id = self.client.create_company(company_fields)
                 company_created = True
@@ -113,7 +131,8 @@ class BitrixPipeline:
                     assignment_reason=assignment_reason,
                 )
 
-            deal_fields = self._deal_fields(app, enrichment, company_id, responsible_id=target_responsible_id)
+            failed_inheritance = self._failed_deal_inheritance_for_director(enrichment.director)
+            deal_fields = self._deal_fields(app, enrichment, company_id, responsible_id=target_responsible_id, failed_inheritance=failed_inheritance)
             if self.config.dry_run:
                 return ProcessResult(
                     app,
@@ -124,6 +143,9 @@ class BitrixPipeline:
                     assigned_by_id=target_responsible_id,
                     assigned_by_name=self._user_name(target_responsible_id),
                     assignment_reason=assignment_reason,
+                    inherited_failed_stage_id=failed_inheritance.stage_id if failed_inheritance else None,
+                    inherited_failed_reason=failed_inheritance.reason if failed_inheritance else None,
+                    inherited_failed_from_deal_id=failed_inheritance.source_deal_id if failed_inheritance else None,
                 )
 
             deal_id = self.client.create_deal(deal_fields)
@@ -149,6 +171,9 @@ class BitrixPipeline:
                 assigned_by_id=target_responsible_id,
                 assigned_by_name=self._user_name(target_responsible_id),
                 assignment_reason=assignment_reason,
+                inherited_failed_stage_id=failed_inheritance.stage_id if failed_inheritance else None,
+                inherited_failed_reason=failed_inheritance.reason if failed_inheritance else None,
+                inherited_failed_from_deal_id=failed_inheritance.source_deal_id if failed_inheritance else None,
             )
         except Exception as exc:  # noqa: BLE001 - log per row instead of failing whole export
             return ProcessResult(app, enrichment, action="error", error=str(exc))
@@ -320,6 +345,14 @@ class BitrixPipeline:
                     },
                 )
         return self._eqazyna_companies_cache
+
+    def _list_eqazyna_deals_cached(self) -> list[dict[str, Any]]:
+        if self._eqazyna_deals_cache is None:
+            if not self.client:
+                self._eqazyna_deals_cache = []
+            else:
+                self._eqazyna_deals_cache = self.client.list_eqazyna_deals()
+        return self._eqazyna_deals_cache
 
     def _package_owner_by_director(self, director: str | None) -> tuple[int | None, str | None]:
         normalized_director = _normalize_text(director or "")
@@ -540,7 +573,111 @@ class BitrixPipeline:
             fields["ASSIGNED_BY_ID"] = responsible
         return fields
 
-    def _deal_fields(self, app: Application, enr: CompanyEnrichment, company_id: str, responsible_id: int | None = None) -> dict[str, object]:
+    def _failed_stage_ids(self) -> set[str]:
+        raw = self.config.failed_deal_stage_ids or ""
+        return {part.strip().upper() for part in raw.split(",") if part.strip()}
+
+    def _failed_reason_fields(self) -> list[str]:
+        raw = self.config.failed_deal_reason_fields or ""
+        fields = [part.strip() for part in raw.split(",") if part.strip()]
+        return fields or ["COMMENTS"]
+
+    def _string_value(self, value: Any) -> str | None:
+        if value in (None, "", [], {}):
+            return None
+        if isinstance(value, str):
+            text = value.strip()
+            return text or None
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, list):
+            parts = [self._string_value(item) for item in value]
+            text = "; ".join(part for part in parts if part)
+            return text or None
+        if isinstance(value, dict):
+            for key in ("VALUE", "value", "TEXT", "text", "NAME", "name", "TITLE", "title"):
+                if key in value:
+                    text = self._string_value(value.get(key))
+                    if text:
+                        return text
+            return str(value)
+        return str(value)
+
+    def _is_failed_deal(self, deal: dict[str, Any]) -> bool:
+        stage_id = str(deal.get("STAGE_ID") or "").strip().upper()
+        semantic = str(deal.get("STAGE_SEMANTIC_ID") or "").strip().upper()
+        if semantic == "F":
+            return True
+        if stage_id and stage_id in self._failed_stage_ids():
+            return True
+        return False
+
+    def _failed_reason_from_deal(self, deal: dict[str, Any]) -> tuple[str | None, str | None]:
+        for field_name in self._failed_reason_fields():
+            value = self._string_value(deal.get(field_name))
+            if value:
+                return value, field_name
+        return None, None
+
+    def _failed_deal_inheritance_for_director(self, director: str | None) -> FailedDealInheritance | None:
+        if not self.config.inherit_failed_deals_by_director:
+            return None
+        normalized_director = _normalize_text(director or "")
+        if not normalized_director:
+            return None
+        if normalized_director in self._failed_deal_by_director_cache:
+            return self._failed_deal_by_director_cache[normalized_director]
+
+        company_ids: set[str] = set()
+        for company in self._list_eqazyna_companies_cached():
+            company_director = _extract_director_from_comments(str(company.get("COMMENTS") or ""))
+            if _normalize_text(company_director) == normalized_director:
+                if company.get("ID") is not None:
+                    company_ids.add(str(company.get("ID")))
+
+        if not company_ids:
+            self._failed_deal_by_director_cache[normalized_director] = None
+            return None
+
+        failed_deals: list[dict[str, Any]] = []
+        for deal in self._list_eqazyna_deals_cached():
+            if str(deal.get("COMPANY_ID") or "") not in company_ids:
+                continue
+            if self._is_failed_deal(deal):
+                failed_deals.append(deal)
+
+        if not failed_deals:
+            self._failed_deal_by_director_cache[normalized_director] = None
+            return None
+
+        def sort_key(deal: dict[str, Any]) -> tuple[int, str]:
+            try:
+                deal_id = int(deal.get("ID") or 0)
+            except (TypeError, ValueError):
+                deal_id = 0
+            return deal_id, str(deal.get("CLOSEDATE") or deal.get("DATE_MODIFY") or "")
+
+        source_deal = sorted(failed_deals, key=sort_key, reverse=True)[0]
+        reason, reason_field = self._failed_reason_from_deal(source_deal)
+        inheritance = FailedDealInheritance(
+            stage_id=str(source_deal.get("STAGE_ID") or ""),
+            reason=reason,
+            reason_field=reason_field,
+            source_deal_id=str(source_deal.get("ID")) if source_deal.get("ID") is not None else None,
+            source_deal_title=self._string_value(source_deal.get("TITLE")),
+        )
+        self._failed_deal_by_director_cache[normalized_director] = inheritance
+        return inheritance
+
+    def _deal_fields(
+        self,
+        app: Application,
+        enr: CompanyEnrichment,
+        company_id: str,
+        responsible_id: int | None = None,
+        failed_inheritance: FailedDealInheritance | None = None,
+    ) -> dict[str, object]:
+        comments = build_deal_comment(app, enr)
         fields: dict[str, object] = {
             "TITLE": build_deal_title(app, enr),
             "COMPANY_ID": int(company_id),
@@ -548,12 +685,26 @@ class BitrixPipeline:
             "STAGE_ID": self.config.deal_stage_id,
             "OPENED": "Y",
             "CLOSED": "N",
-            "COMMENTS": build_deal_comment(app, enr),
+            "COMMENTS": comments,
             "ORIGINATOR_ID": "EQAZYNA",
             "ORIGIN_ID": app.application_key,
             "SOURCE_ID": "OTHER",
             "SOURCE_DESCRIPTION": "e-Qazyna minerals registry",
         }
+        if failed_inheritance:
+            fields["STAGE_ID"] = failed_inheritance.stage_id
+            fields["CLOSED"] = "Y"
+            reason_text = failed_inheritance.reason or "причина не заполнена в старой сделке"
+            fields["COMMENTS"] = (
+                f"{comments}\n\n"
+                "Автозавершение по правилу руководителя:\n"
+                f"у этого руководителя уже есть сделка в финальной стадии '{failed_inheritance.stage_id}'.\n"
+                f"Старая сделка: {failed_inheritance.source_deal_id or 'не определена'}"
+                f"{(' — ' + failed_inheritance.source_deal_title) if failed_inheritance.source_deal_title else ''}.\n"
+                f"Наследованная причина: {reason_text}"
+            )
+            if failed_inheritance.reason_field and failed_inheritance.reason_field != "COMMENTS" and failed_inheritance.reason is not None:
+                fields[failed_inheritance.reason_field] = failed_inheritance.reason
         responsible = responsible_id if responsible_id is not None else self._configured_assigned_by_id()
         if responsible:
             fields["ASSIGNED_BY_ID"] = responsible

@@ -74,3 +74,47 @@ def test_deal_fields_use_explicit_responsible_id():
     fields = pipe._deal_fields(app, enrichment, "555", responsible_id=70)
 
     assert fields["ASSIGNED_BY_ID"] == 70
+
+class FakeClientWithDeals(FakeClient):
+    def __init__(self, companies=None, deals=None):
+        super().__init__(companies)
+        self.deals = deals or []
+
+    def list_eqazyna_deals(self):
+        return list(self.deals)
+
+
+def test_new_deal_inherits_failed_stage_and_reason_by_director():
+    companies = [
+        {
+            "ID": "10",
+            "ASSIGNED_BY_ID": "74",
+            "COMMENTS": "Руководитель: ИВАНОВ ИВАН ИВАНОВИЧ",
+        }
+    ]
+    deals = [
+        {
+            "ID": "99",
+            "TITLE": "Старая проваленная сделка",
+            "COMPANY_ID": "10",
+            "STAGE_ID": "LOSE",
+            "STAGE_SEMANTIC_ID": "F",
+            "COMMENTS": "Причина отказа: нецелевой клиент",
+        }
+    ]
+    pipe = BitrixPipeline(
+        client=FakeClientWithDeals(companies, deals),  # type: ignore[arg-type]
+        config=BitrixPipelineConfig(assigned_by_id="36"),
+    )
+    app = _app("222222222222")
+    enrichment = CompanyEnrichment(bin=app.bin, name=app.applicant_name, director="ИВАНОВ ИВАН ИВАНОВИЧ")
+
+    inheritance = pipe._failed_deal_inheritance_for_director(enrichment.director)
+    fields = pipe._deal_fields(app, enrichment, "555", responsible_id=74, failed_inheritance=inheritance)
+
+    assert inheritance is not None
+    assert inheritance.stage_id == "LOSE"
+    assert inheritance.source_deal_id == "99"
+    assert fields["STAGE_ID"] == "LOSE"
+    assert fields["CLOSED"] == "Y"
+    assert "Причина отказа: нецелевой клиент" in str(fields["COMMENTS"])

@@ -60,6 +60,9 @@ class ProcessResult:
     assigned_by_id: Optional[int] = None
     assigned_by_name: Optional[str] = None
     assignment_reason: Optional[str] = None
+    inherited_failed_stage_id: Optional[str] = None
+    inherited_failed_reason: Optional[str] = None
+    inherited_failed_from_deal_id: Optional[str] = None
     error: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -96,6 +99,9 @@ class ProcessResult:
             "assigned_by_id": self.assigned_by_id,
             "assigned_by_name": self.assigned_by_name,
             "assignment_reason": self.assignment_reason,
+            "inherited_failed_stage_id": self.inherited_failed_stage_id,
+            "inherited_failed_reason": self.inherited_failed_reason,
+            "inherited_failed_from_deal_id": self.inherited_failed_from_deal_id,
             "error": self.error,
             "source_url": self.app.source_url,
         }

@@ -35,6 +35,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lead-status-id", default=os.getenv("BITRIX_LEAD_STATUS_ID", "NEW"))
     parser.add_argument("--assigned-by-id", default=os.getenv("BITRIX_ASSIGNED_BY_ID") or None)
     parser.add_argument("--assignment-limit-per-manager", type=int, default=int(os.getenv("BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER", "15")))
+    parser.add_argument("--inherit-failed-deals-by-director", default=os.getenv("BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR", "true"), help="true = new deals inherit failed final stage/reason from old deals for the same director")
+    parser.add_argument("--failed-deal-stage-ids", default=os.getenv("BITRIX_FAILED_DEAL_STAGE_IDS", "LOSE,C0:LOSE"), help="Comma-separated failed deal STAGE_ID values. STAGE_SEMANTIC_ID=F is also treated as failed when returned by Bitrix.")
+    parser.add_argument("--failed-deal-reason-fields", default=os.getenv("BITRIX_FAILED_DEAL_REASON_FIELDS", "UF_CRM_LOST_REASON,UF_CRM_FAIL_REASON,LOSE_REASON,COMMENTS"), help="Comma-separated deal fields to copy/read as failure reason")
     parser.add_argument("--requisite-preset-id", default=os.getenv("BITRIX_REQUISITE_PRESET_ID") or None)
     parser.add_argument("--requisite-bin-field", default=os.getenv("BITRIX_REQUISITE_BIN_FIELD", "RQ_BIN"))
     parser.add_argument("--strict-page-errors", action="store_true", help="Fail the whole run if any e-Qazyna page fails")
@@ -115,6 +118,9 @@ def main() -> int:
                 requisite_bin_field=args.requisite_bin_field,
                 dry_run=args.dry_run,
                 assignment_limit_per_manager=args.assignment_limit_per_manager,
+                inherit_failed_deals_by_director=str(args.inherit_failed_deals_by_director).lower() == "true",
+                failed_deal_stage_ids=args.failed_deal_stage_ids,
+                failed_deal_reason_fields=args.failed_deal_reason_fields,
             ),
         )
 
