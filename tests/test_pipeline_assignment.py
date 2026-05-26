@@ -100,6 +100,7 @@ def test_new_deal_inherits_failed_stage_and_reason_by_director():
             "STAGE_ID": "LOSE",
             "STAGE_SEMANTIC_ID": "F",
             "COMMENTS": "Причина отказа: нецелевой клиент",
+            "UF_CRM_1779448756033": "388",
         }
     ]
     pipe = BitrixPipeline(
@@ -117,4 +118,6 @@ def test_new_deal_inherits_failed_stage_and_reason_by_director():
     assert inheritance.source_deal_id == "99"
     assert fields["STAGE_ID"] == "LOSE"
     assert fields["CLOSED"] == "Y"
-    assert "Причина отказа: нецелевой клиент" in str(fields["COMMENTS"])
+    assert inheritance.reason == "388"
+    assert fields["UF_CRM_1779448756033"] == "388"
+    assert "Наследованная причина: 388" in str(fields["COMMENTS"])

@@ -32,8 +32,8 @@ class BitrixPipelineConfig:
     dry_run: bool = False
     assignment_limit_per_manager: int = 15
     inherit_failed_deals_by_director: bool = True
-    failed_deal_stage_ids: str = "LOSE,C0:LOSE"
-    failed_deal_reason_fields: str = "UF_CRM_LOST_REASON,UF_CRM_FAIL_REASON,LOSE_REASON,COMMENTS"
+    failed_deal_stage_ids: str = "LOSE"
+    failed_deal_reason_fields: str = "UF_CRM_1779448756033"
 
 
 @dataclass(slots=True)
