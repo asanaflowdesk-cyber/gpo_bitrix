@@ -1,0 +1,86 @@
+name: Update company phones by BIN
+
+run-name: >-
+  Update company phones by BIN / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_path:
+        description: "Путь к XLSX/CSV файлу с колонками BIN и MOBILE"
+        required: true
+        default: "imports/company_phones.xlsx"
+      dry_run:
+        description: "Тест без записи в Bitrix"
+        required: true
+        default: "true"
+      force:
+        description: "Повторно обновлять БИНы, даже если они уже отмечены как обработанные"
+        required: true
+        default: "false"
+      source_label:
+        description: "Источник для блока комментария"
+        required: false
+        default: "файл BIN/MOBILE"
+
+permissions:
+  contents: read
+
+jobs:
+  update-company-phones:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+      BITRIX_REQUISITE_BIN_FIELD: ${{ vars.BITRIX_REQUISITE_BIN_FIELD || 'RQ_BIN' }}
+      REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Update company phones
+        run: |
+          mkdir -p exports
+
+          ARGS=(
+            python -m eqazyna_bitrix.update_company_phones
+            --file "${{ inputs.file_path }}"
+            --source-label "${{ inputs.source_label }}"
+            --out "exports/update_company_phones_log.json"
+            --csv-out "exports/update_company_phones_log.csv"
+          )
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+
+          if [ "${{ inputs.force }}" = "true" ]; then
+            ARGS+=(--force)
+          fi
+
+          "${ARGS[@]}"
+
+          ls -lah exports
+
+      - name: Upload phone update logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-company-phones-log
+          path: |
+            exports/*.json
+            exports/*.csv
+          if-no-files-found: ignore
+          retention-days: 14
