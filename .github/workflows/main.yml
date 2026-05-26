@@ -1,0 +1,203 @@
+name: e-Qazyna to Bitrix CRM AUTO
+
+on:
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: "Сколько свежих страниц e-Qazyna проверить"
+        required: true
+        default: "3"
+      page_start:
+        description: "С какой страницы начать"
+        required: true
+        default: "1"
+      page_list:
+        description: "Конкретные страницы, например 16,22,31-35. Обычно пусто."
+        required: false
+        default: ""
+      doc_type:
+        description: "Тип документа"
+        required: true
+        default: "Заявка на разведку ТПИ"
+      statuses:
+        description: "Статусы через запятую"
+        required: true
+        default: "Отправлено на рассмотрение,Принято"
+      min_created_date:
+        description: "Минимальная дата создания, YYYY-MM-DD. Обычно пусто."
+        required: false
+        default: ""
+      push_bitrix:
+        description: "true = записывать результат в Bitrix"
+        required: true
+        default: "true"
+      dry_run:
+        description: "true = тест без записи, false = запись в Bitrix"
+        required: true
+        default: "true"
+      no_egov:
+        description: "true = отключить eGov-обогащение"
+        required: true
+        default: "false"
+      deal_category_id:
+        description: "ID воронки сделки"
+        required: true
+        default: "0"
+      deal_stage_id:
+        description: "Стадия сделки"
+        required: true
+        default: "NEW"
+      assignment_limit_per_manager:
+        description: "Мягкий лимит компаний на менеджера"
+        required: true
+        default: "15"
+      max_consecutive_page_errors:
+        description: "Сколько подряд ошибок страниц допускаем перед остановкой"
+        required: true
+        default: "5"
+
+  schedule:
+    # UTC. Алматы/Казахстан = UTC+5. Каждые 5 минут с 06:00 до 20:59 Алматы.
+    - cron: "*/5 1-15 * * *"
+
+concurrency:
+  group: eqazyna-to-bitrix
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  eqazyna-to-bitrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      EGOV_API_KEY: ${{ secrets.EGOV_API_KEY }}
+      BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+      BITRIX_ASSIGNED_BY_ID: ${{ vars.BITRIX_ASSIGNED_BY_ID }}
+      BITRIX_REQUISITE_PRESET_ID: ${{ vars.BITRIX_REQUISITE_PRESET_ID }}
+      BITRIX_REQUISITE_BIN_FIELD: ${{ vars.BITRIX_REQUISITE_BIN_FIELD || 'RQ_BIN' }}
+      EGOV_ALLOWED_OKED_PREFIXES: ${{ vars.EGOV_ALLOWED_OKED_PREFIXES || '05,07,08,09' }}
+      EGOV_MIN_NAME_MATCH: ${{ vars.EGOV_MIN_NAME_MATCH || '75' }}
+      EGOV_RESULT_SIZE: ${{ vars.EGOV_RESULT_SIZE || '20' }}
+      REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
+      EQAZYNA_POLITE_DELAY_SECONDS: ${{ vars.EQAZYNA_POLITE_DELAY_SECONDS || '1.2' }}
+      EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS: ${{ vars.EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS || '5' }}
+      BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER: ${{ vars.BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER || '15' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Preflight checks
+        run: |
+          python scripts/validate_repo.py
+          python -m eqazyna_bitrix.main --help >/dev/null
+
+      - name: Run parser, enrichment and Bitrix distribution
+        run: |
+          set -euo pipefail
+          mkdir -p exports
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            PAGES="3"
+            PAGE_START="1"
+            PAGE_LIST=""
+            DOC_TYPE="Заявка на разведку ТПИ"
+            STATUSES="Отправлено на рассмотрение,Принято"
+            MIN_CREATED_DATE=""
+            PUSH_BITRIX="true"
+            DRY_RUN="false"
+            NO_EGOV="false"
+            DEAL_CATEGORY_ID="${{ vars.BITRIX_DEAL_CATEGORY_ID || '0' }}"
+            DEAL_STAGE_ID="${{ vars.BITRIX_DEAL_STAGE_ID || 'NEW' }}"
+            ASSIGNMENT_LIMIT_PER_MANAGER="${{ vars.BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER || '15' }}"
+            MAX_CONSECUTIVE_PAGE_ERRORS="${{ vars.EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS || '5' }}"
+          else
+            PAGES="${{ inputs.pages }}"
+            PAGE_START="${{ inputs.page_start }}"
+            PAGE_LIST="${{ inputs.page_list }}"
+            DOC_TYPE="${{ inputs.doc_type }}"
+            STATUSES="${{ inputs.statuses }}"
+            MIN_CREATED_DATE="${{ inputs.min_created_date }}"
+            PUSH_BITRIX="${{ inputs.push_bitrix }}"
+            DRY_RUN="${{ inputs.dry_run }}"
+            NO_EGOV="${{ inputs.no_egov }}"
+            DEAL_CATEGORY_ID="${{ inputs.deal_category_id }}"
+            DEAL_STAGE_ID="${{ inputs.deal_stage_id }}"
+            ASSIGNMENT_LIMIT_PER_MANAGER="${{ inputs.assignment_limit_per_manager }}"
+            MAX_CONSECUTIVE_PAGE_ERRORS="${{ inputs.max_consecutive_page_errors }}"
+          fi
+
+          if [ "$PUSH_BITRIX" = "true" ] && [ "$DRY_RUN" != "true" ] && [ -z "${BITRIX_WEBHOOK_URL:-}" ]; then
+            echo "ERROR: BITRIX_WEBHOOK_URL secret is empty. Cannot write to Bitrix." >&2
+            exit 1
+          fi
+
+          echo "EVENT=${{ github.event_name }}"
+          echo "PAGES=$PAGES PAGE_START=$PAGE_START PAGE_LIST=$PAGE_LIST"
+          echo "PUSH_BITRIX=$PUSH_BITRIX DRY_RUN=$DRY_RUN NO_EGOV=$NO_EGOV"
+          echo "CRM_MODE=deal"
+          echo "DEAL_CATEGORY_ID=$DEAL_CATEGORY_ID DEAL_STAGE_ID=$DEAL_STAGE_ID"
+          echo "ASSIGNMENT_LIMIT_PER_MANAGER=$ASSIGNMENT_LIMIT_PER_MANAGER"
+
+          ARGS=(
+            python -m eqazyna_bitrix.main
+            --pages "$PAGES"
+            --page-start "$PAGE_START"
+            --doc-type "$DOC_TYPE"
+            --statuses "$STATUSES"
+            --crm-mode "deal"
+            --deal-category-id "$DEAL_CATEGORY_ID"
+            --deal-stage-id "$DEAL_STAGE_ID"
+            --assignment-limit-per-manager "$ASSIGNMENT_LIMIT_PER_MANAGER"
+            --max-consecutive-page-errors "$MAX_CONSECUTIVE_PAGE_ERRORS"
+            --out "exports/eqazyna_bitrix_log.xlsx"
+            --json-out "exports/eqazyna_bitrix_log.json"
+          )
+
+          if [ -n "$PAGE_LIST" ]; then ARGS+=(--page-list "$PAGE_LIST"); fi
+          if [ -n "$MIN_CREATED_DATE" ]; then ARGS+=(--min-created-date "$MIN_CREATED_DATE"); fi
+          if [ "$PUSH_BITRIX" = "true" ]; then ARGS+=(--push-bitrix); fi
+          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ "$NO_EGOV" = "true" ]; then ARGS+=(--no-egov); fi
+
+          "${ARGS[@]}"
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path('exports/eqazyna_bitrix_log.json')
+          if p.exists():
+              data = json.loads(p.read_text(encoding='utf-8'))
+              rows = data if isinstance(data, list) else data.get('results', [])
+              errors = [r for r in rows if r.get('error') or str(r.get('action', '')).lower() == 'error']
+              print(f"JSON_SUMMARY rows={len(rows)} errors={len(errors)}")
+              for row in errors[:10]:
+                  print('ERROR_ROW', row)
+          PY
+          ls -lah exports
+
+      - name: Upload run logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eqazyna-bitrix-run-log
+          path: |
+            exports/*.xlsx
+            exports/*.json
+          if-no-files-found: ignore
+          retention-days: 14

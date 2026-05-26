@@ -1,0 +1,95 @@
+name: Manual director package fix
+
+run-name: Manual director package fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true = тест без записи, false = запись в Bitrix"
+        required: true
+        default: "true"
+      include_closed_deals:
+        description: "true = менять закрытые сделки тоже. Обычно false"
+        required: true
+        default: "false"
+      sync_contacts:
+        description: "true = также менять ответственных у связанных контактов. Медленнее"
+        required: true
+        default: "false"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  manual-director-fix-packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+      REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate repository config
+        run: |
+          python scripts/validate_repo.py
+          python -m eqazyna_bitrix.manual_director_fix_packages --help >/dev/null
+
+      - name: Apply manual director package fixes
+        run: |
+          set -euo pipefail
+          mkdir -p exports
+
+          DRY_RUN="${{ inputs.dry_run }}"
+          INCLUDE_CLOSED_DEALS="${{ inputs.include_closed_deals }}"
+          SYNC_CONTACTS="${{ inputs.sync_contacts }}"
+
+          if [ "$DRY_RUN" != "true" ] && [ -z "${BITRIX_WEBHOOK_URL:-}" ]; then
+            echo "ERROR: BITRIX_WEBHOOK_URL secret is empty. Cannot write to Bitrix." >&2
+            exit 1
+          fi
+
+          echo "DRY_RUN=$DRY_RUN"
+          echo "INCLUDE_CLOSED_DEALS=$INCLUDE_CLOSED_DEALS"
+          echo "SYNC_CONTACTS=$SYNC_CONTACTS"
+
+          ARGS=(
+            python -m eqazyna_bitrix.manual_director_fix_packages
+            --out "exports/manual_director_fix_packages_log.json"
+            --csv-out "exports/manual_director_fix_packages_groups.csv"
+          )
+
+          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ "$INCLUDE_CLOSED_DEALS" = "true" ]; then ARGS+=(--include-closed-deals); fi
+          if [ "$SYNC_CONTACTS" = "true" ]; then ARGS+=(--sync-contacts); fi
+
+          "${ARGS[@]}"
+          ls -lah exports
+
+      - name: Upload manual director fix logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manual-director-fix-packages-log
+          path: |
+            exports/*.json
+            exports/*.csv
+          if-no-files-found: ignore
+          retention-days: 14

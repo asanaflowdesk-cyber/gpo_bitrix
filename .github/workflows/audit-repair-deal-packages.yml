@@ -1,0 +1,137 @@
+name: Audit and repair Bitrix deal packages
+
+run-name: Audit and repair Bitrix deal packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true = тест без записи, false = запись в Bitrix"
+        required: true
+        default: "true"
+      source_responsible_ids:
+        description: "ID технических/исходных ответственных через запятую. Алёна = 36,44"
+        required: true
+        default: "36,44"
+      include_closed_deals:
+        description: "true = менять закрытые сделки тоже. Обычно false"
+        required: true
+        default: "false"
+      sync_contacts:
+        description: "true = также менять ответственных у связанных контактов. Медленнее"
+        required: true
+        default: "false"
+      repair_scope:
+        description: "split_and_hard / split_only / hard_bin_only / all_actions"
+        required: true
+        default: "all_actions"
+      duplicate_hard_bin_policy:
+        description: "skip / current_owner_majority"
+        required: true
+        default: "skip"
+      limit_per_manager_companies:
+        description: "Мягкий лимит компаний для свободных назначений. 0 = не учитывать"
+        required: true
+        default: "15"
+      limit_per_manager_active_deals:
+        description: "Мягкий лимит активных заявок для свободных назначений. 0 = не учитывать"
+        required: true
+        default: "80"
+      seed:
+        description: "Seed для повторяемого выбора при ничьей. Обычно пусто"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  audit-repair-deal-packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+      REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate repository config
+        run: |
+          python scripts/validate_repo.py
+          python -m eqazyna_bitrix.audit_repair_deal_packages --help >/dev/null
+
+      - name: Audit and repair package owners
+        run: |
+          set -euo pipefail
+          mkdir -p exports
+
+          DRY_RUN="${{ inputs.dry_run }}"
+          SOURCE_RESPONSIBLE_IDS="${{ inputs.source_responsible_ids }}"
+          INCLUDE_CLOSED_DEALS="${{ inputs.include_closed_deals }}"
+          SYNC_CONTACTS="${{ inputs.sync_contacts }}"
+          REPAIR_SCOPE="${{ inputs.repair_scope }}"
+          DUPLICATE_HARD_BIN_POLICY="${{ inputs.duplicate_hard_bin_policy }}"
+          LIMIT_PER_MANAGER_COMPANIES="${{ inputs.limit_per_manager_companies }}"
+          LIMIT_PER_MANAGER_ACTIVE_DEALS="${{ inputs.limit_per_manager_active_deals }}"
+          SEED="${{ inputs.seed }}"
+
+          if [ "$DRY_RUN" != "true" ] && [ -z "${BITRIX_WEBHOOK_URL:-}" ]; then
+            echo "ERROR: BITRIX_WEBHOOK_URL secret is empty. Cannot write to Bitrix." >&2
+            exit 1
+          fi
+
+          echo "DRY_RUN=$DRY_RUN"
+          echo "SOURCE_RESPONSIBLE_IDS=$SOURCE_RESPONSIBLE_IDS"
+          echo "INCLUDE_CLOSED_DEALS=$INCLUDE_CLOSED_DEALS"
+          echo "SYNC_CONTACTS=$SYNC_CONTACTS"
+          echo "REPAIR_SCOPE=$REPAIR_SCOPE"
+          echo "DUPLICATE_HARD_BIN_POLICY=$DUPLICATE_HARD_BIN_POLICY"
+          echo "LIMIT_PER_MANAGER_COMPANIES=$LIMIT_PER_MANAGER_COMPANIES"
+          echo "LIMIT_PER_MANAGER_ACTIVE_DEALS=$LIMIT_PER_MANAGER_ACTIVE_DEALS"
+          echo "SEED=$SEED"
+
+          ARGS=(
+            python -m eqazyna_bitrix.audit_repair_deal_packages
+            --source-responsible-ids "$SOURCE_RESPONSIBLE_IDS"
+            --repair-scope "$REPAIR_SCOPE"
+            --duplicate-hard-bin-policy "$DUPLICATE_HARD_BIN_POLICY"
+            --limit-per-manager-companies "$LIMIT_PER_MANAGER_COMPANIES"
+            --limit-per-manager-active-deals "$LIMIT_PER_MANAGER_ACTIVE_DEALS"
+            --out "exports/audit_repair_deal_packages_log.json"
+            --csv-out "exports/audit_repair_deal_packages_groups.csv"
+          )
+
+          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ "$INCLUDE_CLOSED_DEALS" = "true" ]; then ARGS+=(--include-closed-deals); fi
+          if [ "$SYNC_CONTACTS" = "true" ]; then ARGS+=(--sync-contacts); fi
+          if [ -n "$SEED" ]; then ARGS+=(--seed "$SEED"); fi
+
+          "${ARGS[@]}"
+          ls -lah exports
+
+      - name: Upload audit/repair logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-repair-deal-packages-log
+          path: |
+            exports/*.json
+            exports/*.csv
+          if-no-files-found: ignore
+          retention-days: 14
