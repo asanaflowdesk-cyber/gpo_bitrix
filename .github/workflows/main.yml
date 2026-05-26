@@ -51,6 +51,18 @@ on:
         description: "Мягкий лимит компаний на менеджера"
         required: true
         default: "15"
+      inherit_failed_deals_by_director:
+        description: "true = новая сделка наследует провальную финальную стадию и причину по тому же руководителю"
+        required: true
+        default: "true"
+      failed_deal_stage_ids:
+        description: "STAGE_ID провальных стадий через запятую. Обычно LOSE,C0:LOSE"
+        required: true
+        default: "LOSE,C0:LOSE"
+      failed_deal_reason_fields:
+        description: "Поля причины провала через запятую. Если причина в кастомном UF — указать его первым"
+        required: true
+        default: "UF_CRM_LOST_REASON,UF_CRM_FAIL_REASON,LOSE_REASON,COMMENTS"
       max_consecutive_page_errors:
         description: "Сколько подряд ошибок страниц допускаем перед остановкой"
         required: true
@@ -87,6 +99,9 @@ jobs:
       EQAZYNA_POLITE_DELAY_SECONDS: ${{ vars.EQAZYNA_POLITE_DELAY_SECONDS || '1.2' }}
       EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS: ${{ vars.EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS || '5' }}
       BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER: ${{ vars.BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER || '15' }}
+      BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR: ${{ vars.BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR || 'true' }}
+      BITRIX_FAILED_DEAL_STAGE_IDS: ${{ vars.BITRIX_FAILED_DEAL_STAGE_IDS || 'LOSE,C0:LOSE' }}
+      BITRIX_FAILED_DEAL_REASON_FIELDS: ${{ vars.BITRIX_FAILED_DEAL_REASON_FIELDS || 'UF_CRM_LOST_REASON,UF_CRM_FAIL_REASON,LOSE_REASON,COMMENTS' }}
 
     steps:
       - name: Checkout repository
@@ -125,6 +140,9 @@ jobs:
             DEAL_CATEGORY_ID="${{ vars.BITRIX_DEAL_CATEGORY_ID || '0' }}"
             DEAL_STAGE_ID="${{ vars.BITRIX_DEAL_STAGE_ID || 'NEW' }}"
             ASSIGNMENT_LIMIT_PER_MANAGER="${{ vars.BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER || '15' }}"
+            INHERIT_FAILED_DEALS_BY_DIRECTOR="${{ vars.BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR || 'true' }}"
+            FAILED_DEAL_STAGE_IDS="${{ vars.BITRIX_FAILED_DEAL_STAGE_IDS || 'LOSE,C0:LOSE' }}"
+            FAILED_DEAL_REASON_FIELDS="${{ vars.BITRIX_FAILED_DEAL_REASON_FIELDS || 'UF_CRM_LOST_REASON,UF_CRM_FAIL_REASON,LOSE_REASON,COMMENTS' }}"
             MAX_CONSECUTIVE_PAGE_ERRORS="${{ vars.EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS || '5' }}"
           else
             PAGES="${{ inputs.pages }}"
@@ -139,6 +157,9 @@ jobs:
             DEAL_CATEGORY_ID="${{ inputs.deal_category_id }}"
             DEAL_STAGE_ID="${{ inputs.deal_stage_id }}"
             ASSIGNMENT_LIMIT_PER_MANAGER="${{ inputs.assignment_limit_per_manager }}"
+            INHERIT_FAILED_DEALS_BY_DIRECTOR="${{ inputs.inherit_failed_deals_by_director }}"
+            FAILED_DEAL_STAGE_IDS="${{ inputs.failed_deal_stage_ids }}"
+            FAILED_DEAL_REASON_FIELDS="${{ inputs.failed_deal_reason_fields }}"
             MAX_CONSECUTIVE_PAGE_ERRORS="${{ inputs.max_consecutive_page_errors }}"
           fi
 
@@ -153,6 +174,9 @@ jobs:
           echo "CRM_MODE=deal"
           echo "DEAL_CATEGORY_ID=$DEAL_CATEGORY_ID DEAL_STAGE_ID=$DEAL_STAGE_ID"
           echo "ASSIGNMENT_LIMIT_PER_MANAGER=$ASSIGNMENT_LIMIT_PER_MANAGER"
+          echo "INHERIT_FAILED_DEALS_BY_DIRECTOR=$INHERIT_FAILED_DEALS_BY_DIRECTOR"
+          echo "FAILED_DEAL_STAGE_IDS=$FAILED_DEAL_STAGE_IDS"
+          echo "FAILED_DEAL_REASON_FIELDS=$FAILED_DEAL_REASON_FIELDS"
 
           ARGS=(
             python -m eqazyna_bitrix.main
@@ -164,6 +188,9 @@ jobs:
             --deal-category-id "$DEAL_CATEGORY_ID"
             --deal-stage-id "$DEAL_STAGE_ID"
             --assignment-limit-per-manager "$ASSIGNMENT_LIMIT_PER_MANAGER"
+            --inherit-failed-deals-by-director "$INHERIT_FAILED_DEALS_BY_DIRECTOR"
+            --failed-deal-stage-ids "$FAILED_DEAL_STAGE_IDS"
+            --failed-deal-reason-fields "$FAILED_DEAL_REASON_FIELDS"
             --max-consecutive-page-errors "$MAX_CONSECUTIVE_PAGE_ERRORS"
             --out "exports/eqazyna_bitrix_log.xlsx"
             --json-out "exports/eqazyna_bitrix_log.json"
