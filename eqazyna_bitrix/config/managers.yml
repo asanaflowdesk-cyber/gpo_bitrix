@@ -31,6 +31,7 @@ managers:
     active: true
   - id: 108
     name: Юлия Боровая
+    branch_id: 22
     branch: Центральный Столичный филиал
     active: true
 
