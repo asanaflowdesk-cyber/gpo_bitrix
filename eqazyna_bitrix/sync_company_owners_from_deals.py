@@ -1,603 +1,493 @@
+#!/usr/bin/env python3
+"""Audit and optionally repair Bitrix owner consistency by director package.
+
+Package rule:
+  director contact + all companies in this director's deals + all deals of this director
+  must have the same ASSIGNED_BY_ID.
+
+This script is intentionally self-contained and uses Bitrix REST directly.
+"""
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
-import re
+import sys
+import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from .bitrix_client import BitrixClient
-from .config.assignment import load_hard_bin_owners, load_manual_director_owners_raw
-from .config.managers import load_manager_config
+import requests
 
 
-ORIGINATOR_ID = "EQAZYNA"
+DEFAULT_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
+BITRIX_WEBHOOK_URL = os.getenv("BITRIX_WEBHOOK_URL", "").strip()
 
 
-def normalize_digits(value: Any) -> str:
-    return re.sub(r"\D", "", str(value or ""))
+class BitrixError(RuntimeError):
+    pass
 
 
-def normalize_bin(value: Any) -> str:
-    digits = normalize_digits(value)
-    return digits if len(digits) == 12 else ""
+def normalize_webhook(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        raise BitrixError("BITRIX_WEBHOOK_URL is empty")
+    return url.rstrip("/") + "/"
 
 
-def normalize_name(value: Any) -> str:
-    text = str(value or "").replace("Ё", "Е").replace("ё", "е")
-    text = re.sub(r"[^0-9A-Za-zА-Яа-яӘәІіҢңҒғҮүҰұҚқӨөҺһ\s-]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip().upper()
-    return text
+class Bitrix:
+    def __init__(self, webhook_url: str, timeout: int = DEFAULT_TIMEOUT) -> None:
+        self.base = normalize_webhook(webhook_url)
+        self.timeout = timeout
+        self.session = requests.Session()
+        self._user_cache: Dict[str, str] = {}
+        self._contact_cache: Dict[str, Dict[str, Any]] = {}
+        self._company_cache: Dict[str, Dict[str, Any]] = {}
 
+    def call(self, method: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+        url = self.base + method + ".json"
+        resp = self.session.post(url, json=payload or {}, timeout=self.timeout)
+        try:
+            data = resp.json()
+        except Exception:
+            raise BitrixError(f"{method}: HTTP {resp.status_code}: {resp.text[:500]}")
+        if resp.status_code >= 400 or "error" in data:
+            raise BitrixError(f"{method}: {json.dumps(data, ensure_ascii=False)[:1200]}")
+        return data.get("result")
 
-def parse_ids(raw: str) -> set[str]:
-    return {part.strip() for part in str(raw or "").split(",") if part.strip()}
+    def list_all(self, method: str, payload: Optional[Dict[str, Any]] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        payload = dict(payload or {})
+        out: List[Dict[str, Any]] = []
+        start: Any = 0
+        while True:
+            p = dict(payload)
+            p["start"] = start
+            result = self.call(method, p)
+            if isinstance(result, dict) and "items" in result:
+                items = result.get("items") or []
+                next_start = result.get("next")
+            else:
+                items = result if isinstance(result, list) else []
+                # Bitrix puts next outside result only for GET-like JSON, but with POST wrapper it is not always returned.
+                # Safe fallback: if less than 50, stop. If exactly 50, increment.
+                next_start = start + 50 if len(items) >= 50 else None
+            out.extend(items)
+            if limit and len(out) >= limit:
+                return out[:limit]
+            if next_start is None or next_start == "":
+                break
+            start = next_start
+            time.sleep(0.08)
+        return out
 
+    def get_user_name(self, user_id: Any) -> str:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return ""
+        if uid in self._user_cache:
+            return self._user_cache[uid]
+        name = f"ID {uid}"
+        try:
+            result = self.call("user.get", {"ID": uid})
+            if isinstance(result, list) and result:
+                u = result[0]
+                parts = [u.get("NAME"), u.get("LAST_NAME")]
+                email = u.get("EMAIL")
+                full = " ".join(str(x).strip() for x in parts if str(x or "").strip()).strip()
+                name = full or email or name
+        except Exception:
+            pass
+        self._user_cache[uid] = name
+        return name
 
-def user_name(user_id: Any, names: dict[int, str]) -> str:
-    text = str(user_id or "").strip()
-    if not text:
-        return ""
-    try:
-        return names.get(int(text), f"#{text}")
-    except ValueError:
-        return f"#{text}"
-
-
-def contact_fio(contact: dict[str, Any] | None) -> str:
-    if not contact:
-        return ""
-    parts = [contact.get("LAST_NAME"), contact.get("NAME"), contact.get("SECOND_NAME")]
-    return " ".join(str(p or "").strip() for p in parts if str(p or "").strip())
-
-
-def make_url_hint(entity: str, entity_id: str) -> str:
-    # Domain is intentionally not guessed. This is enough to paste after /crm/.
-    return f"/crm/{entity}/details/{entity_id}/"
-
-
-@dataclass
-class CompanyInfo:
-    id: str
-    title: str = ""
-    owner_id: str = ""
-    owner_name: str = ""
-    bins: list[str] = field(default_factory=list)
-
-
-@dataclass
-class DealInfo:
-    id: str
-    title: str = ""
-    company_id: str = ""
-    contact_id: str = ""
-    owner_id: str = ""
-    owner_name: str = ""
-    stage_id: str = ""
-    closed: str = ""
-    category_id: str = ""
-    origin_id: str = ""
-
-
-@dataclass
-class DirectorGroup:
-    contact_id: str
-    fio: str
-    contact_owner_id: str
-    contact_owner_name: str
-    deals: list[DealInfo] = field(default_factory=list)
-    companies: dict[str, CompanyInfo] = field(default_factory=dict)
-    target_owner_id: str = ""
-    target_owner_name: str = ""
-    target_reason: str = ""
-    status: str = ""
-    mismatch_count: int = 0
-    action_count: int = 0
-
-
-def load_manual_director_index() -> dict[str, str]:
-    raw = load_manual_director_owners_raw()
-    index: dict[str, str] = {}
-    for user_id, names in raw.items():
-        for name in names:
-            norm = normalize_name(name)
-            if norm:
-                index[norm] = str(user_id)
-    return index
-
-
-def list_deals(
-    bitrix: BitrixClient,
-    *,
-    only_eqazyna: bool,
-    deal_category_id: str,
-    include_closed_deals: bool,
-    max_deals: int,
-) -> list[dict[str, Any]]:
-    flt: dict[str, Any] = {}
-    if only_eqazyna:
-        flt["ORIGINATOR_ID"] = ORIGINATOR_ID
-    if deal_category_id and deal_category_id.lower() != "all":
-        flt["CATEGORY_ID"] = int(deal_category_id) if str(deal_category_id).isdigit() else deal_category_id
-    if not include_closed_deals:
-        flt["CLOSED"] = "N"
-
-    return bitrix.list_all(
-        "crm.deal.list",
-        {
-            "order": {"ID": "ASC"},
-            "filter": flt,
-            "select": [
-                "ID",
-                "TITLE",
-                "COMPANY_ID",
-                "CONTACT_ID",
-                "ASSIGNED_BY_ID",
-                "STAGE_ID",
-                "CLOSED",
-                "CATEGORY_ID",
-                "ORIGINATOR_ID",
-                "ORIGIN_ID",
-            ],
-        },
-        limit=max_deals or None,
-    )
-
-
-def get_contact(bitrix: BitrixClient, contact_id: str, cache: dict[str, dict[str, Any] | None]) -> dict[str, Any] | None:
-    contact_id = str(contact_id or "").strip()
-    if not contact_id:
-        return None
-    if contact_id not in cache:
-        result = bitrix.call("crm.contact.get", {"id": int(contact_id)})
-        cache[contact_id] = result if isinstance(result, dict) else None
-    return cache[contact_id]
-
-
-def get_company(bitrix: BitrixClient, company_id: str, cache: dict[str, dict[str, Any] | None]) -> dict[str, Any] | None:
-    company_id = str(company_id or "").strip()
-    if not company_id:
-        return None
-    if company_id not in cache:
-        cache[company_id] = bitrix.get_company(company_id)
-    return cache[company_id]
-
-
-def get_company_bins(bitrix: BitrixClient, company: dict[str, Any] | None, cache: dict[str, list[str]]) -> list[str]:
-    if not company:
-        return []
-    company_id = str(company.get("ID") or "")
-    if company_id in cache:
-        return cache[company_id]
-
-    bins: list[str] = []
-    for value in [company.get("ORIGIN_ID")]:
-        bin_value = normalize_bin(value)
-        if bin_value and bin_value not in bins:
-            bins.append(bin_value)
-
-    try:
-        requisites = bitrix.list_requisites_for_company(company_id)
-        for req in requisites:
-            for key in ("RQ_BIN", "RQ_INN"):
-                bin_value = normalize_bin(req.get(key))
-                if bin_value and bin_value not in bins:
-                    bins.append(bin_value)
-    except Exception:
-        pass
-
-    cache[company_id] = bins
-    return bins
-
-
-def is_allowed(user_id: str, allowed_ids: set[str]) -> bool:
-    return str(user_id or "").strip() in allowed_ids
-
-
-def choose_target(
-    group: DirectorGroup,
-    *,
-    manual_directors: dict[str, str],
-    hard_bin_owners: dict[str, list[int]],
-    allowed_ids: set[str],
-    source_ids: set[str],
-    target_policy: str,
-) -> tuple[str, str]:
-    # 1. Manual director fixation wins. This is the cleanest business rule.
-    manual_owner = manual_directors.get(normalize_name(group.fio))
-    if manual_owner and is_allowed(manual_owner, allowed_ids):
-        return manual_owner, "manual_director_owner"
-
-    # 2. Hard BIN if all known BINs point to exactly one same manager.
-    hard_candidates: set[str] = set()
-    hard_conflicting_bins: list[str] = []
-    for company in group.companies.values():
-        for bin_value in company.bins:
-            owners = [str(x) for x in hard_bin_owners.get(bin_value, []) if str(x) in allowed_ids]
-            if len(owners) == 1:
-                hard_candidates.add(owners[0])
-            elif len(owners) > 1:
-                hard_conflicting_bins.append(bin_value)
-    if len(hard_candidates) == 1 and not hard_conflicting_bins:
-        return next(iter(hard_candidates)), "hard_bin_owner_unique"
-
-    contact_owner = str(group.contact_owner_id or "")
-    if target_policy in {"director_owner", "rules_then_director", "rules_then_majority"}:
-        if contact_owner and contact_owner not in source_ids and is_allowed(contact_owner, allowed_ids):
-            return contact_owner, "director_contact_owner"
-
-    deal_owners = [deal.owner_id for deal in group.deals if deal.owner_id and deal.owner_id not in source_ids and is_allowed(deal.owner_id, allowed_ids)]
-    deal_counter = Counter(deal_owners)
-    if target_policy in {"unanimous_deal_owner", "rules_then_majority"}:
-        if len(deal_counter) == 1:
-            return next(iter(deal_counter.keys())), "unanimous_deal_owner"
-
-    company_owners = [company.owner_id for company in group.companies.values() if company.owner_id and company.owner_id not in source_ids and is_allowed(company.owner_id, allowed_ids)]
-    company_counter = Counter(company_owners)
-    if len(company_counter) == 1 and target_policy in {"rules_then_majority", "unanimous_company_owner"}:
-        return next(iter(company_counter.keys())), "unanimous_company_owner"
-
-    if target_policy in {"majority", "rules_then_majority"}:
-        weighted: Counter[str] = Counter()
-        if contact_owner and contact_owner not in source_ids and is_allowed(contact_owner, allowed_ids):
-            weighted[contact_owner] += 3
-        for owner_id in deal_owners:
-            weighted[owner_id] += 2
-        for owner_id in company_owners:
-            weighted[owner_id] += 1
-        if weighted:
-            top = weighted.most_common()
-            if len(top) == 1 or top[0][1] > top[1][1]:
-                return top[0][0], "weighted_majority_owner"
-
-    return "", "no_safe_target_owner"
-
-
-def build_groups(
-    bitrix: BitrixClient,
-    deals_raw: list[dict[str, Any]],
-    *,
-    user_names: dict[int, str],
-) -> dict[str, DirectorGroup]:
-    contact_cache: dict[str, dict[str, Any] | None] = {}
-    company_cache: dict[str, dict[str, Any] | None] = {}
-    company_bins_cache: dict[str, list[str]] = {}
-    groups: dict[str, DirectorGroup] = {}
-
-    for raw in deals_raw:
-        deal_id = str(raw.get("ID") or "")
-        contact_id = str(raw.get("CONTACT_ID") or "")
-        if not contact_id:
-            # Fallback for deals where Bitrix did not return primary CONTACT_ID.
+    def get_contact(self, contact_id: Any) -> Dict[str, Any]:
+        cid = str(contact_id or "").strip()
+        if not cid:
+            return {}
+        if cid not in self._contact_cache:
             try:
-                linked = bitrix.deal_contact_ids(deal_id)
-                contact_id = sorted(linked)[0] if linked else ""
+                self._contact_cache[cid] = self.call("crm.contact.get", {"id": cid}) or {}
             except Exception:
-                contact_id = ""
-        if not contact_id:
-            continue
+                self._contact_cache[cid] = {}
+        return self._contact_cache[cid]
 
-        contact = get_contact(bitrix, contact_id, contact_cache)
-        if not contact:
-            continue
+    def get_company(self, company_id: Any) -> Dict[str, Any]:
+        cid = str(company_id or "").strip()
+        if not cid:
+            return {}
+        if cid not in self._company_cache:
+            try:
+                self._company_cache[cid] = self.call("crm.company.get", {"id": cid}) or {}
+            except Exception:
+                self._company_cache[cid] = {}
+        return self._company_cache[cid]
 
-        fio = contact_fio(contact)
-        contact_owner_id = str(contact.get("ASSIGNED_BY_ID") or "")
-        if contact_id not in groups:
-            groups[contact_id] = DirectorGroup(
-                contact_id=contact_id,
-                fio=fio,
-                contact_owner_id=contact_owner_id,
-                contact_owner_name=user_name(contact_owner_id, user_names),
-            )
-        group = groups[contact_id]
+    def update_contact_owner(self, contact_id: str, owner_id: str) -> None:
+        self.call("crm.contact.update", {"id": contact_id, "fields": {"ASSIGNED_BY_ID": owner_id}})
+        self._contact_cache.pop(str(contact_id), None)
 
-        deal = DealInfo(
-            id=deal_id,
-            title=str(raw.get("TITLE") or ""),
-            company_id=str(raw.get("COMPANY_ID") or ""),
-            contact_id=contact_id,
-            owner_id=str(raw.get("ASSIGNED_BY_ID") or ""),
-            owner_name=user_name(raw.get("ASSIGNED_BY_ID"), user_names),
-            stage_id=str(raw.get("STAGE_ID") or ""),
-            closed=str(raw.get("CLOSED") or ""),
-            category_id=str(raw.get("CATEGORY_ID") or ""),
-            origin_id=str(raw.get("ORIGIN_ID") or ""),
-        )
-        group.deals.append(deal)
+    def update_company_owner(self, company_id: str, owner_id: str) -> None:
+        self.call("crm.company.update", {"id": company_id, "fields": {"ASSIGNED_BY_ID": owner_id}})
+        self._company_cache.pop(str(company_id), None)
 
-        company_id = deal.company_id
-        if company_id and company_id not in group.companies:
-            company = get_company(bitrix, company_id, company_cache)
-            if company:
-                owner_id = str(company.get("ASSIGNED_BY_ID") or "")
-                group.companies[company_id] = CompanyInfo(
-                    id=company_id,
-                    title=str(company.get("TITLE") or ""),
-                    owner_id=owner_id,
-                    owner_name=user_name(owner_id, user_names),
-                    bins=get_company_bins(bitrix, company, company_bins_cache),
-                )
-
-    return groups
+    def update_deal_owner(self, deal_id: str, owner_id: str) -> None:
+        self.call("crm.deal.update", {"id": deal_id, "fields": {"ASSIGNED_BY_ID": owner_id}})
 
 
-def group_is_consistent(group: DirectorGroup, target_owner_id: str | None = None) -> bool:
-    expected = target_owner_id or group.contact_owner_id
-    if not expected:
-        return False
-    if str(group.contact_owner_id or "") != str(expected):
-        return False
-    for company in group.companies.values():
-        if str(company.owner_id or "") != str(expected):
-            return False
-    for deal in group.deals:
-        if str(deal.owner_id or "") != str(expected):
-            return False
-    return True
+def s(value: Any) -> str:
+    return str(value or "").strip()
 
 
-def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+def parse_csv_set(text: str) -> Set[str]:
+    return {x.strip() for x in (text or "").split(",") if x.strip()}
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Audit and repair owner consistency across director contact, companies and deals.")
-    parser.add_argument("--dry-run", action="store_true", help="Do not write to Bitrix")
-    parser.add_argument("--only-eqazyna", action="store_true", default=False, help="Check only e-Qazyna deals")
+def csv_write(path: str, rows: List[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=list(fieldnames), extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def deal_url_hint(deal_id: Any) -> str:
+    return f"/crm/deal/details/{deal_id}/" if deal_id else ""
+
+
+def contact_url_hint(contact_id: Any) -> str:
+    return f"/crm/contact/details/{contact_id}/" if contact_id else ""
+
+
+def company_url_hint(company_id: Any) -> str:
+    return f"/crm/company/details/{company_id}/" if company_id else ""
+
+
+def contact_title(c: Dict[str, Any]) -> str:
+    parts = [c.get("LAST_NAME"), c.get("NAME"), c.get("SECOND_NAME")]
+    title = " ".join(str(x).strip() for x in parts if str(x or "").strip()).strip()
+    return title or s(c.get("TITLE")) or s(c.get("ID"))
+
+
+def build_deal_filter(category_id: str, only_eqazyna: bool, include_closed: bool) -> Dict[str, Any]:
+    flt: Dict[str, Any] = {}
+    if category_id and category_id.lower() != "all":
+        flt["CATEGORY_ID"] = category_id
+    if only_eqazyna:
+        flt["ORIGINATOR_ID"] = "EQAZYNA"
+    if not include_closed:
+        flt["CLOSED"] = "N"
+    return flt
+
+
+def get_deals(bx: Bitrix, category_id: str, only_eqazyna: bool, include_closed: bool, max_deals: int) -> List[Dict[str, Any]]:
+    select = [
+        "ID", "TITLE", "ASSIGNED_BY_ID", "COMPANY_ID", "CONTACT_ID",
+        "STAGE_ID", "STAGE_SEMANTIC_ID", "CLOSED", "CATEGORY_ID",
+        "ORIGINATOR_ID", "ORIGIN_ID", "DATE_CREATE", "DATE_MODIFY",
+    ]
+    payload = {"filter": build_deal_filter(category_id, only_eqazyna, include_closed), "select": select, "order": {"ID": "ASC"}}
+    return bx.list_all("crm.deal.list", payload, limit=max_deals or None)
+
+
+def choose_target_owner(contact_owner: str, deal_owners: List[str], company_owners: List[str], source_ids: Set[str], policy: str) -> Tuple[str, str, str]:
+    """Return target_id, target_reason, conflict_note."""
+    policy = (policy or "rules_then_majority").strip().lower()
+    valid_deal_owners = [o for o in deal_owners if o and o not in source_ids]
+    valid_company_owners = [o for o in company_owners if o and o not in source_ids]
+
+    if policy in {"director", "contact", "director_contact"}:
+        if contact_owner:
+            return contact_owner, "director_contact_owner", ""
+        return "", "no_director_owner", ""
+
+    # Rule 1: non-technical director owner is strongest signal.
+    if contact_owner and contact_owner not in source_ids:
+        return contact_owner, "director_contact_owner", ""
+
+    # Rule 2: all non-technical deals already agree.
+    uniq_deals = sorted(set(valid_deal_owners))
+    if len(uniq_deals) == 1:
+        return uniq_deals[0], "single_non_technical_deal_owner", ""
+
+    # Rule 3: all non-technical companies already agree.
+    uniq_companies = sorted(set(valid_company_owners))
+    if len(uniq_companies) == 1 and not uniq_deals:
+        return uniq_companies[0], "single_non_technical_company_owner", ""
+
+    # Rule 4: weighted majority, deals weigh more than companies/contact.
+    weights: Counter[str] = Counter()
+    for o in valid_deal_owners:
+        weights[o] += 3
+    for o in valid_company_owners:
+        weights[o] += 1
+    if contact_owner and contact_owner not in source_ids:
+        weights[contact_owner] += 5
+
+    if weights:
+        top = weights.most_common()
+        if len(top) == 1 or top[0][1] > top[1][1]:
+            return top[0][0], "weighted_majority", ""
+        return "", "ambiguous_majority", "; ".join(f"{k}:{v}" for k, v in top)
+
+    if contact_owner:
+        return contact_owner, "technical_director_owner_only", ""
+    return "", "no_target_owner", ""
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Audit/repair Bitrix director package owner consistency")
+    parser.add_argument("--source-responsible-ids", default="36,44", help="Technical/source owner IDs, comma-separated")
     parser.add_argument("--deal-category-id", default="all", help="Deal category ID or all")
-    parser.add_argument("--include-closed-deals", action="store_true", default=False)
-    parser.add_argument("--target-policy", default="rules_then_majority", choices=["rules_then_majority", "director_owner", "unanimous_deal_owner", "unanimous_company_owner", "majority"])
-    parser.add_argument("--repair", action="store_true", help="Update Bitrix records to the chosen target owner. Requires dry-run=false.")
-    parser.add_argument("--source-responsible-ids", default="36,44", help="Technical/source user IDs, comma-separated")
-    parser.add_argument("--max-deals", type=int, default=0)
-    parser.add_argument("--out", default="exports/director_package_owner_actions.csv")
+    parser.add_argument("--target-policy", default="rules_then_majority", help="rules_then_majority/director")
+    parser.add_argument("--max-deals", type=int, default=0, help="Limit deals for diagnostics; 0 = no limit")
     parser.add_argument("--summary-out", default="exports/director_package_owner_summary.csv")
     parser.add_argument("--mismatch-out", default="exports/director_package_owner_mismatches.csv")
-    args = parser.parse_args()
+    parser.add_argument("--out", default="exports/director_package_owner_actions.csv")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--repair", action="store_true")
+    parser.add_argument("--only-eqazyna", action="store_true")
+    parser.add_argument("--include-closed-deals", action="store_true")
+    args = parser.parse_args(argv)
 
-    webhook = os.getenv("BITRIX_WEBHOOK_URL", "").strip()
-    if not webhook:
-        raise RuntimeError("BITRIX_WEBHOOK_URL is empty")
+    bx = Bitrix(BITRIX_WEBHOOK_URL)
+    source_ids = parse_csv_set(args.source_responsible_ids)
 
-    manager_config = load_manager_config()
-    allowed_ids = {str(x) for x in manager_config.allowed_user_ids}
-    source_ids = parse_ids(args.source_responsible_ids) | {str(x) for x in manager_config.source_responsible_ids}
-    user_names = manager_config.user_names
-    manual_directors = load_manual_director_index()
-    hard_bin_owners = load_hard_bin_owners()
-
-    bitrix = BitrixClient(
-        webhook_url=webhook,
-        timeout=int(os.getenv("REQUEST_TIMEOUT", "60")),
-        polite_delay_seconds=float(os.getenv("BITRIX_POLITE_DELAY_SECONDS", "0.2")),
-    )
-
-    deals_raw = list_deals(
-        bitrix,
+    deals = get_deals(
+        bx=bx,
+        category_id=args.deal_category_id,
         only_eqazyna=args.only_eqazyna,
-        deal_category_id=args.deal_category_id,
-        include_closed_deals=args.include_closed_deals,
+        include_closed=args.include_closed_deals,
         max_deals=args.max_deals,
     )
-    groups = build_groups(bitrix, deals_raw, user_names=user_names)
 
-    summary_rows: list[dict[str, Any]] = []
-    mismatch_rows: list[dict[str, Any]] = []
-    action_rows: list[dict[str, Any]] = []
+    packages: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    skipped_no_contact = 0
+    for d in deals:
+        contact_id = s(d.get("CONTACT_ID"))
+        if not contact_id:
+            skipped_no_contact += 1
+            continue
+        packages[contact_id].append(d)
 
-    for group in sorted(groups.values(), key=lambda g: int(g.contact_id)):
-        target_id, target_reason = choose_target(
-            group,
-            manual_directors=manual_directors,
-            hard_bin_owners=hard_bin_owners,
-            allowed_ids=allowed_ids,
-            source_ids=source_ids,
-            target_policy=args.target_policy,
-        )
-        group.target_owner_id = target_id
-        group.target_owner_name = user_name(target_id, user_names)
-        group.target_reason = target_reason
+    summary_rows: List[Dict[str, Any]] = []
+    mismatch_rows: List[Dict[str, Any]] = []
+    action_rows: List[Dict[str, Any]] = []
 
-        owners_present = {group.contact_owner_id}
-        owners_present.update(company.owner_id for company in group.companies.values())
-        owners_present.update(deal.owner_id for deal in group.deals)
-        owners_present.discard("")
+    updated_contacts = updated_companies = updated_deals = 0
+    error_count = 0
 
-        consistent_to_current_director = group_is_consistent(group)
-        consistent_to_target = group_is_consistent(group, target_id) if target_id else False
-        has_mismatch = not consistent_to_current_director or (target_id and not consistent_to_target)
-        group.status = "ok" if not has_mismatch else ("repairable" if target_id else "conflict_no_target")
+    for contact_id, pkg_deals in sorted(packages.items(), key=lambda x: int(x[0]) if x[0].isdigit() else x[0]):
+        contact = bx.get_contact(contact_id)
+        director_owner = s(contact.get("ASSIGNED_BY_ID"))
+        director_name = contact_title(contact)
 
-        def add_mismatch(entity_type: str, entity_id: str, title: str, owner_id: str, owner_name_value: str, extra: dict[str, Any] | None = None) -> None:
-            extra = extra or {}
-            mismatch_rows.append(
-                {
-                    "director_contact_id": group.contact_id,
-                    "director_fio": group.fio,
-                    "director_owner_id": group.contact_owner_id,
-                    "director_owner_name": group.contact_owner_name,
-                    "target_owner_id": target_id,
-                    "target_owner_name": group.target_owner_name,
-                    "target_reason": target_reason,
-                    "entity_type": entity_type,
-                    "entity_id": entity_id,
-                    "entity_title": title,
-                    "entity_owner_id": owner_id,
-                    "entity_owner_name": owner_name_value,
-                    "stage_id": extra.get("stage_id", ""),
-                    "closed": extra.get("closed", ""),
-                    "company_id": extra.get("company_id", ""),
-                    "company_title": extra.get("company_title", ""),
-                    "origin_id": extra.get("origin_id", ""),
-                    "url_hint": make_url_hint(entity_type, entity_id) if entity_id else "",
-                }
-            )
+        company_ids = sorted({s(d.get("COMPANY_ID")) for d in pkg_deals if s(d.get("COMPANY_ID"))}, key=lambda x: int(x) if x.isdigit() else x)
+        companies = {cid: bx.get_company(cid) for cid in company_ids}
 
-        if target_id and group.contact_owner_id != target_id:
-            add_mismatch("contact", group.contact_id, group.fio, group.contact_owner_id, group.contact_owner_name)
-        elif not consistent_to_current_director and not target_id:
-            # Still show the director contact as the package root.
-            add_mismatch("contact", group.contact_id, group.fio, group.contact_owner_id, group.contact_owner_name)
+        deal_owners = [s(d.get("ASSIGNED_BY_ID")) for d in pkg_deals]
+        company_owners = [s(c.get("ASSIGNED_BY_ID")) for c in companies.values()]
+        target_id, target_reason, conflict_note = choose_target_owner(director_owner, deal_owners, company_owners, source_ids, args.target_policy)
+        target_name = bx.get_user_name(target_id) if target_id else ""
 
-        for company in group.companies.values():
-            if target_id and company.owner_id != target_id:
-                add_mismatch("company", company.id, company.title, company.owner_id, company.owner_name)
-            elif not target_id and company.owner_id != group.contact_owner_id:
-                add_mismatch("company", company.id, company.title, company.owner_id, company.owner_name)
+        owner_set = {o for o in ([director_owner] + deal_owners + company_owners) if o}
+        mismatched = bool(target_id and any(o and o != target_id for o in owner_set)) or len(owner_set) > 1
 
-        for deal in group.deals:
-            company = group.companies.get(deal.company_id)
-            if target_id and deal.owner_id != target_id:
-                add_mismatch(
-                    "deal",
-                    deal.id,
-                    deal.title,
-                    deal.owner_id,
-                    deal.owner_name,
-                    {
-                        "stage_id": deal.stage_id,
-                        "closed": deal.closed,
-                        "company_id": deal.company_id,
-                        "company_title": company.title if company else "",
-                        "origin_id": deal.origin_id,
-                    },
-                )
-            elif not target_id and deal.owner_id != group.contact_owner_id:
-                add_mismatch(
-                    "deal",
-                    deal.id,
-                    deal.title,
-                    deal.owner_id,
-                    deal.owner_name,
-                    {
-                        "stage_id": deal.stage_id,
-                        "closed": deal.closed,
-                        "company_id": deal.company_id,
-                        "company_title": company.title if company else "",
-                        "origin_id": deal.origin_id,
-                    },
-                )
+        summary_rows.append({
+            "director_contact_id": contact_id,
+            "director_fio": director_name,
+            "director_owner_id": director_owner,
+            "director_owner_name": bx.get_user_name(director_owner),
+            "target_owner_id": target_id,
+            "target_owner_name": target_name,
+            "target_reason": target_reason,
+            "conflict_note": conflict_note,
+            "deal_count": len(pkg_deals),
+            "company_count": len(company_ids),
+            "distinct_owner_ids": ",".join(sorted(owner_set, key=lambda x: int(x) if x.isdigit() else x)),
+            "distinct_owner_names": "; ".join(bx.get_user_name(o) for o in sorted(owner_set, key=lambda x: int(x) if x.isdigit() else x)),
+            "has_mismatch": "Y" if mismatched else "N",
+            "contact_url_hint": contact_url_hint(contact_id),
+        })
 
-        # Build actions. Only write if explicitly requested and safe target exists.
-        if target_id:
-            if group.contact_owner_id != target_id:
-                action_rows.append({"entity_type": "contact", "entity_id": group.contact_id, "entity_title": group.fio, "old_owner_id": group.contact_owner_id, "old_owner_name": group.contact_owner_name, "new_owner_id": target_id, "new_owner_name": group.target_owner_name, "action": "dry_run_update" if args.dry_run or not args.repair else "updated", "reason": target_reason})
-                if args.repair and not args.dry_run:
-                    bitrix.update_contact(group.contact_id, {"ASSIGNED_BY_ID": int(target_id)})
-            for company in group.companies.values():
-                if company.owner_id != target_id:
-                    action_rows.append({"entity_type": "company", "entity_id": company.id, "entity_title": company.title, "old_owner_id": company.owner_id, "old_owner_name": company.owner_name, "new_owner_id": target_id, "new_owner_name": group.target_owner_name, "action": "dry_run_update" if args.dry_run or not args.repair else "updated", "reason": target_reason})
-                    if args.repair and not args.dry_run:
-                        bitrix.update_company(company.id, {"ASSIGNED_BY_ID": int(target_id)})
-            for deal in group.deals:
-                if deal.owner_id != target_id:
-                    action_rows.append({"entity_type": "deal", "entity_id": deal.id, "entity_title": deal.title, "old_owner_id": deal.owner_id, "old_owner_name": deal.owner_name, "new_owner_id": target_id, "new_owner_name": group.target_owner_name, "action": "dry_run_update" if args.dry_run or not args.repair else "updated", "reason": target_reason})
-                    if args.repair and not args.dry_run:
-                        bitrix.update_deal(deal.id, {"ASSIGNED_BY_ID": int(target_id)})
-        elif has_mismatch:
-            action_rows.append({"entity_type": "director_package", "entity_id": group.contact_id, "entity_title": group.fio, "old_owner_id": group.contact_owner_id, "old_owner_name": group.contact_owner_name, "new_owner_id": "", "new_owner_name": "", "action": "skipped_no_safe_target", "reason": target_reason})
-
-        group.mismatch_count = sum(1 for row in mismatch_rows if row["director_contact_id"] == group.contact_id)
-        group.action_count = sum(1 for row in action_rows if row.get("entity_id") == group.contact_id or row.get("reason") == target_reason)
-
-        summary_rows.append(
-            {
-                "director_contact_id": group.contact_id,
-                "director_fio": group.fio,
-                "director_owner_id": group.contact_owner_id,
-                "director_owner_name": group.contact_owner_name,
+        # Contact mismatch/action
+        if target_id and director_owner and director_owner != target_id:
+            mismatch_rows.append({
+                "entity_type": "contact",
+                "entity_id": contact_id,
+                "entity_title": director_name,
+                "current_owner_id": director_owner,
+                "current_owner_name": bx.get_user_name(director_owner),
                 "target_owner_id": target_id,
-                "target_owner_name": group.target_owner_name,
-                "target_reason": target_reason,
-                "status": group.status,
-                "owners_present_ids": ",".join(sorted(owners_present, key=lambda x: int(x) if x.isdigit() else 999999)),
-                "owners_present_names": ", ".join(user_name(x, user_names) for x in sorted(owners_present, key=lambda x: int(x) if x.isdigit() else 999999)),
-                "companies_count": len(group.companies),
-                "deals_count": len(group.deals),
-                "mismatch_count": group.mismatch_count,
-                "company_ids": ",".join(sorted(group.companies.keys(), key=lambda x: int(x) if x.isdigit() else 999999)),
-                "deal_ids": ",".join(deal.id for deal in group.deals),
-            }
-        )
+                "target_owner_name": target_name,
+                "director_contact_id": contact_id,
+                "director_fio": director_name,
+                "company_id": "",
+                "company_title": "",
+                "deal_id": "",
+                "deal_title": "",
+                "stage_id": "",
+                "closed": "",
+                "url_hint": contact_url_hint(contact_id),
+            })
+            status = "dry_run_update" if args.dry_run or not args.repair else "updated"
+            err = ""
+            if args.repair and not args.dry_run:
+                try:
+                    bx.update_contact_owner(contact_id, target_id)
+                    updated_contacts += 1
+                except Exception as e:
+                    status = "error"
+                    err = str(e)
+                    error_count += 1
+            action_rows.append({
+                "action": status,
+                "entity_type": "contact",
+                "entity_id": contact_id,
+                "entity_title": director_name,
+                "from_owner_id": director_owner,
+                "from_owner_name": bx.get_user_name(director_owner),
+                "to_owner_id": target_id,
+                "to_owner_name": target_name,
+                "reason": target_reason,
+                "error": err,
+            })
 
-    write_csv(
-        Path(args.summary_out),
-        summary_rows,
-        [
-            "director_contact_id",
-            "director_fio",
-            "director_owner_id",
-            "director_owner_name",
-            "target_owner_id",
-            "target_owner_name",
-            "target_reason",
-            "status",
-            "owners_present_ids",
-            "owners_present_names",
-            "companies_count",
-            "deals_count",
-            "mismatch_count",
-            "company_ids",
-            "deal_ids",
-        ],
-    )
-    write_csv(
-        Path(args.mismatch_out),
-        mismatch_rows,
-        [
-            "director_contact_id",
-            "director_fio",
-            "director_owner_id",
-            "director_owner_name",
-            "target_owner_id",
-            "target_owner_name",
-            "target_reason",
-            "entity_type",
-            "entity_id",
-            "entity_title",
-            "entity_owner_id",
-            "entity_owner_name",
-            "stage_id",
-            "closed",
-            "company_id",
-            "company_title",
-            "origin_id",
-            "url_hint",
-        ],
-    )
-    write_csv(
-        Path(args.out),
-        action_rows,
-        [
-            "entity_type",
-            "entity_id",
-            "entity_title",
-            "old_owner_id",
-            "old_owner_name",
-            "new_owner_id",
-            "new_owner_name",
-            "action",
-            "reason",
-        ],
-    )
+        # Company mismatches/actions
+        for cid, comp in companies.items():
+            owner = s(comp.get("ASSIGNED_BY_ID"))
+            title = s(comp.get("TITLE")) or s(comp.get("COMPANY_TITLE")) or cid
+            if target_id and owner and owner != target_id:
+                mismatch_rows.append({
+                    "entity_type": "company",
+                    "entity_id": cid,
+                    "entity_title": title,
+                    "current_owner_id": owner,
+                    "current_owner_name": bx.get_user_name(owner),
+                    "target_owner_id": target_id,
+                    "target_owner_name": target_name,
+                    "director_contact_id": contact_id,
+                    "director_fio": director_name,
+                    "company_id": cid,
+                    "company_title": title,
+                    "deal_id": "",
+                    "deal_title": "",
+                    "stage_id": "",
+                    "closed": "",
+                    "url_hint": company_url_hint(cid),
+                })
+                status = "dry_run_update" if args.dry_run or not args.repair else "updated"
+                err = ""
+                if args.repair and not args.dry_run:
+                    try:
+                        bx.update_company_owner(cid, target_id)
+                        updated_companies += 1
+                    except Exception as e:
+                        status = "error"
+                        err = str(e)
+                        error_count += 1
+                action_rows.append({
+                    "action": status,
+                    "entity_type": "company",
+                    "entity_id": cid,
+                    "entity_title": title,
+                    "from_owner_id": owner,
+                    "from_owner_name": bx.get_user_name(owner),
+                    "to_owner_id": target_id,
+                    "to_owner_name": target_name,
+                    "reason": target_reason,
+                    "error": err,
+                })
 
-    print(f"DIRECTOR_PACKAGES={len(groups)}")
-    print(f"SUMMARY_ROWS={len(summary_rows)}")
-    print(f"MISMATCH_ROWS={len(mismatch_rows)}")
-    print(f"ACTION_ROWS={len(action_rows)}")
-    if args.repair and not args.dry_run:
-        print("WRITE_MODE=enabled")
-    else:
-        print("WRITE_MODE=dry_run")
-    return 0
+        # Deal mismatches/actions
+        for d in pkg_deals:
+            deal_id = s(d.get("ID"))
+            owner = s(d.get("ASSIGNED_BY_ID"))
+            title = s(d.get("TITLE")) or deal_id
+            cid = s(d.get("COMPANY_ID"))
+            comp_title = s(companies.get(cid, {}).get("TITLE")) if cid else ""
+            if target_id and owner and owner != target_id:
+                mismatch_rows.append({
+                    "entity_type": "deal",
+                    "entity_id": deal_id,
+                    "entity_title": title,
+                    "current_owner_id": owner,
+                    "current_owner_name": bx.get_user_name(owner),
+                    "target_owner_id": target_id,
+                    "target_owner_name": target_name,
+                    "director_contact_id": contact_id,
+                    "director_fio": director_name,
+                    "company_id": cid,
+                    "company_title": comp_title,
+                    "deal_id": deal_id,
+                    "deal_title": title,
+                    "stage_id": s(d.get("STAGE_ID")),
+                    "closed": s(d.get("CLOSED")),
+                    "url_hint": deal_url_hint(deal_id),
+                })
+                status = "dry_run_update" if args.dry_run or not args.repair else "updated"
+                err = ""
+                if args.repair and not args.dry_run:
+                    try:
+                        bx.update_deal_owner(deal_id, target_id)
+                        updated_deals += 1
+                    except Exception as e:
+                        status = "error"
+                        err = str(e)
+                        error_count += 1
+                action_rows.append({
+                    "action": status,
+                    "entity_type": "deal",
+                    "entity_id": deal_id,
+                    "entity_title": title,
+                    "from_owner_id": owner,
+                    "from_owner_name": bx.get_user_name(owner),
+                    "to_owner_id": target_id,
+                    "to_owner_name": target_name,
+                    "reason": target_reason,
+                    "error": err,
+                })
+
+    summary_fields = [
+        "director_contact_id", "director_fio", "director_owner_id", "director_owner_name",
+        "target_owner_id", "target_owner_name", "target_reason", "conflict_note",
+        "deal_count", "company_count", "distinct_owner_ids", "distinct_owner_names",
+        "has_mismatch", "contact_url_hint",
+    ]
+    mismatch_fields = [
+        "entity_type", "entity_id", "entity_title", "current_owner_id", "current_owner_name",
+        "target_owner_id", "target_owner_name", "director_contact_id", "director_fio",
+        "company_id", "company_title", "deal_id", "deal_title", "stage_id", "closed", "url_hint",
+    ]
+    action_fields = [
+        "action", "entity_type", "entity_id", "entity_title", "from_owner_id", "from_owner_name",
+        "to_owner_id", "to_owner_name", "reason", "error",
+    ]
+
+    csv_write(args.summary_out, summary_rows, summary_fields)
+    csv_write(args.mismatch_out, mismatch_rows, mismatch_fields)
+    csv_write(args.out, action_rows, action_fields)
+
+    print("DIRECTOR_PACKAGE_OWNER_AUDIT_DONE")
+    print(json.dumps({
+        "deals_loaded": len(deals),
+        "packages": len(packages),
+        "skipped_deals_without_contact": skipped_no_contact,
+        "summary_rows": len(summary_rows),
+        "mismatch_rows": len(mismatch_rows),
+        "action_rows": len(action_rows),
+        "dry_run": bool(args.dry_run),
+        "repair": bool(args.repair),
+        "updated_contacts": updated_contacts,
+        "updated_companies": updated_companies,
+        "updated_deals": updated_deals,
+        "errors": error_count,
+    }, ensure_ascii=False, indent=2))
+
+    return 1 if error_count else 0
 
 
 if __name__ == "__main__":
