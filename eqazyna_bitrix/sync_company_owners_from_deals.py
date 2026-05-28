@@ -78,6 +78,31 @@ class ConflictDealRow:
     deal_url_hint: str
 
 
+
+@dataclass
+class DealAuditRow:
+    company_id: str
+    company_title: str
+    company_owner_id: str
+    company_owner_name: str
+    deal_id: str
+    deal_title: str
+    deal_owner_id: str
+    deal_owner_name: str
+    deal_owner_is_source: str
+    deal_owner_is_allowed_target: str
+    company_owner_equals_deal_owner: str
+    stage_id: str
+    stage_semantic_id: str
+    closed: str
+    category_id: str
+    date_create: str
+    date_modify: str
+    moved_time: str
+    originator_id: str
+    origin_id: str
+    deal_url_hint: str
+
 class CompanyOwnerSync:
     def __init__(
         self,
@@ -306,6 +331,81 @@ class CompanyOwnerSync:
                 error=str(exc),
             )
 
+
+    def build_deal_audit_rows(self, rows: list[SyncRow]) -> list[DealAuditRow]:
+        """Build a manual audit table with every deal found for every checked source company.
+
+        This is intentionally broader than conflict report:
+        it shows company owner vs deal owner even when all deals are still on technical users.
+        """
+        audit_rows: list[DealAuditRow] = []
+
+        for row in rows:
+            try:
+                deals = self.list_company_deals(row.company_id)
+            except Exception as exc:  # noqa: BLE001
+                audit_rows.append(
+                    DealAuditRow(
+                        company_id=row.company_id,
+                        company_title=row.company_title,
+                        company_owner_id=row.old_company_owner_id,
+                        company_owner_name=row.old_company_owner_name,
+                        deal_id="",
+                        deal_title=f"ERROR: {exc}",
+                        deal_owner_id="",
+                        deal_owner_name="",
+                        deal_owner_is_source="",
+                        deal_owner_is_allowed_target="",
+                        company_owner_equals_deal_owner="",
+                        stage_id="",
+                        stage_semantic_id="",
+                        closed="",
+                        category_id="",
+                        date_create="",
+                        date_modify="",
+                        moved_time="",
+                        originator_id="",
+                        origin_id="",
+                        deal_url_hint="",
+                    )
+                )
+                continue
+
+            for deal in deals:
+                deal_id = str(deal.get("ID") or "")
+                deal_owner = _as_int(deal.get("ASSIGNED_BY_ID"))
+                company_owner = _as_int(row.old_company_owner_id)
+                audit_rows.append(
+                    DealAuditRow(
+                        company_id=row.company_id,
+                        company_title=row.company_title,
+                        company_owner_id=row.old_company_owner_id,
+                        company_owner_name=row.old_company_owner_name,
+                        deal_id=deal_id,
+                        deal_title=str(deal.get("TITLE") or ""),
+                        deal_owner_id=str(deal_owner or ""),
+                        deal_owner_name=self.name(deal_owner),
+                        deal_owner_is_source="Y" if deal_owner in self.source_responsible_ids else "N",
+                        deal_owner_is_allowed_target="Y"
+                        if (not self.allowed_target_ids or deal_owner in self.allowed_target_ids)
+                        else "N",
+                        company_owner_equals_deal_owner="Y" if company_owner == deal_owner else "N",
+                        stage_id=str(deal.get("STAGE_ID") or ""),
+                        stage_semantic_id=str(deal.get("STAGE_SEMANTIC_ID") or ""),
+                        closed=str(deal.get("CLOSED") or ""),
+                        category_id=str(deal.get("CATEGORY_ID") or ""),
+                        date_create=str(deal.get("DATE_CREATE") or ""),
+                        date_modify=str(deal.get("DATE_MODIFY") or ""),
+                        moved_time=str(deal.get("MOVED_TIME") or ""),
+                        originator_id=str(deal.get("ORIGINATOR_ID") or ""),
+                        origin_id=str(deal.get("ORIGIN_ID") or ""),
+                        deal_url_hint=f"/crm/deal/details/{deal_id}/" if deal_id else "",
+                    )
+                )
+
+        return audit_rows
+
+
     def build_conflict_deal_rows(self, rows: list[SyncRow]) -> list[ConflictDealRow]:
         conflict_rows: list[ConflictDealRow] = []
 
@@ -382,11 +482,12 @@ class CompanyOwnerSync:
 
         return conflict_rows
 
-    def run(self) -> tuple[list[SyncRow], list[ConflictDealRow]]:
+    def run(self) -> tuple[list[SyncRow], list[ConflictDealRow], list[DealAuditRow]]:
         companies = self.list_source_companies()
         rows = [self.process_company(company) for company in companies]
         conflict_rows = self.build_conflict_deal_rows(rows)
-        return rows, conflict_rows
+        deal_audit_rows = self.build_deal_audit_rows(rows)
+        return rows, conflict_rows, deal_audit_rows
 
 
 def _write_csv(path: Path, rows: list[Any], fieldnames: list[str]) -> None:
@@ -400,20 +501,27 @@ def _write_csv(path: Path, rows: list[Any], fieldnames: list[str]) -> None:
 def write_outputs(
     rows: list[SyncRow],
     conflict_rows: list[ConflictDealRow],
+    deal_audit_rows: list[DealAuditRow],
     json_out: Path,
     csv_out: Path,
     conflicts_json_out: Path,
     conflicts_csv_out: Path,
+    deal_audit_json_out: Path,
+    deal_audit_csv_out: Path,
 ) -> None:
     json_out.parent.mkdir(parents=True, exist_ok=True)
     csv_out.parent.mkdir(parents=True, exist_ok=True)
     data = [asdict(row) for row in rows]
     conflict_data = [asdict(row) for row in conflict_rows]
+    deal_audit_data = [asdict(row) for row in deal_audit_rows]
+
     json_out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     conflicts_json_out.write_text(json.dumps(conflict_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    deal_audit_json_out.write_text(json.dumps(deal_audit_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
     _write_csv(csv_out, rows, list(SyncRow.__dataclass_fields__.keys()))
     _write_csv(conflicts_csv_out, conflict_rows, list(ConflictDealRow.__dataclass_fields__.keys()))
-
+    _write_csv(deal_audit_csv_out, deal_audit_rows, list(DealAuditRow.__dataclass_fields__.keys()))
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="One-time sync of company responsible users from assigned e-Qazyna deals.")
@@ -429,6 +537,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--csv-out", default="exports/sync_company_owners_from_deals_log.csv")
     parser.add_argument("--conflicts-out", default="exports/sync_company_owner_conflicts.json")
     parser.add_argument("--conflicts-csv-out", default="exports/sync_company_owner_conflicts.csv")
+    parser.add_argument("--deal-audit-out", default="exports/sync_company_owner_deal_audit.json")
+    parser.add_argument("--deal-audit-csv-out", default="exports/sync_company_owner_deal_audit.csv")
     return parser
 
 
@@ -459,14 +569,17 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         max_companies=args.max_companies or None,
     )
-    rows, conflict_rows = sync.run()
+    rows, conflict_rows, deal_audit_rows = sync.run()
     write_outputs(
         rows,
         conflict_rows,
+        deal_audit_rows,
         Path(args.out),
         Path(args.csv_out),
         Path(args.conflicts_out),
         Path(args.conflicts_csv_out),
+        Path(args.deal_audit_out),
+        Path(args.deal_audit_csv_out),
     )
 
     counts = Counter(row.action for row in rows)
@@ -474,7 +587,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"dry_run={args.dry_run}")
     print(f"companies_checked={len(rows)}")
     print(f"conflict_deal_rows={len(conflict_rows)}")
+    print(f"deal_audit_rows={len(deal_audit_rows)}")
     print(f"conflicts_csv={args.conflicts_csv_out}")
+    print(f"deal_audit_csv={args.deal_audit_csv_out}")
     for action, count in sorted(counts.items()):
         print(f"{action}={count}")
     errors = [row for row in rows if row.error]
