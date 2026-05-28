@@ -29,6 +29,10 @@ managers:
     branch_id: 22
     branch: Центральный Столичный филиал
     active: true
+  - id: 108
+    name: Юлия Боровая
+    branch: Центральный Столичный филиал
+    active: true
 
   # Астанинский филиал
   - id: 104
@@ -117,3 +121,4 @@ managers:
     branch_id: 18
     branch: Талдыкорган
     active: true
+
