@@ -1,45 +1,49 @@
-name: Audit company/deal owner mismatches
+name: Audit/repair director package owners
 
 on:
   workflow_dispatch:
     inputs:
-      scope:
-        description: "Что проверять: all_companies или только source_companies"
+      dry_run:
+        description: "Тест без записи в Bitrix"
         required: true
-        default: "all_companies"
-      source_responsible_ids:
-        description: "Технические ответственные через запятую. Алёна = 36,44"
+        default: "true"
+      repair:
+        description: "Исправлять найденные расхождения. Включать только после проверки отчёта"
         required: true
-        default: "36,44"
+        default: "false"
+      only_eqazyna:
+        description: "Проверять только сделки e-Qazyna"
+        required: true
+        default: "true"
       deal_category_id:
-        description: "ID воронки сделок или all"
+        description: "ID воронки или all"
         required: true
         default: "all"
       include_closed_deals:
         description: "Включать закрытые сделки"
-        type: boolean
         required: true
-        default: true
-      include_non_eqazyna_deals:
-        description: "Включать не только e-Qazyna сделки"
-        type: boolean
+        default: "true"
+      target_policy:
+        description: "Как выбирать единого менеджера: rules_then_majority / director_owner / unanimous_deal_owner / majority"
         required: true
-        default: true
-      max_companies:
-        description: "Лимит компаний для теста. 0 = без лимита"
+        default: "rules_then_majority"
+      source_responsible_ids:
+        description: "Технические ответственные через запятую"
+        required: true
+        default: "36,44"
+      max_deals:
+        description: "0 = без лимита"
         required: true
         default: "0"
 
 permissions:
   contents: read
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
-  audit-owner-mismatches:
+  audit-repair-director-package-owners:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
     env:
       BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
       REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
@@ -58,36 +62,45 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Audit company/deal owner mismatches
+      - name: Audit/repair director package owners
         run: |
           mkdir -p exports
 
           ARGS=(
-            python -m eqazyna_bitrix.audit_company_deal_owner_mismatches
-            --scope "${{ inputs.scope }}"
+            python -m eqazyna_bitrix.audit_repair_director_package_owners
             --source-responsible-ids "${{ inputs.source_responsible_ids }}"
             --deal-category-id "${{ inputs.deal_category_id }}"
-            --max-companies "${{ inputs.max_companies }}"
+            --target-policy "${{ inputs.target_policy }}"
+            --max-deals "${{ inputs.max_deals }}"
+            --summary-out "exports/director_package_owner_summary.csv"
+            --mismatch-out "exports/director_package_owner_mismatches.csv"
+            --out "exports/director_package_owner_actions.csv"
           )
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+
+          if [ "${{ inputs.repair }}" = "true" ]; then
+            ARGS+=(--repair)
+          fi
+
+          if [ "${{ inputs.only_eqazyna }}" = "true" ]; then
+            ARGS+=(--only-eqazyna)
+          fi
 
           if [ "${{ inputs.include_closed_deals }}" = "true" ]; then
             ARGS+=(--include-closed-deals)
           fi
 
-          if [ "${{ inputs.include_non_eqazyna_deals }}" = "true" ]; then
-            ARGS+=(--include-non-eqazyna-deals)
-          fi
-
           "${ARGS[@]}"
           ls -lah exports
 
-      - name: Upload audit logs
+      - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: company-deal-owner-mismatch-audit
-          path: |
-            exports/*.json
-            exports/*.csv
+          name: director-package-owner-audit
+          path: exports/*.csv
           if-no-files-found: ignore
           retention-days: 14
