@@ -1,0 +1,120 @@
+name: Sync company owners from assigned deals
+
+run-name: Sync company owners from deals / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true = тест без записи, false = запись в Bitrix"
+        required: true
+        default: "true"
+      source_responsible_ids:
+        description: "ID текущих технических ответственных компаний. Алёна = 36,44"
+        required: true
+        default: "36,44"
+      deal_category_id:
+        description: "ID воронки сделок. 0 = основная, all = все"
+        required: true
+        default: "0"
+      include_closed_deals:
+        description: "true = учитывать закрытые сделки при выборе владельца компании"
+        required: true
+        default: "true"
+      include_non_eqazyna_deals:
+        description: "true = учитывать все сделки компании, false = только e-Qazyna"
+        required: true
+        default: "false"
+      conflict_policy:
+        description: "skip / latest / majority. При разных менеджерах у сделок безопаснее skip"
+        required: true
+        default: "skip"
+      sync_contacts:
+        description: "true = также менять ответственного у связанных контактов, если они на 36/44"
+        required: true
+        default: "false"
+      max_companies:
+        description: "Лимит компаний для теста. 0 = без лимита"
+        required: true
+        default: "0"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  sync-company-owners:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+      REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate script import
+        run: |
+          python -m eqazyna_bitrix.sync_company_owners_from_deals --help >/dev/null
+
+      - name: Sync company owners from deals
+        run: |
+          set -euo pipefail
+          mkdir -p exports
+
+          DRY_RUN="${{ inputs.dry_run }}"
+          SOURCE_RESPONSIBLE_IDS="${{ inputs.source_responsible_ids }}"
+          DEAL_CATEGORY_ID="${{ inputs.deal_category_id }}"
+          INCLUDE_CLOSED_DEALS="${{ inputs.include_closed_deals }}"
+          INCLUDE_NON_EQAZYNA_DEALS="${{ inputs.include_non_eqazyna_deals }}"
+          CONFLICT_POLICY="${{ inputs.conflict_policy }}"
+          SYNC_CONTACTS="${{ inputs.sync_contacts }}"
+          MAX_COMPANIES="${{ inputs.max_companies }}"
+
+          if [ "$DRY_RUN" != "true" ] && [ -z "${BITRIX_WEBHOOK_URL:-}" ]; then
+            echo "ERROR: BITRIX_WEBHOOK_URL secret is empty. Cannot write to Bitrix." >&2
+            exit 1
+          fi
+
+          ARGS=(
+            python -m eqazyna_bitrix.sync_company_owners_from_deals
+            --source-responsible-ids "$SOURCE_RESPONSIBLE_IDS"
+            --deal-category-id "$DEAL_CATEGORY_ID"
+            --conflict-policy "$CONFLICT_POLICY"
+            --out "exports/sync_company_owners_from_deals_log.json"
+            --csv-out "exports/sync_company_owners_from_deals_log.csv"
+          )
+
+          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ "$INCLUDE_CLOSED_DEALS" = "true" ]; then ARGS+=(--include-closed-deals); fi
+          if [ "$INCLUDE_NON_EQAZYNA_DEALS" = "true" ]; then ARGS+=(--include-non-eqazyna-deals); fi
+          if [ "$SYNC_CONTACTS" = "true" ]; then ARGS+=(--sync-contacts); fi
+          if [ "$MAX_COMPANIES" != "0" ] && [ -n "$MAX_COMPANIES" ]; then ARGS+=(--max-companies "$MAX_COMPANIES"); fi
+
+          "${ARGS[@]}"
+          ls -lah exports
+
+      - name: Upload sync logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-company-owners-from-deals-log
+          path: |
+            exports/*.json
+            exports/*.csv
+          if-no-files-found: ignore
+          retention-days: 14
