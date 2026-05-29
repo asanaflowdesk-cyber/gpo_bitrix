@@ -29,7 +29,7 @@ managers:
   - id: 110
     name: Казрахметова Алия
     branch_id: 32
-    branch_name: Павлодарский филиал
+    branch: Павлодарский филиал
     active: true
 
   # Центральный Столичный филиал
