@@ -52,11 +52,7 @@ managers:
     active: true
 
   # Астанинский филиал 2
-  - id: 94
-    name: Марат Шалбаев
-    branch_id: 26
-    branch: Астанинский филиал 2
-    active: true
+  #- id: 94     name: Марат Шалбаев    branch_id: 26    branch: Астанинский филиал 2    active: true
   - id: 82
     name: Aisulu Gaisa / Асанова Айсулу
     branch_id: 26
