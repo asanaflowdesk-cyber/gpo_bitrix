@@ -9,7 +9,7 @@ on:
       source_user_id:
         description: "ID старого ответственного"
         required: true
-        default: ""
+        default: "36"
       target_user_id:
         description: "ID нового ответственного"
         required: true
