@@ -31,7 +31,7 @@ on:
         required: true
         default: "true"
       include_deals:
-        description: "Переносить сделки тоже. Обычно false для задачи 'клиенты и лиды'"
+        description: "Переносить сделки тоже"
         required: true
         default: "false"
       include_closed_deals:
@@ -39,11 +39,27 @@ on:
         required: true
         default: "false"
       deal_category_id:
-        description: "Воронка сделок для include_deals. all = все"
+        description: "Воронка сделок. all = все"
         required: true
         default: "all"
+      deal_stage_ids:
+        description: "Стадии сделок через запятую. all = все. Например NEW,EXECUTING,UC_HRSCUK"
+        required: true
+        default: "all"
+      lead_status_ids:
+        description: "Статусы лидов через запятую. all = все"
+        required: true
+        default: "all"
+      filter_company_contact_by_deal_stage:
+        description: "Для компаний/контактов брать только связанные со сделками в выбранной стадии"
+        required: true
+        default: "false"
       limit:
-        description: "Лимит строк на сущность. 0 = без лимита"
+        description: "Лимит на каждый тип сущности. 0 = без лимита"
+        required: true
+        default: "0"
+      max_total:
+        description: "Общий лимит на перенос по всем выбранным сущностям. 0 = без лимита"
         required: true
         default: "0"
 
@@ -91,7 +107,11 @@ jobs:
             --include-deals "${{ inputs.include_deals }}"
             --include-closed-deals "${{ inputs.include_closed_deals }}"
             --deal-category-id "${{ inputs.deal_category_id }}"
+            --deal-stage-ids "${{ inputs.deal_stage_ids }}"
+            --lead-status-ids "${{ inputs.lead_status_ids }}"
+            --filter-company-contact-by-deal-stage "${{ inputs.filter_company_contact_by_deal_stage }}"
             --limit "${{ inputs.limit }}"
+            --max-total "${{ inputs.max_total }}"
             --out "exports/reassign_crm_owner_log.csv"
           )
 
