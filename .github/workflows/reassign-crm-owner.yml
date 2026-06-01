@@ -29,11 +29,11 @@ on:
       include_leads:
         description: "Переносить лиды"
         required: true
-        default: "true"
-      include_deals:
-        description: "Переносить сделки тоже"
-        required: true
         default: "false"
+      include_deals:
+        description: "Переносить сделки / заявки"
+        required: true
+        default: "true"
       include_closed_deals:
         description: "Если include_deals=true, переносить закрытые сделки тоже"
         required: true
@@ -59,7 +59,7 @@ on:
         required: true
         default: "0"
       max_total:
-        description: "Общий лимит на перенос по всем выбранным сущностям. 0 = без лимита"
+        description: "Лимит. Если include_deals=true — это лимит сделок; связанные клиенты/контакты не считаются. 0 = без лимита"
         required: true
         default: "0"
 
