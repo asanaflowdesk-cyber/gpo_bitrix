@@ -1,37 +1,32 @@
 # Reassign CRM owner
 
-Разовая операция для переноса сущностей Bitrix CRM с одного ответственного на другого.
+Разовая ручная передача сущностей Bitrix от одного ответственного к другому.
 
-## Workflow
+## Основной сценарий
 
-`Actions → Reassign CRM owner`
+1. Сначала запускать `dry_run=true`.
+2. Проверить artifact `reassign_crm_owner_log.csv`.
+3. Только потом запускать `dry_run=false`.
 
-## Рекомендуемый первый запуск
+## Полезные параметры
 
-```text
-source_user_id = ID старого менеджера
-target_user_id = ID нового менеджера
-dry_run = true
-include_companies = true
-include_contacts = true
-include_leads = true
-include_deals = false
-include_closed_deals = false
-deal_category_id = all
-limit = 0
-```
+- `source_user_id` — старый менеджер.
+- `target_user_id` — новый менеджер.
+- `limit` — лимит на каждый тип сущности.
+- `max_total` — общий лимит по всем выбранным сущностям.
+- `deal_stage_ids` — стадии сделок через запятую, например `NEW,EXECUTING,UC_HRSCUK`.
+- `lead_status_ids` — статусы лидов через запятую.
+- `filter_company_contact_by_deal_stage=true` — компании и контакты переносить только если у них есть связанная сделка старого менеджера в выбранной стадии.
 
-После проверки artifact `reassign-crm-owner-log` можно запускать:
+## Пример
 
-```text
-dry_run = false
-```
+Передать 10 компаний/контактов/сделок со стадии `NEW`:
 
-## Важно
+- `include_companies=true`
+- `include_contacts=true`
+- `include_leads=false`
+- `include_deals=true`
+- `deal_stage_ids=NEW`
+- `filter_company_contact_by_deal_stage=true`
+- `max_total=10`
 
-По умолчанию сделки не переносит. Для полного переезда менеджера включить:
-
-```text
-include_deals = true
-include_closed_deals = true/false по ситуации
-```
