@@ -27,6 +27,7 @@ from .audit_repair_deal_packages import (
 from .bitrix_client import BitrixClient
 from .distribute_companies import ALLOWED_USER_IDS, HARD_BIN_OWNERS, USER_NAMES, _normalize_text
 from .config.assignment import load_manual_director_owners_raw
+from .director import director_identity_key
 from .settings import Settings
 
 
@@ -46,7 +47,7 @@ def build_manual_director_owners() -> dict[str, int]:
         if user_id not in ALLOWED_USER_IDS:
             raise SystemExit(f"Manual target user {user_id} is not in ALLOWED_USER_IDS")
         for name in names:
-            normalized = _normalize_text(name)
+            normalized = director_identity_key(name) or _normalize_text(name)
             if not normalized:
                 continue
             if normalized in index and index[normalized] != user_id:
@@ -351,7 +352,7 @@ def main() -> int:
         director = record_director(record)
         if not director:
             continue
-        key = _normalize_text(director)
+        key = director_identity_key(director) or _normalize_text(director)
         target_user_id = MANUAL_DIRECTOR_OWNERS.get(key)
         if target_user_id is None:
             continue

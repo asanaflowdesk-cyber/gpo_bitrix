@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .bitrix_client import BitrixClient
+from .director import director_identity_key
 from .distribute_companies import (
     ALLOWED_USER_IDS,
     HARD_BIN_OWNERS,
@@ -326,7 +327,7 @@ def group_key_for_record(record: dict[str, Any]) -> tuple[str, str, str]:
         return f"hard_bin|{bin_value}", "hard_bin", bin_value
 
     if director:
-        return f"director|{_normalize_text(director)}", "director", director
+        return f"director|{director_identity_key(director) or _normalize_text(director)}", "director", director
 
     if bin_value:
         return f"bin|{bin_value}", "bin", bin_value
@@ -513,7 +514,7 @@ def build_director_hints(
         director = record_director(record)
         if not director:
             continue
-        normalized = _normalize_text(director)
+        normalized = director_identity_key(director) or _normalize_text(director)
         bin_value = record_bin(record)
         owner = record.get("owner_id")
 
@@ -558,7 +559,7 @@ def choose_target(
 
     director_targets = set()
     for director in directors:
-        hint = director_hints.get(_normalize_text(director))
+        hint = director_hints.get(director_identity_key(director) or _normalize_text(director))
         if hint in ALLOWED_USER_IDS:
             director_targets.add(hint)
 

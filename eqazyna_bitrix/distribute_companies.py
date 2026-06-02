@@ -27,6 +27,7 @@ SOURCE_RESPONSIBLE_ID = 36
 
 from .manager_config import load_manager_config
 from .config.assignment import load_hard_bin_owners, load_hard_bin_owners_raw
+from .director import director_identity_key
 
 _MANAGER_CONFIG = load_manager_config()
 
@@ -229,7 +230,7 @@ def _company_group_key(company: dict[str, Any]) -> tuple[str, str, str]:
     director = _company_director(company)
 
     if director:
-        normalized = _normalize_text(director)
+        normalized = director_identity_key(director) or _normalize_text(director)
         return f"director|{normalized}", "director", director
 
     bin_value = _company_bin(company) or f"company-{company.get('ID')}"

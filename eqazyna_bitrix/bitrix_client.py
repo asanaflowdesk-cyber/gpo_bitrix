@@ -6,6 +6,8 @@ from typing import Any
 
 import requests
 
+from .director import director_identity_keys
+
 
 class BitrixError(RuntimeError):
     pass
@@ -247,6 +249,63 @@ def _find_contact_by_fio(self, last_name: str, name: str, second_name: str = "")
     return None
 
 
+def _contact_full_name(contact: dict[str, Any]) -> str:
+    parts = [
+        str(contact.get("LAST_NAME") or "").strip(),
+        str(contact.get("NAME") or "").strip(),
+        str(contact.get("SECOND_NAME") or "").strip(),
+    ]
+    return " ".join(part for part in parts if part)
+
+
+def _find_contact_by_director_alias(self, director_raw: str) -> dict[str, Any] | None:
+    target_keys = set(director_identity_keys(director_raw))
+    if not target_keys:
+        return None
+
+    tokens = []
+    for key in target_keys:
+        parts = key.split("|")
+        for part in parts[1:]:
+            if len(part) > 1 and part not in tokens:
+                tokens.append(part)
+
+    candidates: dict[str, dict[str, Any]] = {}
+    for token in tokens[:6]:
+        for field_name in ("LAST_NAME", "NAME"):
+            try:
+                result = self.call(
+                    "crm.contact.list",
+                    {
+                        "order": {"ID": "DESC"},
+                        "filter": {field_name: token},
+                        "select": [
+                            "ID",
+                            "NAME",
+                            "SECOND_NAME",
+                            "LAST_NAME",
+                            "POST",
+                            "COMMENTS",
+                            "COMPANY_ID",
+                            "ASSIGNED_BY_ID",
+                        ],
+                    },
+                )
+            except Exception:
+                continue
+            if isinstance(result, list):
+                for contact in result:
+                    contact_id = str(contact.get("ID") or "")
+                    if contact_id:
+                        candidates[contact_id] = contact
+
+    for contact in sorted(candidates.values(), key=lambda item: int(item.get("ID") or 0), reverse=True):
+        contact_keys = set(director_identity_keys(_contact_full_name(contact)))
+        if target_keys.intersection(contact_keys):
+            return contact
+    return None
+
+
 def _create_contact(self, fields: dict[str, Any]) -> str:
     result = self.call("crm.contact.add", {"fields": fields, "params": {"REGISTER_SONET_EVENT": "N"}})
     return str(result)
@@ -361,6 +420,7 @@ def _list_eqazyna_leads(self, limit: int | None = None) -> list[dict[str, Any]]:
 BitrixClient.call_full = _bitrix_call_full  # type: ignore[attr-defined]
 BitrixClient.list_all = _bitrix_list_all  # type: ignore[attr-defined]
 BitrixClient.find_contact_by_fio = _find_contact_by_fio  # type: ignore[attr-defined]
+BitrixClient.find_contact_by_director_alias = _find_contact_by_director_alias  # type: ignore[attr-defined]
 BitrixClient.create_contact = _create_contact  # type: ignore[attr-defined]
 BitrixClient.update_contact = _update_contact  # type: ignore[attr-defined]
 BitrixClient.company_contact_ids = _company_contact_ids  # type: ignore[attr-defined]

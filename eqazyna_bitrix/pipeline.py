@@ -8,7 +8,7 @@ from collections import Counter
 from .bitrix_client import BitrixClient, BitrixError
 from .formatter import build_company_summary, build_deal_comment, build_deal_title, build_lead_comment, build_lead_title
 from .models import Application, CompanyEnrichment, ProcessResult
-from .director import split_director_fio
+from .director import director_identity_key, director_identity_keys, director_keys_match, split_director_fio
 from .distribute_companies import (
     ALLOWED_USER_IDS,
     HARD_BIN_OWNERS,
@@ -306,9 +306,8 @@ class BitrixPipeline:
         normalized_bin = _normalize_bin(bin_value or "")
         if normalized_bin:
             keys.append(f"bin|{normalized_bin}")
-        normalized_director = _normalize_text(director or "")
-        if normalized_director:
-            keys.append(f"director|{normalized_director}")
+        for director_key in director_identity_keys(director):
+            keys.append(f"director|{director_key}")
         return keys
 
     def _cached_assignment(self, bin_value: str | None, director: str | None) -> tuple[int | None, str | None]:
@@ -355,14 +354,14 @@ class BitrixPipeline:
         return self._eqazyna_deals_cache
 
     def _package_owner_by_director(self, director: str | None) -> tuple[int | None, str | None]:
-        normalized_director = _normalize_text(director or "")
-        if not normalized_director:
+        director_keys = set(director_identity_keys(director))
+        if not director_keys:
             return None, None
 
         counts: Counter[int] = Counter()
         for company in self._list_eqazyna_companies_cached():
             company_director = _extract_director_from_comments(str(company.get("COMMENTS") or ""))
-            if _normalize_text(company_director) != normalized_director:
+            if not director_keys.intersection(director_identity_keys(company_director)):
                 continue
             owner_id = self._record_assigned_by_id(company)
             if not self._is_allowed_manager(owner_id):
@@ -464,12 +463,17 @@ class BitrixPipeline:
         if self.config.dry_run:
             return "DRY_RUN_CONTACT", "dry_run_director_contact", None
         try:
-            cached_id = self._director_contact_cache.get(fio.normalized)
+            cache_keys = director_identity_keys(fio.raw) or [fio.normalized]
+            cached_id = next((self._director_contact_cache.get(key) for key in cache_keys if self._director_contact_cache.get(key)), None)
             if cached_id:
                 contact_id = cached_id
                 action_parts = ["cached_contact"]
             else:
                 contact = self.client.find_contact_by_fio(fio.last_name, fio.name, fio.second_name)
+                if not contact:
+                    find_alias = getattr(self.client, "find_contact_by_director_alias", None)
+                    if callable(find_alias):
+                        contact = find_alias(fio.raw)
                 if contact:
                     contact_id = str(contact["ID"])
                     action_parts = ["existing_contact"]
@@ -496,7 +500,8 @@ class BitrixPipeline:
                         fields["ASSIGNED_BY_ID"] = int(contact_owner_id)
                     contact_id = self.client.create_contact(fields)
                     action_parts = ["created_contact"]
-                self._director_contact_cache[fio.normalized] = contact_id
+                for cache_key in cache_keys:
+                    self._director_contact_cache[cache_key] = contact_id
 
             company_linked = self.client.link_contact_to_company(company_id, contact_id, primary=True)
             action_parts.append("linked_company" if company_linked else "company_already_linked")
@@ -622,21 +627,22 @@ class BitrixPipeline:
     def _failed_deal_inheritance_for_director(self, director: str | None) -> FailedDealInheritance | None:
         if not self.config.inherit_failed_deals_by_director:
             return None
-        normalized_director = _normalize_text(director or "")
-        if not normalized_director:
+        director_key = director_identity_key(director)
+        director_keys = set(director_identity_keys(director))
+        if not director_key or not director_keys:
             return None
-        if normalized_director in self._failed_deal_by_director_cache:
-            return self._failed_deal_by_director_cache[normalized_director]
+        if director_key in self._failed_deal_by_director_cache:
+            return self._failed_deal_by_director_cache[director_key]
 
         company_ids: set[str] = set()
         for company in self._list_eqazyna_companies_cached():
             company_director = _extract_director_from_comments(str(company.get("COMMENTS") or ""))
-            if _normalize_text(company_director) == normalized_director:
+            if director_keys.intersection(director_identity_keys(company_director)):
                 if company.get("ID") is not None:
                     company_ids.add(str(company.get("ID")))
 
         if not company_ids:
-            self._failed_deal_by_director_cache[normalized_director] = None
+            self._failed_deal_by_director_cache[director_key] = None
             return None
 
         failed_deals: list[dict[str, Any]] = []
@@ -647,7 +653,7 @@ class BitrixPipeline:
                 failed_deals.append(deal)
 
         if not failed_deals:
-            self._failed_deal_by_director_cache[normalized_director] = None
+            self._failed_deal_by_director_cache[director_key] = None
             return None
 
         def sort_key(deal: dict[str, Any]) -> tuple[int, str]:
@@ -666,7 +672,7 @@ class BitrixPipeline:
             source_deal_id=str(source_deal.get("ID")) if source_deal.get("ID") is not None else None,
             source_deal_title=self._string_value(source_deal.get("TITLE")),
         )
-        self._failed_deal_by_director_cache[normalized_director] = inheritance
+        self._failed_deal_by_director_cache[director_key] = inheritance
         return inheritance
 
     def _deal_fields(
