@@ -1,0 +1,125 @@
+name: Audit director alias duplicates
+
+run-name: >-
+  Audit director alias duplicates / eqazyna=${{ inputs.only_eqazyna }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      only_eqazyna:
+        description: "Проверять только e-Qazyna компании/сделки"
+        required: true
+        default: "true"
+      include_closed_deals:
+        description: "Включать закрытые сделки"
+        required: true
+        default: "true"
+      include_contacts:
+        description: "Проверять контакты Bitrix"
+        required: true
+        default: "true"
+      include_companies:
+        description: "Проверять компании/клиентов"
+        required: true
+        default: "true"
+      include_deals:
+        description: "Проверять сделки и руководителей из комментариев"
+        required: true
+        default: "true"
+      max_contacts:
+        description: "Лимит контактов для теста. 0 = без лимита"
+        required: false
+        default: "0"
+      max_companies:
+        description: "Лимит компаний для теста. 0 = без лимита"
+        required: false
+        default: "0"
+      max_deals:
+        description: "Лимит сделок для теста. 0 = без лимита"
+        required: false
+        default: "0"
+      min_records_per_group:
+        description: "Минимум записей в alias-группе"
+        required: false
+        default: "2"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  audit-director-alias-duplicates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+      REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
+      BITRIX_POLITE_DELAY_SECONDS: ${{ vars.BITRIX_POLITE_DELAY_SECONDS || '0.15' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Preflight checks
+        run: |
+          python scripts/validate_repo.py
+          python -m eqazyna_bitrix.audit_director_alias_duplicates --help >/dev/null
+
+      - name: Audit possible duplicate director aliases
+        run: |
+          mkdir -p exports
+
+          ARGS=(
+            python -m eqazyna_bitrix.audit_director_alias_duplicates
+            --max-contacts "${{ inputs.max_contacts }}"
+            --max-companies "${{ inputs.max_companies }}"
+            --max-deals "${{ inputs.max_deals }}"
+            --min-records-per-group "${{ inputs.min_records_per_group }}"
+            --summary-out "exports/director_alias_groups.csv"
+            --suspects-out "exports/director_alias_suspects.csv"
+            --records-out "exports/director_alias_records.csv"
+          )
+
+          if [ "${{ inputs.only_eqazyna }}" = "true" ]; then
+            ARGS+=(--only-eqazyna)
+          fi
+          if [ "${{ inputs.include_closed_deals }}" = "true" ]; then
+            ARGS+=(--include-closed-deals)
+          fi
+          if [ "${{ inputs.include_contacts }}" = "true" ]; then
+            ARGS+=(--include-contacts)
+          fi
+          if [ "${{ inputs.include_companies }}" = "true" ]; then
+            ARGS+=(--include-companies)
+          fi
+          if [ "${{ inputs.include_deals }}" = "true" ]; then
+            ARGS+=(--include-deals)
+          fi
+
+          "${ARGS[@]}"
+          ls -lah exports
+
+      - name: Upload alias audit logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: director-alias-audit
+          path: |
+            exports/*.csv
+          if-no-files-found: ignore
+          retention-days: 14
