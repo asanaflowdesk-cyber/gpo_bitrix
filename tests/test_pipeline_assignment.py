@@ -10,6 +10,9 @@ class FakeClient:
     def list_all(self, method, payload):
         return list(self.companies)
 
+    def list_eqazyna_deals(self):
+        return []
+
 
 def _pipe(assigned_by_id: str | None = "36", companies=None) -> BitrixPipeline:
     return BitrixPipeline(client=FakeClient(companies), config=BitrixPipelineConfig(assigned_by_id=assigned_by_id))  # type: ignore[arg-type]
@@ -63,7 +66,7 @@ def test_director_package_owner_is_reused_for_new_bin():
     target, reason = pipe._resolve_target_responsible(_app(), CompanyEnrichment(bin="123456789012", director="ИВАНОВ ИВАН ИВАНОВИЧ"), None)
 
     assert target == 74
-    assert reason == "existing_director_package_owner"
+    assert reason == "historical_first_company_owner"
 
 
 def test_deal_fields_use_explicit_responsible_id():
@@ -152,7 +155,7 @@ def test_director_package_owner_overrides_existing_company_owner():
     )
 
     assert target == 74
-    assert reason == "existing_director_package_owner"
+    assert reason == "historical_first_company_owner"
 
 
 def test_director_contact_owner_is_canonical_for_new_deal():
@@ -178,31 +181,85 @@ def test_director_contact_owner_is_canonical_for_new_deal():
     assert reason == "existing_director_contact_owner"
 
 
-def test_split_director_package_is_blocked_instead_of_silently_assigning():
+def test_split_director_package_uses_oldest_company_owner_when_no_deals_exist():
     companies = [
         {
             "ID": "1",
+            "DATE_CREATE": "2026-01-01T00:00:00+00:00",
             "ASSIGNED_BY_ID": "74",
             "COMMENTS": "Руководитель: ИВАНОВ ИВАН ИВАНОВИЧ",
         },
         {
             "ID": "2",
+            "DATE_CREATE": "2026-02-01T00:00:00+00:00",
             "ASSIGNED_BY_ID": "92",
             "COMMENTS": "Руководитель: ИВАНОВ ИВАН ИВАНОВИЧ",
         },
     ]
     pipe = _pipe("36", companies=companies)
 
-    try:
-        pipe._resolve_target_responsible(
-            _app("444444444444"),
-            CompanyEnrichment(bin="444444444444", director="ИВАНОВ ИВАН ИВАНОВИЧ"),
-            None,
-        )
-    except Exception as exc:
-        assert "DIRECTOR_PACKAGE_OWNER_CONFLICT" in str(exc)
-    else:
-        raise AssertionError("split director package must be blocked")
+    target, reason = pipe._resolve_target_responsible(
+        _app("444444444444"),
+        CompanyEnrichment(bin="444444444444", director="ИВАНОВ ИВАН ИВАНОВИЧ"),
+        None,
+    )
+
+    assert target == 74
+    assert reason == "historical_first_company_owner"
+
+
+def test_oldest_deal_owner_wins_over_newer_deals_and_contact_owner():
+    companies = [
+        {
+            "ID": "1",
+            "DATE_CREATE": "2026-01-01T00:00:00+00:00",
+            "ASSIGNED_BY_ID": "92",
+            "COMMENTS": "Руководитель: ИВАНОВ ИВАН ИВАНОВИЧ",
+        }
+    ]
+    deals = [
+        {
+            "ID": "10",
+            "DATE_CREATE": "2026-01-02T00:00:00+00:00",
+            "COMPANY_ID": "1",
+            "ASSIGNED_BY_ID": "74",
+            "COMMENTS": "Руководитель: ИВАНОВ ИВАН ИВАНОВИЧ",
+        },
+        {
+            "ID": "11",
+            "DATE_CREATE": "2026-02-02T00:00:00+00:00",
+            "COMPANY_ID": "1",
+            "ASSIGNED_BY_ID": "92",
+            "COMMENTS": "Руководитель: ИВАНОВ ИВАН ИВАНОВИЧ",
+        },
+        {
+            "ID": "12",
+            "DATE_CREATE": "2026-03-02T00:00:00+00:00",
+            "COMPANY_ID": "1",
+            "ASSIGNED_BY_ID": "92",
+            "COMMENTS": "Руководитель: ИВАНОВ ИВАН ИВАНОВИЧ",
+        },
+    ]
+    contact = {
+        "ID": "500",
+        "LAST_NAME": "ИВАНОВ",
+        "NAME": "ИВАН",
+        "SECOND_NAME": "ИВАНОВИЧ",
+        "ASSIGNED_BY_ID": "92",
+    }
+    pipe = BitrixPipeline(
+        client=FakeClientWithContactsAndDeals(companies, deals, contact),  # type: ignore[arg-type]
+        config=BitrixPipelineConfig(assigned_by_id="36"),
+    )
+
+    target, reason = pipe._resolve_target_responsible(
+        _app("777777777777"),
+        CompanyEnrichment(bin="777777777777", director="ИВАНОВ ИВАН ИВАНОВИЧ"),
+        None,
+    )
+
+    assert target == 74
+    assert reason == "historical_first_deal_owner"
 
 
 def test_runtime_cache_rejects_two_managers_for_one_director():

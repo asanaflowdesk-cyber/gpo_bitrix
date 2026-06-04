@@ -5,8 +5,10 @@ Rule:
   one physical director + every linked director contact + every company in the
   director's deals + every deal of that director = one ASSIGNED_BY_ID.
 
-Unlike the regular e-Qazyna import, this script loads EXISTING Bitrix deals via
-crm.deal.list. It is not limited to newly parsed applications or to one stage.
+The target owner is NOT selected by majority. It is the historical package
+anchor: the manager on the oldest existing non-technical deal of the director.
+Manual director fixations override the historical anchor. If no eligible deal
+exists, the oldest eligible company owner is used as a fallback.
 """
 from __future__ import annotations
 
@@ -15,7 +17,8 @@ import csv
 import json
 import os
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -25,12 +28,15 @@ from .config.assignment import load_manual_director_owners_raw
 from .director import (
     clean_director_value,
     director_identity_key,
+    director_identity_keys,
     director_keys_match,
     extract_director_from_text,
 )
+from .distribute_companies import ALLOWED_USER_IDS
 
 DEFAULT_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
 BITRIX_WEBHOOK_URL = os.getenv("BITRIX_WEBHOOK_URL", "").strip()
+ALLOWED_TARGET_IDS = {str(user_id) for user_id in ALLOWED_USER_IDS}
 
 
 class BitrixError(RuntimeError):
@@ -54,8 +60,8 @@ def normalize_webhook(url: str) -> str:
 
 def csv_write(path: str, rows: List[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=list(fieldnames), extrasaction="ignore")
+    with open(path, "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=list(fieldnames), extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow({key: row.get(key, "") for key in fieldnames})
@@ -71,6 +77,27 @@ def contact_url_hint(contact_id: Any) -> str:
 
 def company_url_hint(company_id: Any) -> str:
     return f"/crm/company/details/{company_id}/" if company_id else ""
+
+
+def parse_datetime(value: Any) -> datetime:
+    raw = s(value)
+    if not raw:
+        return datetime.max.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return datetime.max.replace(tzinfo=timezone.utc)
+
+
+def entity_sort_key(record: Dict[str, Any]) -> Tuple[datetime, int]:
+    try:
+        entity_id = int(record.get("ID") or 0)
+    except (TypeError, ValueError):
+        entity_id = 0
+    return parse_datetime(record.get("DATE_CREATE")), entity_id
 
 
 class Bitrix:
@@ -201,21 +228,24 @@ def load_manual_owner_index() -> Dict[str, str]:
     result: Dict[str, str] = {}
     for user_id, director_names in load_manual_director_owners_raw().items():
         for director_name in director_names:
-            key = director_identity_key(director_name)
-            if key:
-                result[key] = str(user_id)
+            for key in director_identity_keys(director_name) or [director_identity_key(director_name)]:
+                if key:
+                    result[key] = str(user_id)
     return result
 
 
 def resolve_manual_owner(director_names: Sequence[str], manual_index: Dict[str, str]) -> str:
+    owners: Set[str] = set()
     for name in director_names:
-        key = director_identity_key(name)
-        if key and key in manual_index:
-            return manual_index[key]
+        for key in director_identity_keys(name) or [director_identity_key(name)]:
+            if key and key in manual_index:
+                owners.add(manual_index[key])
         for configured_key, owner_id in manual_index.items():
             configured_name = configured_key.split("|", 1)[-1]
             if director_keys_match(name, configured_name):
-                return owner_id
+                owners.add(owner_id)
+    if len(owners) == 1:
+        return next(iter(owners))
     return ""
 
 
@@ -245,64 +275,70 @@ def resolve_director_for_deal(bx: Bitrix, deal: Dict[str, Any]) -> Tuple[str, st
     return "", "", contact_id, "unresolved"
 
 
-def choose_target_owner(
+def eligible_owner(owner_id: str, source_ids: Set[str]) -> bool:
+    return bool(owner_id and owner_id not in source_ids and owner_id in ALLOWED_TARGET_IDS)
+
+
+def choose_historical_target(
     director_names: Sequence[str],
-    contact_owners: List[str],
-    deal_owners: List[str],
-    company_owners: List[str],
+    package_deals: List[Dict[str, Any]],
+    companies: Dict[str, Dict[str, Any]],
+    contacts: Dict[str, Dict[str, Any]],
     source_ids: Set[str],
-    policy: str,
     manual_index: Dict[str, str],
-) -> Tuple[str, str, str]:
+) -> Tuple[str, str, str, Dict[str, Any]]:
+    """Return target_id, reason, conflict_note, historical evidence."""
     manual_owner = resolve_manual_owner(director_names, manual_index)
     if manual_owner:
-        return manual_owner, "manual_director_owner", ""
+        return manual_owner, "manual_director_owner", "", {
+            "historical_entity_type": "manual_director",
+            "historical_entity_id": "",
+            "historical_entity_date": "",
+            "historical_owner_id": manual_owner,
+        }
 
-    valid_contacts = [owner for owner in contact_owners if owner and owner not in source_ids]
-    valid_deals = [owner for owner in deal_owners if owner and owner not in source_ids]
-    valid_companies = [owner for owner in company_owners if owner and owner not in source_ids]
+    eligible_deals = [deal for deal in package_deals if eligible_owner(s(deal.get("ASSIGNED_BY_ID")), source_ids)]
+    if eligible_deals:
+        oldest_deal = min(eligible_deals, key=entity_sort_key)
+        owner_id = s(oldest_deal.get("ASSIGNED_BY_ID"))
+        return owner_id, "historical_first_deal_owner", "", {
+            "historical_entity_type": "deal",
+            "historical_entity_id": s(oldest_deal.get("ID")),
+            "historical_entity_date": s(oldest_deal.get("DATE_CREATE")),
+            "historical_owner_id": owner_id,
+        }
 
-    policy = (policy or "rules_then_majority").strip().lower()
-    if policy in {"director", "contact", "director_contact"}:
-        unique_contacts = sorted(set(valid_contacts))
-        if len(unique_contacts) == 1:
-            return unique_contacts[0], "single_non_technical_director_contact_owner", ""
-        return "", "ambiguous_or_missing_director_contact_owner", ",".join(unique_contacts)
+    eligible_companies = [company for company in companies.values() if eligible_owner(s(company.get("ASSIGNED_BY_ID")), source_ids)]
+    if eligible_companies:
+        oldest_company = min(eligible_companies, key=entity_sort_key)
+        owner_id = s(oldest_company.get("ASSIGNED_BY_ID"))
+        return owner_id, "historical_first_company_owner", "", {
+            "historical_entity_type": "company",
+            "historical_entity_id": s(oldest_company.get("ID")),
+            "historical_entity_date": s(oldest_company.get("DATE_CREATE")),
+            "historical_owner_id": owner_id,
+        }
 
-    unique_contacts = sorted(set(valid_contacts))
-    if len(unique_contacts) == 1:
-        return unique_contacts[0], "single_non_technical_director_contact_owner", ""
+    contact_owners = sorted({s(contact.get("ASSIGNED_BY_ID")) for contact in contacts.values() if eligible_owner(s(contact.get("ASSIGNED_BY_ID")), source_ids)})
+    if len(contact_owners) == 1:
+        owner_id = contact_owners[0]
+        return owner_id, "director_contact_owner_fallback", "", {
+            "historical_entity_type": "contact_fallback",
+            "historical_entity_id": "",
+            "historical_entity_date": "",
+            "historical_owner_id": owner_id,
+        }
+    if len(contact_owners) > 1:
+        return "", "ambiguous_director_contacts", ",".join(contact_owners), {}
 
-    unique_deals = sorted(set(valid_deals))
-    if len(unique_deals) == 1:
-        return unique_deals[0], "single_non_technical_deal_owner", ""
-
-    unique_companies = sorted(set(valid_companies))
-    if len(unique_companies) == 1 and not unique_deals:
-        return unique_companies[0], "single_non_technical_company_owner", ""
-
-    weights: Counter[str] = Counter()
-    for owner in valid_contacts:
-        weights[owner] += 5
-    for owner in valid_deals:
-        weights[owner] += 3
-    for owner in valid_companies:
-        weights[owner] += 1
-
-    if weights:
-        top = weights.most_common()
-        if len(top) == 1 or top[0][1] > top[1][1]:
-            return top[0][0], "weighted_majority", ""
-        return "", "ambiguous_majority", "; ".join(f"{owner}:{weight}" for owner, weight in top)
-
-    return "", "no_target_owner", ""
+    return "", "no_historical_target_owner", "", {}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Full audit/repair of all existing Bitrix deals by director package")
+    parser = argparse.ArgumentParser(description="Full historical audit/repair of all existing Bitrix deals by director package")
     parser.add_argument("--source-responsible-ids", default="36,44")
     parser.add_argument("--deal-category-id", default="all")
-    parser.add_argument("--target-policy", default="rules_then_majority")
+    parser.add_argument("--target-policy", default="historical_first", help="Compatibility argument. Historical-first is always used.")
     parser.add_argument("--max-deals", type=int, default=0, help="0 = no limit")
     parser.add_argument("--summary-out", default="exports/director_package_owner_summary.csv")
     parser.add_argument("--mismatch-out", default="exports/director_package_owner_mismatches.csv")
@@ -317,7 +353,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     bx = Bitrix(BITRIX_WEBHOOK_URL)
     source_ids = parse_csv_set(args.source_responsible_ids)
     manual_index = load_manual_owner_index()
-
     deals = get_deals(bx, args.deal_category_id, args.only_eqazyna, args.include_closed_deals, args.max_deals)
 
     packages: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
@@ -364,13 +399,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         contacts = {cid: bx.get_contact(cid) for cid in contact_ids}
         companies = {cid: bx.get_company(cid) for cid in company_ids}
 
+        target_id, target_reason, conflict_note, evidence = choose_historical_target(
+            director_names, package_deals, companies, contacts, source_ids, manual_index
+        )
+        target_name = bx.get_user_name(target_id) if target_id else ""
         contact_owners = [s(contact.get("ASSIGNED_BY_ID")) for contact in contacts.values()]
         company_owners = [s(company.get("ASSIGNED_BY_ID")) for company in companies.values()]
         deal_owners = [s(deal.get("ASSIGNED_BY_ID")) for deal in package_deals]
-        target_id, target_reason, conflict_note = choose_target_owner(
-            director_names, contact_owners, deal_owners, company_owners, source_ids, args.target_policy, manual_index
-        )
-        target_name = bx.get_user_name(target_id) if target_id else ""
         owner_set = {owner for owner in contact_owners + company_owners + deal_owners if owner}
         has_mismatch = len(owner_set) > 1 or bool(target_id and any(owner != target_id for owner in owner_set))
 
@@ -380,6 +415,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "target_owner_id": target_id,
             "target_owner_name": target_name,
             "target_reason": target_reason,
+            "historical_entity_type": evidence.get("historical_entity_type", ""),
+            "historical_entity_id": evidence.get("historical_entity_id", ""),
+            "historical_entity_date": evidence.get("historical_entity_date", ""),
+            "historical_owner_id": evidence.get("historical_owner_id", ""),
+            "historical_owner_name": bx.get_user_name(evidence.get("historical_owner_id")) if evidence.get("historical_owner_id") else "",
             "conflict_note": conflict_note,
             "contact_count": len(contact_ids),
             "company_count": len(company_ids),
@@ -394,7 +434,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             nonlocal updated_contacts, updated_companies, updated_deals, error_count
             if not target_id or not current_owner or current_owner == target_id:
                 return
-            mismatch_rows.append({
+            base = {
                 "director_key": director_key,
                 "director_names": " | ".join(director_names),
                 "entity_type": entity_type,
@@ -405,9 +445,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "target_owner_id": target_id,
                 "target_owner_name": target_name,
                 "target_reason": target_reason,
+                "historical_entity_type": evidence.get("historical_entity_type", ""),
+                "historical_entity_id": evidence.get("historical_entity_id", ""),
+                "historical_entity_date": evidence.get("historical_entity_date", ""),
                 "url_hint": url_hint,
                 **extra,
-            })
+            }
+            mismatch_rows.append(base)
             status = "dry_run_update" if args.dry_run or not args.repair else "updated"
             error = ""
             if args.repair and not args.dry_run:
@@ -427,8 +471,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     error_count += 1
             action_rows.append({
                 "action": status,
-                "director_key": director_key,
-                "director_names": " | ".join(director_names),
                 "entity_type": entity_type,
                 "entity_id": entity_id,
                 "entity_title": title,
@@ -437,6 +479,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "to_owner_id": target_id,
                 "to_owner_name": target_name,
                 "reason": target_reason,
+                "historical_entity_type": evidence.get("historical_entity_type", ""),
+                "historical_entity_id": evidence.get("historical_entity_id", ""),
+                "historical_entity_date": evidence.get("historical_entity_date", ""),
                 "error": error,
             })
 
@@ -458,19 +503,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
     summary_fields = [
-        "director_key", "director_names", "target_owner_id", "target_owner_name", "target_reason", "conflict_note",
-        "contact_count", "company_count", "deal_count", "distinct_owner_ids", "distinct_owner_names", "resolution_sources", "has_mismatch",
+        "director_key", "director_names", "target_owner_id", "target_owner_name", "target_reason",
+        "historical_entity_type", "historical_entity_id", "historical_entity_date", "historical_owner_id", "historical_owner_name",
+        "conflict_note", "contact_count", "company_count", "deal_count", "distinct_owner_ids", "distinct_owner_names",
+        "resolution_sources", "has_mismatch",
     ]
     mismatch_fields = [
         "director_key", "director_names", "entity_type", "entity_id", "entity_title", "current_owner_id", "current_owner_name",
-        "target_owner_id", "target_owner_name", "target_reason", "company_id", "deal_id", "stage_id", "closed", "url_hint",
+        "target_owner_id", "target_owner_name", "target_reason", "historical_entity_type", "historical_entity_id", "historical_entity_date",
+        "company_id", "deal_id", "stage_id", "closed", "url_hint",
     ]
     unresolved_fields = [
         "deal_id", "deal_title", "company_id", "contact_id", "stage_id", "closed", "assigned_by_id", "assigned_by_name", "reason", "deal_url_hint",
     ]
     action_fields = [
-        "action", "director_key", "director_names", "entity_type", "entity_id", "entity_title", "from_owner_id", "from_owner_name",
-        "to_owner_id", "to_owner_name", "reason", "error",
+        "action", "entity_type", "entity_id", "entity_title", "from_owner_id", "from_owner_name", "to_owner_id", "to_owner_name",
+        "reason", "historical_entity_type", "historical_entity_id", "historical_entity_date", "error",
     ]
 
     csv_write(args.summary_out, summary_rows, summary_fields)
@@ -478,12 +526,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     csv_write(args.unresolved_out, unresolved_rows, unresolved_fields)
     csv_write(args.out, action_rows, action_fields)
 
-    print("FULL_DIRECTOR_PACKAGE_OWNER_AUDIT_DONE")
+    print("HISTORICAL_DIRECTOR_PACKAGE_OWNER_AUDIT_DONE")
     print(json.dumps({
         "deals_loaded": len(deals),
-        "deals_resolved_to_director": sum(len(package["deals"]) for package in packages.values()),
-        "deals_unresolved": len(unresolved_rows),
-        "director_packages": len(packages),
+        "packages": len(packages),
+        "unresolved_deals": len(unresolved_rows),
         "summary_rows": len(summary_rows),
         "mismatch_rows": len(mismatch_rows),
         "action_rows": len(action_rows),

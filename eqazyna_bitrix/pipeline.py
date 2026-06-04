@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 import random
 from collections import Counter
+from datetime import datetime, timezone
 
 from .bitrix_client import BitrixClient, BitrixError
 from .formatter import build_company_summary, build_deal_comment, build_deal_title, build_lead_comment, build_lead_title
@@ -391,7 +392,7 @@ class BitrixPipeline:
                     {
                         "order": {"ID": "ASC"},
                         "filter": {"ORIGINATOR_ID": "EQAZYNA"},
-                        "select": ["ID", "TITLE", "ASSIGNED_BY_ID", "ORIGINATOR_ID", "ORIGIN_ID", "COMMENTS"],
+                        "select": ["ID", "TITLE", "ASSIGNED_BY_ID", "ORIGINATOR_ID", "ORIGIN_ID", "COMMENTS", "DATE_CREATE"],
                     },
                 )
         return self._eqazyna_companies_cache
@@ -447,58 +448,79 @@ class BitrixPipeline:
             self._director_contact_owner_cache[key] = result
         return result
 
-    def _package_owner_by_director(self, director: str | None) -> tuple[int | None, str | None]:
-        """Return the only existing manager for a director package.
+    def _historical_sort_key(self, record: dict[str, Any]) -> tuple[datetime, int]:
+        """Sort oldest CRM entities first, with ID as deterministic fallback."""
+        raw_date = str(record.get("DATE_CREATE") or "").strip()
+        parsed = datetime.max.replace(tzinfo=timezone.utc)
+        if raw_date:
+            try:
+                parsed = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+        try:
+            record_id = int(record.get("ID") or 0)
+        except (TypeError, ValueError):
+            record_id = 0
+        return parsed, record_id
 
-        A package is the director plus all matching e-Qazyna companies and their
-        deals. If the existing package is already split between several real
-        managers and there is no stronger manual/contact owner, the parser must
-        stop that row instead of silently choosing one and creating another
-        mismatch.
+    def _package_owner_by_director(self, director: str | None) -> tuple[int | None, str | None]:
+        """Return the historical owner of an existing director package.
+
+        Historical owner means the manager on the oldest existing non-technical
+        deal of this director. Newer accidentally assigned deals cannot outvote
+        that anchor. If the package has no usable deal yet, the oldest usable
+        company owner is used as a fallback.
         """
         director_keys = set(director_identity_keys(director))
         if not director_keys:
             return None, None
 
-        counts: Counter[int] = Counter()
-        company_ids: set[str] = set()
-
+        matching_company_ids: set[str] = set()
+        matching_companies: list[dict[str, Any]] = []
         for company in self._list_eqazyna_companies_cached():
             company_director = _extract_director_from_comments(str(company.get("COMMENTS") or ""))
             if not director_keys.intersection(director_identity_keys(company_director)):
                 continue
+            matching_companies.append(company)
             company_id = str(company.get("ID") or "")
             if company_id:
-                company_ids.add(company_id)
-            owner_id = self._record_assigned_by_id(company)
-            if self._is_allowed_manager(owner_id) and not self._is_source_responsible(owner_id):
-                counts[owner_id] += 1
+                matching_company_ids.add(company_id)
 
-        if company_ids:
-            try:
-                for deal in self._list_eqazyna_deals_cached():
-                    if str(deal.get("COMPANY_ID") or "") not in company_ids:
-                        continue
-                    owner_id = self._record_assigned_by_id(deal)
-                    if self._is_allowed_manager(owner_id) and not self._is_source_responsible(owner_id):
-                        counts[owner_id] += 1
-            except Exception:
-                # Company owners are still enough to resolve a clean package.
-                pass
+        matching_deals: list[dict[str, Any]] = []
+        for deal in self._list_eqazyna_deals_cached():
+            deal_company_id = str(deal.get("COMPANY_ID") or "")
+            deal_director = _extract_director_from_comments(str(deal.get("COMMENTS") or ""))
+            matches_by_company = bool(deal_company_id and deal_company_id in matching_company_ids)
+            matches_by_comment = bool(director_keys.intersection(director_identity_keys(deal_director)))
+            if not (matches_by_company or matches_by_comment):
+                continue
+            matching_deals.append(deal)
+            if deal_company_id:
+                matching_company_ids.add(deal_company_id)
 
-        owners = sorted(counts)
-        if not owners:
-            return None, None
-        if len(owners) > 1:
-            details = ", ".join(
-                f"{owner_id} ({self._user_name(owner_id)}): {counts[owner_id]} entities"
-                for owner_id in owners
-            )
-            raise BitrixError(
-                f"DIRECTOR_PACKAGE_OWNER_CONFLICT: director {director!r} already has several managers: {details}. "
-                "Run the director package audit/repair before creating another deal."
-            )
-        return owners[0], "existing_director_package_owner"
+        eligible_deals = [
+            deal for deal in matching_deals
+            if self._is_allowed_manager(self._record_assigned_by_id(deal))
+            and not self._is_source_responsible(self._record_assigned_by_id(deal))
+        ]
+        if eligible_deals:
+            oldest_deal = min(eligible_deals, key=self._historical_sort_key)
+            owner_id = self._record_assigned_by_id(oldest_deal)
+            return owner_id, "historical_first_deal_owner"
+
+        eligible_companies = [
+            company for company in matching_companies
+            if self._is_allowed_manager(self._record_assigned_by_id(company))
+            and not self._is_source_responsible(self._record_assigned_by_id(company))
+        ]
+        if eligible_companies:
+            oldest_company = min(eligible_companies, key=self._historical_sort_key)
+            owner_id = self._record_assigned_by_id(oldest_company)
+            return owner_id, "historical_first_company_owner"
+
+        return None, None
 
     def _manager_load(self, user_id: int) -> int:
         count = 0
@@ -548,15 +570,17 @@ class BitrixPipeline:
             return manual_owner_id, manual_reason
 
         # 2) Read all available director-level signals before considering a BIN
-        # or a company card. Contact owner is the strongest live CRM signal.
+        # or a company card. Historical package owner is the strongest CRM signal.
         cached_owner_id, cached_reason = self._cached_assignment(app.bin, director)
-        contact_owner_id, contact_reason = self._contact_owner_by_director(director)
-        package_owner_id: int | None = None
-        package_reason: str | None = None
-        if not contact_owner_id:
-            package_owner_id, package_reason = self._package_owner_by_director(director)
-        director_owner_id = contact_owner_id or package_owner_id
-        director_reason = contact_reason or package_reason
+        package_owner_id, package_reason = self._package_owner_by_director(director)
+        contact_owner_id: int | None = None
+        contact_reason: str | None = None
+        if not package_owner_id:
+            contact_owner_id, contact_reason = self._contact_owner_by_director(director)
+        # Existing historical package owner is the anchor. A contact owner is
+        # only allowed to seed a package that has no historical deal/company yet.
+        director_owner_id = package_owner_id or contact_owner_id
+        director_reason = package_reason or contact_reason
 
         hard_owner_id, hard_reason = self._hard_owner_for_bin(app.bin, current_owner_id=current_owner_id)
 

@@ -356,7 +356,7 @@ def _list_eqazyna_companies(self, limit: int | None = None) -> list[dict[str, An
         {
             "order": {"ID": "ASC"},
             "filter": {"ORIGINATOR_ID": "EQAZYNA"},
-            "select": ["ID", "TITLE", "COMMENTS", "ORIGINATOR_ID", "ORIGIN_ID", "ASSIGNED_BY_ID"],
+            "select": ["ID", "TITLE", "COMMENTS", "ORIGINATOR_ID", "ORIGIN_ID", "ASSIGNED_BY_ID", "DATE_CREATE"],
         },
         limit=limit,
     )
@@ -377,6 +377,7 @@ def _list_eqazyna_deals(self, limit: int | None = None) -> list[dict[str, Any]]:
                 "STAGE_SEMANTIC_ID",
                 "CLOSED",
                 "CLOSEDATE",
+                "DATE_CREATE",
                 "DATE_MODIFY",
                 "COMMENTS",
                 "ORIGINATOR_ID",
@@ -399,7 +400,7 @@ def _list_deals_by_company(self, company_id: str, only_eqazyna: bool = True, lim
         {
             "order": {"ID": "ASC"},
             "filter": flt,
-            "select": ["ID", "TITLE", "COMPANY_ID", "STAGE_ID", "CATEGORY_ID", "CLOSED", "COMMENTS", "ORIGINATOR_ID", "ORIGIN_ID", "ASSIGNED_BY_ID"],
+            "select": ["ID", "TITLE", "COMPANY_ID", "STAGE_ID", "CATEGORY_ID", "CLOSED", "COMMENTS", "ORIGINATOR_ID", "ORIGIN_ID", "ASSIGNED_BY_ID", "DATE_CREATE"],
         },
         limit=limit,
     )
