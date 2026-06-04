@@ -241,7 +241,7 @@ def _find_contact_by_fio(self, last_name: str, name: str, second_name: str = "")
         {
             "order": {"ID": "DESC"},
             "filter": filters,
-            "select": ["ID", "NAME", "SECOND_NAME", "LAST_NAME", "POST", "COMMENTS", "COMPANY_ID"],
+            "select": ["ID", "NAME", "SECOND_NAME", "LAST_NAME", "POST", "COMMENTS", "COMPANY_ID", "ASSIGNED_BY_ID"],
         },
     )
     if isinstance(result, list) and result:

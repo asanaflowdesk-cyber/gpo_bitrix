@@ -9,6 +9,7 @@ from .bitrix_client import BitrixClient, BitrixError
 from .formatter import build_company_summary, build_deal_comment, build_deal_title, build_lead_comment, build_lead_title
 from .models import Application, CompanyEnrichment, ProcessResult
 from .director import director_identity_key, director_identity_keys, director_keys_match, split_director_fio
+from .config.assignment import load_manual_director_owners_raw
 from .distribute_companies import (
     ALLOWED_USER_IDS,
     HARD_BIN_OWNERS,
@@ -18,6 +19,34 @@ from .distribute_companies import (
     _normalize_bin,
     _normalize_text,
 )
+
+
+def _build_manual_director_owner_index() -> dict[str, int]:
+    """Build one reusable index for hard director assignments.
+
+    manual_directors.yml is authoritative: if a director is fixed there, new
+    companies and deals must never be assigned to another manager.
+    """
+    index: dict[str, int] = {}
+    conflicts: dict[str, set[int]] = {}
+    for user_id, names in load_manual_director_owners_raw().items():
+        if user_id not in ALLOWED_USER_IDS:
+            raise RuntimeError(f"Manual director owner {user_id} is not an active manager")
+        for name in names:
+            keys = director_identity_keys(name) or [director_identity_key(name)]
+            for key in keys:
+                if not key:
+                    continue
+                previous = index.get(key)
+                if previous is not None and previous != user_id:
+                    conflicts.setdefault(key, {previous}).add(user_id)
+                index[key] = user_id
+    if conflicts:
+        raise RuntimeError(f"Conflicting manual director owners: {conflicts}")
+    return index
+
+
+MANUAL_DIRECTOR_OWNERS = _build_manual_director_owner_index()
 
 
 @dataclass(slots=True)
@@ -50,6 +79,7 @@ class BitrixPipeline:
         self.client = client
         self.config = config
         self._director_contact_cache: dict[str, str] = {}
+        self._director_contact_owner_cache: dict[str, tuple[int | None, str | None]] = {}
         self._eqazyna_companies_cache: list[dict[str, Any]] | None = None
         self._eqazyna_deals_cache: list[dict[str, Any]] | None = None
         self._failed_deal_by_director_cache: dict[str, FailedDealInheritance | None] = {}
@@ -318,11 +348,32 @@ class BitrixPipeline:
         return None, None
 
     def _remember_assignment(self, bin_value: str | None, director: str | None, user_id: int | None, reason: str | None) -> None:
+        """Remember one owner for every BIN/director key and reject split packages.
+
+        The previous implementation used ``setdefault``. If a second BIN of the
+        same director had another hard owner, the BIN key was stored for the new
+        manager while the director key silently stayed on the old manager. That
+        is exactly how one director could receive deals under different people.
+        """
         if not user_id:
             return
         cache_reason = reason or "runtime_cached_package_owner"
-        for key in self._assignment_cache_keys(bin_value, director):
-            self._assignment_cache.setdefault(key, (user_id, cache_reason))
+        keys = self._assignment_cache_keys(bin_value, director)
+        conflicts: list[str] = []
+        for key in keys:
+            existing = self._assignment_cache.get(key)
+            if existing and existing[0] != user_id:
+                conflicts.append(
+                    f"{key}: {existing[0]} ({self._user_name(existing[0])}) != "
+                    f"{user_id} ({self._user_name(user_id)})"
+                )
+        if conflicts:
+            raise BitrixError(
+                "DIRECTOR_PACKAGE_RUNTIME_CONFLICT: one BIN/director package cannot be assigned "
+                "to different managers in one run. " + "; ".join(conflicts)
+            )
+        for key in keys:
+            self._assignment_cache[key] = (user_id, cache_reason)
 
     def _remember_new_package_load(self, user_id: int | None, reason: str | None) -> None:
         if not user_id:
@@ -353,29 +404,101 @@ class BitrixPipeline:
                 self._eqazyna_deals_cache = self.client.list_eqazyna_deals()
         return self._eqazyna_deals_cache
 
+    def _manual_owner_by_director(self, director: str | None) -> tuple[int | None, str | None]:
+        keys = director_identity_keys(director)
+        owners = {MANUAL_DIRECTOR_OWNERS[key] for key in keys if key in MANUAL_DIRECTOR_OWNERS}
+        if not owners:
+            return None, None
+        if len(owners) > 1:
+            details = ", ".join(f"{owner_id} ({self._user_name(owner_id)})" for owner_id in sorted(owners))
+            raise BitrixError(
+                f"MANUAL_DIRECTOR_OWNER_CONFLICT: director {director!r} is mapped to multiple managers: {details}"
+            )
+        owner_id = next(iter(owners))
+        return owner_id, "manual_director_owner"
+
+    def _contact_owner_by_director(self, director: str | None) -> tuple[int | None, str | None]:
+        keys = director_identity_keys(director)
+        if not keys:
+            return None, None
+
+        for key in keys:
+            if key in self._director_contact_owner_cache:
+                return self._director_contact_owner_cache[key]
+
+        result: tuple[int | None, str | None] = (None, None)
+        fio = split_director_fio(director)
+        if fio:
+            try:
+                find_exact = getattr(self.client, "find_contact_by_fio", None)
+                contact = find_exact(fio.last_name, fio.name, fio.second_name) if callable(find_exact) else None
+                if not contact:
+                    find_alias = getattr(self.client, "find_contact_by_director_alias", None)
+                    contact = find_alias(fio.raw) if callable(find_alias) else None
+                owner_id = self._record_assigned_by_id(contact)
+                if self._is_allowed_manager(owner_id) and not self._is_source_responsible(owner_id):
+                    result = (owner_id, "existing_director_contact_owner")
+            except Exception:
+                # Contact lookup is an additional read-only signal. A temporary
+                # lookup failure must not stop the whole parser.
+                result = (None, None)
+
+        for key in keys:
+            self._director_contact_owner_cache[key] = result
+        return result
+
     def _package_owner_by_director(self, director: str | None) -> tuple[int | None, str | None]:
+        """Return the only existing manager for a director package.
+
+        A package is the director plus all matching e-Qazyna companies and their
+        deals. If the existing package is already split between several real
+        managers and there is no stronger manual/contact owner, the parser must
+        stop that row instead of silently choosing one and creating another
+        mismatch.
+        """
         director_keys = set(director_identity_keys(director))
         if not director_keys:
             return None, None
 
         counts: Counter[int] = Counter()
+        company_ids: set[str] = set()
+
         for company in self._list_eqazyna_companies_cached():
             company_director = _extract_director_from_comments(str(company.get("COMMENTS") or ""))
             if not director_keys.intersection(director_identity_keys(company_director)):
                 continue
+            company_id = str(company.get("ID") or "")
+            if company_id:
+                company_ids.add(company_id)
             owner_id = self._record_assigned_by_id(company)
-            if not self._is_allowed_manager(owner_id):
-                continue
-            if self._is_source_responsible(owner_id):
-                continue
-            counts[owner_id] += 1
+            if self._is_allowed_manager(owner_id) and not self._is_source_responsible(owner_id):
+                counts[owner_id] += 1
 
-        if not counts:
+        if company_ids:
+            try:
+                for deal in self._list_eqazyna_deals_cached():
+                    if str(deal.get("COMPANY_ID") or "") not in company_ids:
+                        continue
+                    owner_id = self._record_assigned_by_id(deal)
+                    if self._is_allowed_manager(owner_id) and not self._is_source_responsible(owner_id):
+                        counts[owner_id] += 1
+            except Exception:
+                # Company owners are still enough to resolve a clean package.
+                pass
+
+        owners = sorted(counts)
+        if not owners:
             return None, None
-        max_count = max(counts.values())
-        candidates = [user_id for user_id, count in counts.items() if count == max_count]
-        candidates.sort(key=lambda user_id: (self._manager_load(user_id), user_id))
-        return candidates[0], "existing_director_package_owner"
+        if len(owners) > 1:
+            details = ", ".join(
+                f"{owner_id} ({self._user_name(owner_id)}): {counts[owner_id]} entities"
+                for owner_id in owners
+            )
+            raise BitrixError(
+                f"DIRECTOR_PACKAGE_OWNER_CONFLICT: director {director!r} already has several managers: {details}. "
+                "Run the director package audit/repair before creating another deal."
+            )
+        return owners[0], "existing_director_package_owner"
 
     def _manager_load(self, user_id: int) -> int:
         count = 0
@@ -407,37 +530,78 @@ class BitrixPipeline:
         enr: CompanyEnrichment,
         company: dict | None,
     ) -> tuple[int | None, str | None]:
+        """Resolve one strict owner for BIN + director package.
+
+        Priority is deliberately director-first. The previous order was
+        ``hard BIN -> existing company -> director package``; therefore two
+        companies of one director could keep different owners and every new
+        deal followed its own company. That violated the core rule.
+        """
         current_owner_id = self._record_assigned_by_id(company)
         director = enr.director
 
-        # 1) Hard BINs are absolute. They override source owners, random assignment,
-        # and director package logic.
+        # 1) Manual director fixation is authoritative and may repair older
+        # company/deal owners as the package is touched by the parser.
+        manual_owner_id, manual_reason = self._manual_owner_by_director(director)
+        if manual_owner_id:
+            self._remember_assignment(app.bin, director, manual_owner_id, manual_reason)
+            return manual_owner_id, manual_reason
+
+        # 2) Read all available director-level signals before considering a BIN
+        # or a company card. Contact owner is the strongest live CRM signal.
+        cached_owner_id, cached_reason = self._cached_assignment(app.bin, director)
+        contact_owner_id, contact_reason = self._contact_owner_by_director(director)
+        package_owner_id: int | None = None
+        package_reason: str | None = None
+        if not contact_owner_id:
+            package_owner_id, package_reason = self._package_owner_by_director(director)
+        director_owner_id = contact_owner_id or package_owner_id
+        director_reason = contact_reason or package_reason
+
         hard_owner_id, hard_reason = self._hard_owner_for_bin(app.bin, current_owner_id=current_owner_id)
+
+        # 3) A current-run assignment must agree with any existing director
+        # owner and with a hard BIN. Otherwise stop the row instead of splitting.
+        if cached_owner_id:
+            if director_owner_id and director_owner_id != cached_owner_id:
+                raise BitrixError(
+                    f"DIRECTOR_PACKAGE_OWNER_CONFLICT: director {director!r} is cached for "
+                    f"{cached_owner_id} ({self._user_name(cached_owner_id)}) but CRM package owner is "
+                    f"{director_owner_id} ({self._user_name(director_owner_id)})."
+                )
+            if hard_owner_id and hard_owner_id != cached_owner_id:
+                raise BitrixError(
+                    f"DIRECTOR_HARD_BIN_OWNER_CONFLICT: BIN {app.bin} is hard-fixed to "
+                    f"{hard_owner_id} ({self._user_name(hard_owner_id)}), but director {director!r} is already "
+                    f"assigned to {cached_owner_id} ({self._user_name(cached_owner_id)})."
+                )
+            return cached_owner_id, f"{cached_reason}_runtime_cache"
+
+        # 4) Existing director owner wins over company owner and randomizer. A
+        # conflicting hard BIN is not allowed to split the package silently.
+        if director_owner_id:
+            if hard_owner_id and hard_owner_id != director_owner_id:
+                raise BitrixError(
+                    f"DIRECTOR_HARD_BIN_OWNER_CONFLICT: BIN {app.bin} is hard-fixed to "
+                    f"{hard_owner_id} ({self._user_name(hard_owner_id)}), but director {director!r} belongs to "
+                    f"{director_owner_id} ({self._user_name(director_owner_id)})."
+                )
+            self._remember_assignment(app.bin, director, director_owner_id, director_reason)
+            return director_owner_id, director_reason
+
+        # 5) No director package exists yet: a hard BIN may seed the package.
         if hard_owner_id:
             self._remember_assignment(app.bin, director, hard_owner_id, hard_reason)
             return hard_owner_id, hard_reason
 
-        # 2) The current run may have already assigned the same BIN or director package.
-        # Without this cache, two applications for one BIN can be randomly split between
-        # two managers before Bitrix has a chance to persist the first assignment.
-        cached_owner_id, cached_reason = self._cached_assignment(app.bin, director)
-        if cached_owner_id:
-            return cached_owner_id, f"{cached_reason}_runtime_cache"
-
-        # 3) Existing company owner wins only if it is a real allowed manager,
-        # not one of the source/service users 36/44.
+        # 6) Existing company owner may seed a brand-new director package, but
+        # never override a director owner found above.
         if self._is_allowed_manager(current_owner_id) and not self._is_source_responsible(current_owner_id):
-            reason = "existing_company_owner"
+            reason = "existing_company_owner_seeds_director_package"
             self._remember_assignment(app.bin, director, current_owner_id, reason)
             return current_owner_id, reason
 
-        # 4) Reuse an existing director package owner across old and new BINs.
-        director_owner_id, director_reason = self._package_owner_by_director(director)
-        if director_owner_id:
-            self._remember_assignment(app.bin, director, director_owner_id, director_reason)
-            return director_owner_id, director_reason
-
-        # 5) Optional fallback, only if it is a real manager.
+        # 7) Optional fallback, only if it is a real manager.
         configured_id = self._configured_assigned_by_id()
         if self._is_allowed_manager(configured_id) and not self._is_source_responsible(configured_id):
             reason = "configured_manager_fallback"
@@ -445,7 +609,7 @@ class BitrixPipeline:
             self._remember_new_package_load(configured_id, reason)
             return configured_id, reason
 
-        # 6) Brand-new BIN + brand-new director: distribute once, then cache.
+        # 8) Brand-new BIN + brand-new director: distribute once, then cache.
         owner_id, reason = self._random_owner_from_current_load()
         self._remember_assignment(app.bin, director, owner_id, reason)
         self._remember_new_package_load(owner_id, reason)
@@ -477,10 +641,14 @@ class BitrixPipeline:
                 if contact:
                     contact_id = str(contact["ID"])
                     action_parts = ["existing_contact"]
-                    # Backfill position/comment if contact existed and fields are empty.
+                    # Backfill position and enforce the same owner as the whole
+                    # director package. Contact/company/deal must not diverge.
                     update_fields: dict[str, object] = {}
                     if not contact.get("POST"):
                         update_fields["POST"] = "Руководитель"
+                    contact_owner_id = self._record_assigned_by_id(contact)
+                    if responsible_id and contact_owner_id != responsible_id:
+                        update_fields["ASSIGNED_BY_ID"] = int(responsible_id)
                     if update_fields:
                         self.client.update_contact(contact_id, update_fields)
                 else:

@@ -32,7 +32,7 @@ def test_existing_company_owner_has_priority_over_source_fallback():
     target, reason = pipe._resolve_target_responsible(_app(), CompanyEnrichment(bin="123456789012"), {"ASSIGNED_BY_ID": "70"})
 
     assert target == 70
-    assert reason == "existing_company_owner"
+    assert reason == "existing_company_owner_seeds_director_package"
 
 
 def test_source_owner_is_not_used_as_fallback_for_new_package():
@@ -121,3 +121,120 @@ def test_new_deal_inherits_failed_stage_and_reason_by_director():
     assert inheritance.reason == "388"
     assert fields["UF_CRM_1779448756033"] == "388"
     assert "Наследованная причина: 388" in str(fields["COMMENTS"])
+
+
+class FakeClientWithContactsAndDeals(FakeClientWithDeals):
+    def __init__(self, companies=None, deals=None, contact=None):
+        super().__init__(companies, deals)
+        self.contact = contact
+
+    def find_contact_by_fio(self, last_name, name, second_name=""):
+        return self.contact
+
+    def find_contact_by_director_alias(self, director_raw):
+        return self.contact
+
+
+def test_director_package_owner_overrides_existing_company_owner():
+    companies = [
+        {
+            "ID": "1",
+            "ASSIGNED_BY_ID": "74",
+            "COMMENTS": "Руководитель: ИВАНОВ ИВАН ИВАНОВИЧ",
+        }
+    ]
+    pipe = _pipe("36", companies=companies)
+
+    target, reason = pipe._resolve_target_responsible(
+        _app("222222222222"),
+        CompanyEnrichment(bin="222222222222", director="ИВАНОВ ИВАН ИВАНОВИЧ"),
+        {"ASSIGNED_BY_ID": "92"},
+    )
+
+    assert target == 74
+    assert reason == "existing_director_package_owner"
+
+
+def test_director_contact_owner_is_canonical_for_new_deal():
+    contact = {
+        "ID": "500",
+        "LAST_NAME": "ИВАНОВ",
+        "NAME": "ИВАН",
+        "SECOND_NAME": "ИВАНОВИЧ",
+        "ASSIGNED_BY_ID": "92",
+    }
+    pipe = BitrixPipeline(
+        client=FakeClientWithContactsAndDeals(contact=contact),  # type: ignore[arg-type]
+        config=BitrixPipelineConfig(assigned_by_id="36"),
+    )
+
+    target, reason = pipe._resolve_target_responsible(
+        _app("333333333333"),
+        CompanyEnrichment(bin="333333333333", director="ИВАНОВ ИВАН ИВАНОВИЧ"),
+        {"ASSIGNED_BY_ID": "74"},
+    )
+
+    assert target == 92
+    assert reason == "existing_director_contact_owner"
+
+
+def test_split_director_package_is_blocked_instead_of_silently_assigning():
+    companies = [
+        {
+            "ID": "1",
+            "ASSIGNED_BY_ID": "74",
+            "COMMENTS": "Руководитель: ИВАНОВ ИВАН ИВАНОВИЧ",
+        },
+        {
+            "ID": "2",
+            "ASSIGNED_BY_ID": "92",
+            "COMMENTS": "Руководитель: ИВАНОВ ИВАН ИВАНОВИЧ",
+        },
+    ]
+    pipe = _pipe("36", companies=companies)
+
+    try:
+        pipe._resolve_target_responsible(
+            _app("444444444444"),
+            CompanyEnrichment(bin="444444444444", director="ИВАНОВ ИВАН ИВАНОВИЧ"),
+            None,
+        )
+    except Exception as exc:
+        assert "DIRECTOR_PACKAGE_OWNER_CONFLICT" in str(exc)
+    else:
+        raise AssertionError("split director package must be blocked")
+
+
+def test_runtime_cache_rejects_two_managers_for_one_director():
+    pipe = _pipe("36", companies=[])
+    director = "ИВАНОВ ИВАН ИВАНОВИЧ"
+    pipe._remember_assignment("555555555555", director, 74, "test")
+
+    try:
+        pipe._remember_assignment("666666666666", director, 92, "test")
+    except Exception as exc:
+        assert "DIRECTOR_PACKAGE_RUNTIME_CONFLICT" in str(exc)
+    else:
+        raise AssertionError("runtime cache must reject split director assignment")
+
+
+def test_hard_bin_cannot_split_existing_director_package():
+    companies = [
+        {
+            "ID": "1",
+            "ASSIGNED_BY_ID": "74",
+            "COMMENTS": "Руководитель: ИВАНОВ ИВАН ИВАНОВИЧ",
+        }
+    ]
+    pipe = _pipe("36", companies=companies)
+
+    try:
+        pipe._resolve_target_responsible(
+            _app("260540008322"),
+            CompanyEnrichment(bin="260540008322", director="ИВАНОВ ИВАН ИВАНОВИЧ"),
+            None,
+        )
+    except Exception as exc:
+        assert "DIRECTOR_HARD_BIN_OWNER_CONFLICT" in str(exc)
+    else:
+        raise AssertionError("hard BIN must not silently split a director package")
