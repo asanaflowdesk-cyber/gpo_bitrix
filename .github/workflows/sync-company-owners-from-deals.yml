@@ -1,49 +1,54 @@
-name: Audit/repair director package owners
+name: Historical owner audit/repair for all director packages
+
+run-name: >-
+  Historical director package check / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }}
 
 on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Тест без записи в Bitrix"
+        description: "true = только отчет, false = разрешить запись"
         required: true
         default: "true"
       repair:
-        description: "Исправлять найденные расхождения. Включать только после проверки отчёта"
+        description: "true = выровнять директора, компании и сделки на одного менеджера"
         required: true
         default: "false"
-      only_eqazyna:
-        description: "Проверять только сделки e-Qazyna"
+      include_closed_deals:
+        description: "true = проверить закрытые сделки тоже"
         required: true
         default: "true"
+      only_eqazyna:
+        description: "false = проверить вообще все сделки Bitrix, не только e-Qazyna"
+        required: true
+        default: "false"
       deal_category_id:
-        description: "ID воронки или all"
+        description: "all = все воронки"
         required: true
         default: "all"
-      include_closed_deals:
-        description: "Включать закрытые сделки"
-        required: true
-        default: "true"
-      target_policy:
-        description: "Как выбирать единого менеджера: rules_then_majority / director_owner / unanimous_deal_owner / majority"
-        required: true
-        default: "rules_then_majority"
       source_responsible_ids:
-        description: "Технические ответственные через запятую"
+        description: "Технические ответственные, которые не считаются целевыми менеджерами"
         required: true
         default: "36,44"
+      target_policy:
+        description: "historical_first = первый существующий менеджер пакета; большинство не используется"
+        required: true
+        default: "historical_first"
       max_deals:
-        description: "0 = без лимита"
+        description: "0 = без лимита, проверить все существующие сделки"
         required: true
         default: "0"
 
 permissions:
   contents: read
 
-jobs:
-  audit-repair-director-package-owners:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+jobs:
+  full-director-package-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
     env:
       BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
       REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
@@ -62,8 +67,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Audit/repair director package owners
+      - name: Validate module
         run: |
+          python scripts/validate_repo.py
+          python -m eqazyna_bitrix.audit_repair_director_package_owners --help >/dev/null
+
+      - name: Check all existing deals
+        run: |
+          set -euo pipefail
           mkdir -p exports
 
           ARGS=(
@@ -74,24 +85,14 @@ jobs:
             --max-deals "${{ inputs.max_deals }}"
             --summary-out "exports/director_package_owner_summary.csv"
             --mismatch-out "exports/director_package_owner_mismatches.csv"
+            --unresolved-out "exports/director_package_owner_unresolved_deals.csv"
             --out "exports/director_package_owner_actions.csv"
           )
 
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            ARGS+=(--dry-run)
-          fi
-
-          if [ "${{ inputs.repair }}" = "true" ]; then
-            ARGS+=(--repair)
-          fi
-
-          if [ "${{ inputs.only_eqazyna }}" = "true" ]; then
-            ARGS+=(--only-eqazyna)
-          fi
-
-          if [ "${{ inputs.include_closed_deals }}" = "true" ]; then
-            ARGS+=(--include-closed-deals)
-          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ "${{ inputs.repair }}" = "true" ]; then ARGS+=(--repair); fi
+          if [ "${{ inputs.include_closed_deals }}" = "true" ]; then ARGS+=(--include-closed-deals); fi
+          if [ "${{ inputs.only_eqazyna }}" = "true" ]; then ARGS+=(--only-eqazyna); fi
 
           "${ARGS[@]}"
           ls -lah exports
@@ -100,7 +101,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: director-package-owner-audit
+          name: historical-director-package-owner-audit
           path: exports/*.csv
           if-no-files-found: ignore
           retention-days: 14
