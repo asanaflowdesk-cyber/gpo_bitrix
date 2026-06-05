@@ -26,6 +26,13 @@ managers:
     active: true
 
   # Петропавловский филиал
+  - id: 116
+    name: Zhanadil Nyssanov
+    branch_id: 34
+    branch: Павлодарский филиал
+    active: true
+
+  # Актауский филиал
   - id: 110
     name: Казрахметова Алия
     branch_id: 32
