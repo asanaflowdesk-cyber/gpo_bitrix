@@ -22,21 +22,21 @@ on:
         required: true
         default: "false"
       repair_scope:
-        description: "split_and_hard / split_only / hard_bin_only / all_actions"
+        description: "all_actions / split_only"
         required: true
         default: "all_actions"
-      duplicate_hard_bin_policy:
-        description: "skip / current_owner_majority"
-        required: true
-        default: "skip"
       limit_per_manager_companies:
-        description: "Мягкий лимит компаний для свободных назначений. 0 = не учитывать"
+        description: "Мягкий лимит компаний для новых пакетов. 0 = не учитывать"
         required: true
-        default: "15"
+        default: "0"
       limit_per_manager_active_deals:
-        description: "Мягкий лимит активных заявок для свободных назначений. 0 = не учитывать"
+        description: "Мягкий лимит сделок для новых пакетов. Если все выше лимита, выбирается минимальная нагрузка"
         required: true
-        default: "80"
+        default: "30"
+      active_deal_load_stage_ids:
+        description: "STAGE_ID, которые входят в лимит. Только Новая + В работе, например NEW,EXECUTING"
+        required: true
+        default: "NEW,EXECUTING"
       seed:
         description: "Seed для повторяемого выбора при ничьей. Обычно пусто"
         required: false
@@ -86,9 +86,9 @@ jobs:
           INCLUDE_CLOSED_DEALS="${{ inputs.include_closed_deals }}"
           SYNC_CONTACTS="${{ inputs.sync_contacts }}"
           REPAIR_SCOPE="${{ inputs.repair_scope }}"
-          DUPLICATE_HARD_BIN_POLICY="${{ inputs.duplicate_hard_bin_policy }}"
           LIMIT_PER_MANAGER_COMPANIES="${{ inputs.limit_per_manager_companies }}"
           LIMIT_PER_MANAGER_ACTIVE_DEALS="${{ inputs.limit_per_manager_active_deals }}"
+          ACTIVE_DEAL_LOAD_STAGE_IDS="${{ inputs.active_deal_load_stage_ids }}"
           SEED="${{ inputs.seed }}"
 
           if [ "$DRY_RUN" != "true" ] && [ -z "${BITRIX_WEBHOOK_URL:-}" ]; then
@@ -101,18 +101,18 @@ jobs:
           echo "INCLUDE_CLOSED_DEALS=$INCLUDE_CLOSED_DEALS"
           echo "SYNC_CONTACTS=$SYNC_CONTACTS"
           echo "REPAIR_SCOPE=$REPAIR_SCOPE"
-          echo "DUPLICATE_HARD_BIN_POLICY=$DUPLICATE_HARD_BIN_POLICY"
           echo "LIMIT_PER_MANAGER_COMPANIES=$LIMIT_PER_MANAGER_COMPANIES"
           echo "LIMIT_PER_MANAGER_ACTIVE_DEALS=$LIMIT_PER_MANAGER_ACTIVE_DEALS"
+          echo "ACTIVE_DEAL_LOAD_STAGE_IDS=$ACTIVE_DEAL_LOAD_STAGE_IDS"
           echo "SEED=$SEED"
 
           ARGS=(
             python -m eqazyna_bitrix.audit_repair_deal_packages
             --source-responsible-ids "$SOURCE_RESPONSIBLE_IDS"
             --repair-scope "$REPAIR_SCOPE"
-            --duplicate-hard-bin-policy "$DUPLICATE_HARD_BIN_POLICY"
             --limit-per-manager-companies "$LIMIT_PER_MANAGER_COMPANIES"
             --limit-per-manager-active-deals "$LIMIT_PER_MANAGER_ACTIVE_DEALS"
+            --active-deal-load-stage-ids "$ACTIVE_DEAL_LOAD_STAGE_IDS"
             --out "exports/audit_repair_deal_packages_log.json"
             --csv-out "exports/audit_repair_deal_packages_groups.csv"
           )

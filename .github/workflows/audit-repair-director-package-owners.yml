@@ -1,7 +1,7 @@
-name: Full audit/repair all existing deals by director
+name: Historical owner audit/repair for director packages
 
 run-name: >-
-  Full director package check / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }}
+  Historical director package check / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }}
 
 on:
   workflow_dispatch:
@@ -31,9 +31,9 @@ on:
         required: true
         default: "36,44"
       target_policy:
-        description: "rules_then_majority / director"
+        description: "historical_first = первый существующий менеджер пакета; большинство не используется"
         required: true
-        default: "rules_then_majority"
+        default: "historical_first"
       max_deals:
         description: "0 = без лимита, проверить все существующие сделки"
         required: true
@@ -101,7 +101,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: full-director-package-owner-audit
+          name: historical-director-package-owner-audit
           path: exports/*.csv
           if-no-files-found: ignore
           retention-days: 14

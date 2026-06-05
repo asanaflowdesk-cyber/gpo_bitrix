@@ -17,7 +17,7 @@ on:
       dry_run:
         description: "Тест без записи в Bitrix"
         required: true
-        default: "false"
+        default: "true"
       include_companies:
         description: "Переносить компании / клиентов"
         required: true
@@ -43,13 +43,42 @@ on:
         required: true
         default: "all"
       deal_stage_ids:
-        description: "Стадии сделок через запятую. all = все. Например NEW,EXECUTING,UC_HRSCUK"
+        description: "Исходные стадии сделок через запятую. all = все. Например NEW,EXECUTING"
         required: true
-        default: "New"
+        default: "NEW"
       lead_status_ids:
         description: "Статусы лидов через запятую. all = все"
         required: true
         default: "all"
+      target_deal_stage_id:
+        description: "Новая стадия для выбранных сделок. Пусто = не менять. Например LOSE"
+        required: false
+        default: ""
+      failure_reason_field:
+        description: "Поле причины неудачи. Пусто = UF_CRM_1779448756033 при выборе failure_reason_id"
+        required: false
+        default: ""
+      failure_reason_id:
+        description: "CloseReasonID: 400 дубль, 394 отказ, 402 неактивна, 386 не дозвонились, 396 не подходит, 392 нет данных, 398 ошибка, 404 проиграли, 390 Евразия, 388 конкурент"
+        required: true
+        type: choice
+        default: "none"
+        options:
+          - "none"
+          - "400"
+          - "394"
+          - "402"
+          - "386"
+          - "396"
+          - "392"
+          - "398"
+          - "404"
+          - "390"
+          - "388"
+      failure_reason_text:
+        description: "Редкое ручное значение вместо failure_reason_id. Обычно оставить пустым"
+        required: false
+        default: ""
       filter_company_contact_by_deal_stage:
         description: "Для компаний/контактов брать только связанные со сделками в выбранной стадии"
         required: true
@@ -109,6 +138,10 @@ jobs:
             --deal-category-id "${{ inputs.deal_category_id }}"
             --deal-stage-ids "${{ inputs.deal_stage_ids }}"
             --lead-status-ids "${{ inputs.lead_status_ids }}"
+            --target-deal-stage-id "${{ inputs.target_deal_stage_id }}"
+            --failure-reason-field "${{ inputs.failure_reason_field }}"
+            --failure-reason-id "${{ inputs.failure_reason_id }}"
+            --failure-reason-text "${{ inputs.failure_reason_text }}"
             --filter-company-contact-by-deal-stage "${{ inputs.filter_company_contact_by_deal_stage }}"
             --limit "${{ inputs.limit }}"
             --max-total "${{ inputs.max_total }}"
