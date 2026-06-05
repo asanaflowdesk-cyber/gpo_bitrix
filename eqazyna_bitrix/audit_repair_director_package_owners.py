@@ -7,8 +7,9 @@ Rule:
 
 The target owner is NOT selected by majority. It is the historical package
 anchor: the manager on the oldest existing non-technical deal of the director.
-Manual director fixations override the historical anchor. If no eligible deal
-exists, the oldest eligible company owner is used as a fallback.
+Manual director YAML is intentionally ignored here; emergency manual movement
+is handled only by the separate admin reassignment workflow. If no eligible
+deal exists, the oldest eligible company owner is used as a fallback.
 """
 from __future__ import annotations
 
@@ -24,7 +25,6 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import requests
 
-from .config.assignment import load_manual_director_owners_raw
 from .director import (
     clean_director_value,
     director_identity_key,
@@ -224,30 +224,6 @@ def get_deals(bx: Bitrix, category_id: str, only_eqazyna: bool, include_closed: 
     return bx.list_all("crm.deal.list", payload, limit=max_deals or None)
 
 
-def load_manual_owner_index() -> Dict[str, str]:
-    result: Dict[str, str] = {}
-    for user_id, director_names in load_manual_director_owners_raw().items():
-        for director_name in director_names:
-            for key in director_identity_keys(director_name) or [director_identity_key(director_name)]:
-                if key:
-                    result[key] = str(user_id)
-    return result
-
-
-def resolve_manual_owner(director_names: Sequence[str], manual_index: Dict[str, str]) -> str:
-    owners: Set[str] = set()
-    for name in director_names:
-        for key in director_identity_keys(name) or [director_identity_key(name)]:
-            if key and key in manual_index:
-                owners.add(manual_index[key])
-        for configured_key, owner_id in manual_index.items():
-            configured_name = configured_key.split("|", 1)[-1]
-            if director_keys_match(name, configured_name):
-                owners.add(owner_id)
-    if len(owners) == 1:
-        return next(iter(owners))
-    return ""
-
 
 def resolve_director_for_deal(bx: Bitrix, deal: Dict[str, Any]) -> Tuple[str, str, str, str]:
     """Return director_key, director_name, contact_id, resolution_source."""
@@ -285,18 +261,9 @@ def choose_historical_target(
     companies: Dict[str, Dict[str, Any]],
     contacts: Dict[str, Dict[str, Any]],
     source_ids: Set[str],
-    manual_index: Dict[str, str],
+    manual_index: Dict[str, str],  # kept for backward-compatible tests/calls; ignored
 ) -> Tuple[str, str, str, Dict[str, Any]]:
     """Return target_id, reason, conflict_note, historical evidence."""
-    manual_owner = resolve_manual_owner(director_names, manual_index)
-    if manual_owner:
-        return manual_owner, "manual_director_owner", "", {
-            "historical_entity_type": "manual_director",
-            "historical_entity_id": "",
-            "historical_entity_date": "",
-            "historical_owner_id": manual_owner,
-        }
-
     eligible_deals = [deal for deal in package_deals if eligible_owner(s(deal.get("ASSIGNED_BY_ID")), source_ids)]
     if eligible_deals:
         oldest_deal = min(eligible_deals, key=entity_sort_key)
@@ -352,7 +319,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     bx = Bitrix(BITRIX_WEBHOOK_URL)
     source_ids = parse_csv_set(args.source_responsible_ids)
-    manual_index = load_manual_owner_index()
+    manual_index: Dict[str, str] = {}  # manual_directors.yml is not used by historical repair
     deals = get_deals(bx, args.deal_category_id, args.only_eqazyna, args.include_closed_deals, args.max_deals)
 
     packages: Dict[str, Dict[str, Any]] = defaultdict(lambda: {

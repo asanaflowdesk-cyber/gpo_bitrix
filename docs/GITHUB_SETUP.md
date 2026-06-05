@@ -8,7 +8,7 @@
 .github/
 eqazyna_bitrix/
 requirements.txt
-README.md
+docs/
 ```
 
 Нельзя загружать папку проекта внутрь ещё одной папки, иначе GitHub Actions не увидит `.github/workflows`.
@@ -39,29 +39,32 @@ Repository → Settings → Secrets and variables → Actions → Variables → 
 Добавить при необходимости:
 
 ```text
-BITRIX_DEAL_CATEGORY_ID        # например 0 или 2
-BITRIX_DEAL_STAGE_ID           # например NEW или C2:NEW
-BITRIX_ASSIGNED_BY_ID          # ID ответственного, опционально
-BITRIX_REQUISITE_PRESET_ID     # ID шаблона реквизитов, нужен для записи БИН в реквизиты
-BITRIX_REQUISITE_BIN_FIELD     # обычно RQ_BIN
+BITRIX_DEAL_CATEGORY_ID
+BITRIX_DEAL_STAGE_ID
+BITRIX_REQUISITE_PRESET_ID
+BITRIX_REQUISITE_BIN_FIELD
+BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER    # по умолчанию 30 сделок
+BITRIX_ASSIGNMENT_LOAD_STAGE_IDS       # стадии, которые входят в лимит: Новая + В работе
 ```
+
+`BITRIX_ASSIGNED_BY_ID` больше не должен использоваться как способ массово назначать новые заявки одному человеку. Новые руководители распределяются по минимальной активной нагрузке, а исторические руководители идут своему историческому менеджеру.
 
 ## 4. Ручной запуск
 
 ```text
-Actions → e-Qazyna to Bitrix CRM → Run workflow
+Actions → e-Qazyna to Bitrix CRM AUTO → Run workflow
 ```
 
 Для первого теста:
 
 ```text
-pages = 2
+pages = 3
 push_bitrix = true
 dry_run = true
 no_egov = false
 ```
 
-Если Excel-лог выглядит нормально, следующий запуск:
+Если Excel/JSON-лог выглядит нормально, следующий запуск:
 
 ```text
 dry_run = false
@@ -69,14 +72,9 @@ dry_run = false
 
 ## 5. Автозапуск
 
-Workflow уже настроен на запуск каждые 15 минут:
+Внутренний GitHub `schedule` из workflow убран, чтобы не было двойного запуска. Регулярный запуск должен идти через внешний cron schedule site.
 
-```yaml
-schedule:
-  - cron: "*/15 * * * *"
-```
-
-Если пока не нужен автозапуск, закомментировать блок `schedule` в `.github/workflows/eqazyna-to-bitrix.yml`.
+Если cron site вызывает GitHub workflow dispatch, он должен запускать `.github/workflows/main.yml` с нужными input-параметрами или использовать значения по умолчанию. В `main.yml` значение по умолчанию для `dry_run` — `false`, потому что регулярный cron рассчитан на боевую запись. Для проверки руками всегда явно ставить `dry_run=true`.
 
 ## 6. Логи
 

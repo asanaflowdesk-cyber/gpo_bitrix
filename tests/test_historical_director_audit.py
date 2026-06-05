@@ -17,7 +17,7 @@ def test_historical_audit_uses_oldest_deal_owner_not_majority():
     assert evidence["historical_entity_id"] == "10"
 
 
-def test_manual_director_owner_overrides_historical_deal_owner():
+def test_manual_director_owner_no_longer_overrides_historical_deal_owner():
     deals = [
         {"ID": "10", "DATE_CREATE": "2026-01-01T00:00:00+00:00", "ASSIGNED_BY_ID": "74"},
     ]
@@ -30,5 +30,5 @@ def test_manual_director_owner_overrides_historical_deal_owner():
         {"surname_first_patronymic|ТАТАЕВ|НУРЛАН|САПАРАЛИЕВИЧ": "78"},
     )
 
-    assert target == "78"
-    assert reason == "manual_director_owner"
+    assert target == "74"
+    assert reason == "historical_first_deal_owner"

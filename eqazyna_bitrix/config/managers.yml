@@ -1,6 +1,6 @@
 # Единый справочник менеджеров для распределения e-Qazyna / Bitrix.
 # Чтобы добавить нового менеджера, добавь строку в блок managers и сделай commit.
-# После этого pipeline, audit-repair и manual-director-fix увидят его автоматически,
+# После этого pipeline и audit/repair-скрипты увидят его автоматически,
 # потому что они берут ALLOWED_USER_IDS и USER_NAMES через distribute_companies.py.
 
 source_responsible_ids:
@@ -32,7 +32,7 @@ managers:
     branch: Актауский филиал
     active: true
 
-  # Петропавловский филиал
+  # Павлодарский филиал
   - id: 110
     name: Казрахметова Алия
     branch_id: 32

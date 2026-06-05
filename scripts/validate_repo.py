@@ -35,8 +35,6 @@ def check_workflows() -> None:
 
     forbidden = [
         WORKFLOWS / "managers.yml",
-        WORKFLOWS / "hard_bins.yml",
-        WORKFLOWS / "manual_directors.yml",
     ]
     for path in forbidden:
         if path.exists():
@@ -57,48 +55,21 @@ def check_workflows() -> None:
 
 
 def check_configs() -> None:
-    for name in ["managers.yml", "hard_bins.yml", "manual_directors.yml"]:
-        read_yaml(CONFIG / name)
+    read_yaml(CONFIG / "managers.yml")
 
     from eqazyna_bitrix.config.managers import load_manager_config
-    from eqazyna_bitrix.config.assignment import (
-        load_hard_bin_owners,
-        load_hard_bin_owners_raw,
-        load_manual_director_owners_raw,
-    )
 
     managers = load_manager_config()
-    hard_raw = load_hard_bin_owners_raw()
-    hard_index = load_hard_bin_owners()
-    manual_raw = load_manual_director_owners_raw()
-
-    allowed = set(managers.allowed_user_ids)
     known = set(managers.user_names)
-
-    for user_id in hard_raw:
-        if user_id not in allowed:
-            fail(f"hard_bins.yml references inactive/unknown manager id: {user_id}")
-
-    for user_id in manual_raw:
-        if user_id not in allowed:
-            fail(f"manual_directors.yml references inactive/unknown manager id: {user_id}")
 
     for user_id in managers.source_responsible_ids:
         if user_id not in known:
             fail(f"source_responsible_ids references unknown technical user id: {user_id}")
 
-    duplicate_hard_bins = {
-        bin_value: owners for bin_value, owners in hard_index.items() if len(owners) > 1
-    }
-
     summary = {
         "active_manager_count": len(managers.allowed_user_ids),
         "active_manager_ids": managers.allowed_user_ids,
         "technical_source_responsible_ids": managers.source_responsible_ids,
-        "hard_bin_unique_count": len(hard_index),
-        "duplicate_hard_bin_count": len(duplicate_hard_bins),
-        "manual_director_alias_count": sum(len(v) for v in manual_raw.values()),
-        "duplicate_hard_bins": duplicate_hard_bins,
     }
     print("CONFIG_VALIDATION_SUMMARY")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -109,7 +80,6 @@ def check_imports() -> None:
     import eqazyna_bitrix.pipeline  # noqa: F401
     import eqazyna_bitrix.distribute_companies  # noqa: F401
     import eqazyna_bitrix.audit_repair_deal_packages  # noqa: F401
-    import eqazyna_bitrix.manual_director_fix_packages  # noqa: F401
 
 
 def main() -> int:

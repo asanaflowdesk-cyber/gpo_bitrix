@@ -18,7 +18,7 @@ from .settings import Settings
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="e-Qazyna → eGov → Bitrix24 companies/deals")
-    parser.add_argument("--pages", type=int, default=int(os.getenv("EQAZYNA_PAGES", "2")), help="How many pages to process in this run")
+    parser.add_argument("--pages", type=int, default=int(os.getenv("EQAZYNA_PAGES", "3")), help="How many pages to process in this run")
     parser.add_argument("--page-start", type=int, default=int(os.getenv("EQAZYNA_PAGE_START", "1")), help="First e-Qazyna page for this run")
     parser.add_argument("--page-list", default=os.getenv("EQAZYNA_PAGE_LIST") or None, help="Optional explicit pages/ranges, e.g. 16,22,30-35. Overrides page-start/pages.")
     parser.add_argument("--doc-type", default=os.getenv("EQAZYNA_DOC_TYPE", "Заявка на разведку ТПИ"))
@@ -34,7 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deal-stage-id", default=os.getenv("BITRIX_DEAL_STAGE_ID", "NEW"))
     parser.add_argument("--lead-status-id", default=os.getenv("BITRIX_LEAD_STATUS_ID", "NEW"))
     parser.add_argument("--assigned-by-id", default=os.getenv("BITRIX_ASSIGNED_BY_ID") or None)
-    parser.add_argument("--assignment-limit-per-manager", type=int, default=int(os.getenv("BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER", "15")))
+    parser.add_argument("--assignment-limit-per-manager", type=int, default=int(os.getenv("BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER", "30")), help="Soft deal limit for brand-new director packages. Historical director packages ignore the limit.")
+    parser.add_argument("--assignment-load-stage-ids", default=os.getenv("BITRIX_ASSIGNMENT_LOAD_STAGE_IDS", "NEW,EXECUTING"), help="Comma-separated STAGE_ID values that consume the assignment limit. Default: NEW,EXECUTING. Other stages do not count.")
     parser.add_argument("--inherit-failed-deals-by-director", default=os.getenv("BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR", "true"), help="true = new deals inherit failed final stage/reason from old deals for the same director")
     parser.add_argument("--failed-deal-stage-ids", default=os.getenv("BITRIX_FAILED_DEAL_STAGE_IDS", "LOSE"), help="Comma-separated failed deal STAGE_ID values. STAGE_SEMANTIC_ID=F is also treated as failed when returned by Bitrix.")
     parser.add_argument("--failed-deal-reason-fields", default=os.getenv("BITRIX_FAILED_DEAL_REASON_FIELDS", "UF_CRM_1779448756033"), help="Comma-separated deal fields to copy/read as failure reason")
@@ -118,6 +119,7 @@ def main() -> int:
                 requisite_bin_field=args.requisite_bin_field,
                 dry_run=args.dry_run,
                 assignment_limit_per_manager=args.assignment_limit_per_manager,
+                assignment_load_stage_ids=args.assignment_load_stage_ids,
                 inherit_failed_deals_by_director=str(args.inherit_failed_deals_by_director).lower() == "true",
                 failed_deal_stage_ids=args.failed_deal_stage_ids,
                 failed_deal_reason_fields=args.failed_deal_reason_fields,
@@ -125,16 +127,59 @@ def main() -> int:
         )
 
     results: list[ProcessResult] = []
-    print("[2/4] Staged eGov enrichment and Bitrix processing")
-    enrichment_map = _build_enrichment_map(applications, egov) if applications else {}
+    print("[2/4] Existing-deal precheck, staged eGov enrichment and Bitrix processing")
+
+    existing_deal_results: dict[str, ProcessResult] = {}
+    applications_for_enrichment: list = []
+    if bitrix_pipeline and (args.crm_mode or "deal").lower() == "deal":
+        for app in applications:
+            try:
+                existing_deal = bitrix_pipeline.client.find_deal_by_origin(app.application_key)
+            except Exception as exc:  # noqa: BLE001
+                existing_deal_results[app.application_key] = ProcessResult(
+                    app,
+                    CompanyEnrichment(bin=app.bin),
+                    action="existing_deal_precheck_error",
+                    error=str(exc),
+                )
+                continue
+            if existing_deal:
+                assigned_by_id = bitrix_pipeline._record_assigned_by_id(existing_deal)
+                existing_deal_results[app.application_key] = ProcessResult(
+                    app,
+                    CompanyEnrichment(
+                        bin=app.bin,
+                        match_reason="eGov skipped: Bitrix deal already exists by ORIGIN_ID/application_key",
+                    ),
+                    action="existing_deal_skipped",
+                    company_id=str(existing_deal.get("COMPANY_ID") or "") or None,
+                    deal_id=str(existing_deal.get("ID") or "") or None,
+                    assigned_by_id=assigned_by_id,
+                    assigned_by_name=bitrix_pipeline._user_name(assigned_by_id),
+                    assignment_reason="existing_deal_no_update_precheck",
+                )
+            else:
+                applications_for_enrichment.append(app)
+        print(
+            f"    existing Bitrix deals skipped before eGov: {len(existing_deal_results)}; "
+            f"applications sent to eGov: {len(applications_for_enrichment)}"
+        )
+    else:
+        applications_for_enrichment = list(applications)
+
+    enrichment_map = _build_enrichment_map(applications_for_enrichment, egov) if applications_for_enrichment else {}
 
     for idx, app in enumerate(applications, start=1):
         print(f"  Bitrix {idx}/{len(applications)} {app.doc_number} {app.bin} {app.applicant_name[:60]}")
-        enrichment = enrichment_map.get(_enrichment_key(app.bin, app.applicant_name)) or CompanyEnrichment(bin=app.bin, error="enrichment_missing")
-        if bitrix_pipeline:
-            result = bitrix_pipeline.process(app, enrichment)
+        prechecked_result = existing_deal_results.get(app.application_key)
+        if prechecked_result:
+            result = prechecked_result
         else:
-            result = ProcessResult(app, enrichment, action="excel_only")
+            enrichment = enrichment_map.get(_enrichment_key(app.bin, app.applicant_name)) or CompanyEnrichment(bin=app.bin, error="enrichment_missing")
+            if bitrix_pipeline:
+                result = bitrix_pipeline.process(app, enrichment)
+            else:
+                result = ProcessResult(app, enrichment, action="excel_only")
         if result.error:
             print(f"    ERROR: {result.error}")
         else:

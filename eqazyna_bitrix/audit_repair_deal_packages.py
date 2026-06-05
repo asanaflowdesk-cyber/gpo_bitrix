@@ -14,7 +14,6 @@ from .bitrix_client import BitrixClient
 from .director import director_identity_key
 from .distribute_companies import (
     ALLOWED_USER_IDS,
-    HARD_BIN_OWNERS,
     USER_NAMES,
     _extract_director_from_comments,
     _normalize_bin,
@@ -22,6 +21,7 @@ from .distribute_companies import (
     _to_int,
 )
 from .settings import Settings
+from .config.assignment import DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS, is_assignment_load_deal, parse_stage_ids
 
 
 ORIGINATOR_ID = "EQAZYNA"
@@ -55,29 +55,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--repair-scope",
-        choices=["split_only", "split_and_hard", "hard_bin_only", "all_actions"],
-        default="split_and_hard",
+        choices=["split_only", "all_actions"],
+        default="all_actions",
         help=(
             "What to repair: split_only = only packages with mixed owners; "
-            "split_and_hard = mixed owners plus hard BIN packages that are on the wrong owner; "
-            "hard_bin_only = only hard BIN packages on the wrong owner; "
-            "all_actions = also move packages from technical/source owners to lowest-load managers."
-        ),
-    )
-    parser.add_argument(
-        "--duplicate-hard-bin-policy",
-        choices=["skip", "current_owner_majority"],
-        default="skip",
-        help=(
-            "How to handle a BIN that is configured for several hard owners. "
-            "skip = do not change such groups and log them as unresolved; "
-            "current_owner_majority = choose by current owner/majority/load."
+            "all_actions = also move packages from technical/source owners to the historical or lowest-load manager."
         ),
     )
     parser.add_argument(
         "--limit-per-manager-companies",
         type=int,
-        default=15,
+        default=0,
         help=(
             "Soft client/company limit for automatic new-package assignment. "
             "A manager at or above this limit before assignment is skipped. 0 = ignore."
@@ -86,11 +74,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--limit-per-manager-active-deals",
         type=int,
-        default=80,
+        default=30,
         help=(
-            "Soft active e-Qazyna deal limit for automatic new-package assignment. "
+            "Soft e-Qazyna deal limit for automatic new-package assignment in configured load stages. "
             "A manager at or above this limit before assignment is skipped. 0 = ignore."
         ),
+    )
+    parser.add_argument(
+        "--active-deal-load-stage-ids",
+        default=DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS,
+        help="Comma-separated STAGE_ID values that consume the active-deal limit. Default: NEW,EXECUTING.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Optional seed for tie-breaks")
     return parser.parse_args()
@@ -173,6 +166,7 @@ def list_all_eqazyna_deals(client: BitrixClient) -> list[dict[str, Any]]:
                 "COMMENTS",
                 "ORIGINATOR_ID",
                 "ORIGIN_ID",
+                "DATE_CREATE",
             ],
         },
     )
@@ -191,6 +185,7 @@ def list_all_eqazyna_companies(client: BitrixClient) -> list[dict[str, Any]]:
                 "COMMENTS",
                 "ORIGINATOR_ID",
                 "ORIGIN_ID",
+                "DATE_CREATE",
             ],
         },
     )
@@ -291,6 +286,7 @@ def make_records(
                 "director": director,
                 "owner_id": owner_id(deal),
                 "closed": is_closed_deal(deal),
+                "stage_id": safe_str(deal.get("STAGE_ID")),
                 "title": entity_label(deal),
             }
         )
@@ -322,12 +318,10 @@ def group_key_for_record(record: dict[str, Any]) -> tuple[str, str, str]:
     bin_value = record_bin(record)
     director = record_director(record)
 
-    # Hard BINs are absolute. They are grouped by BIN first, so a hard BIN cannot be dragged away by another director package.
-    if bin_value and bin_value in HARD_BIN_OWNERS:
-        return f"hard_bin|{bin_value}", "hard_bin", bin_value
-
+    # Director/founder is the package anchor and must not be split across managers.
     if director:
         return f"director|{director_identity_key(director) or _normalize_text(director)}", "director", director
+
 
     if bin_value:
         return f"bin|{bin_value}", "bin", bin_value
@@ -358,12 +352,17 @@ def initial_load(companies: dict[str, dict[str, Any]]) -> dict[int, int]:
     return load
 
 
-def initial_active_deal_load(records: list[dict[str, Any]]) -> dict[int, int]:
+def record_counts_for_active_deal_limit(record: dict[str, Any], load_stage_ids: set[str]) -> bool:
+    if record.get("entity_type") != "deal":
+        return False
+    closed = "Y" if record.get("closed") else "N"
+    return is_assignment_load_deal({"CLOSED": closed, "STAGE_ID": record.get("stage_id")}, load_stage_ids)
+
+
+def initial_active_deal_load(records: list[dict[str, Any]], load_stage_ids: set[str]) -> dict[int, int]:
     load = {user_id: 0 for user_id in ALLOWED_USER_IDS}
     for record in records:
-        if record.get("entity_type") != "deal":
-            continue
-        if record.get("closed"):
+        if not record_counts_for_active_deal_limit(record, load_stage_ids):
             continue
         user_id = record.get("owner_id")
         if user_id in load:
@@ -412,7 +411,10 @@ def choose_lowest_load(
     }
 
     if not eligible:
-        return None, debug
+        eligible = list(ALLOWED_USER_IDS)
+        debug["soft_limit_expanded"] = True
+    else:
+        debug["soft_limit_expanded"] = False
 
     min_active_deals = min(active_deal_load.get(user_id, 0) for user_id in eligible)
     active_candidates = [
@@ -431,7 +433,7 @@ def choose_lowest_load(
     target = random.choice(sorted(client_candidates))
     debug.update(
         {
-            "selected_by": "below_limits_lowest_active_deal_load_then_lowest_client_load_then_random",
+            "selected_by": "below_soft_limit_or_lowest_active_deal_load_then_lowest_client_load_then_random",
             "selected_user_id": target,
             "selected_user_name": user_name(target),
             "selected_active_deal_load": active_deal_load.get(target, 0),
@@ -441,246 +443,87 @@ def choose_lowest_load(
     return target, debug
 
 
-def duplicate_hard_owner_map(bins: set[str]) -> dict[str, list[int]]:
-    conflicts: dict[str, list[int]] = {}
-    for bin_value in sorted(bins):
-        owner_ids = sorted(set(HARD_BIN_OWNERS.get(bin_value, [])))
-        if len(owner_ids) > 1:
-            conflicts[bin_value] = owner_ids
-    return conflicts
+
+def _record_sort_key(record: dict[str, Any]) -> tuple[str, int]:
+    entity = record.get("entity") if isinstance(record.get("entity"), dict) else {}
+    date_value = safe_str(entity.get("DATE_CREATE"))
+    try:
+        entity_id = int(record.get("entity_id") or 0)
+    except (TypeError, ValueError):
+        entity_id = 0
+    return date_value, entity_id
 
 
-def is_duplicate_hard_bin(bin_value: str) -> bool:
-    return len(set(HARD_BIN_OWNERS.get(bin_value, []))) > 1
-
-
-def choose_from_candidates_by_current_ownership(
-    candidates: set[int],
-    owners: list[int],
-    load: dict[int, int],
-) -> tuple[int, str]:
-    current = Counter(owner for owner in owners if owner in candidates)
-    if current:
-        top = current.most_common()
-        top_count = top[0][1]
-        top_candidates = {owner for owner, count in top if count == top_count}
-        if len(top_candidates) == 1:
-            return next(iter(top_candidates)), "current_owner_majority"
-        candidates = top_candidates
-
-    min_load = min(load.get(user_id, 0) for user_id in candidates)
-    load_candidates = sorted(user_id for user_id in candidates if load.get(user_id, 0) == min_load)
-    return random.choice(load_candidates), "lowest_load_tie_break"
-
-
-def choose_hard_owner(
-    bins: set[str],
-    owners: list[int],
-    load: dict[int, int],
-) -> tuple[int, str, dict[str, Any]]:
-    counts: Counter[int] = Counter()
-    hard_bins: dict[str, list[int]] = {}
-    for bin_value in sorted(bins):
-        owner_ids = HARD_BIN_OWNERS.get(bin_value, [])
-        if not owner_ids:
-            continue
-        hard_bins[bin_value] = owner_ids
-        for owner_id in owner_ids:
-            counts[owner_id] += 1
-
-    if not counts:
-        raise ValueError("choose_hard_owner called without hard BIN candidates")
-
-    top_count = counts.most_common(1)[0][1]
-    candidates = {owner_id for owner_id, count in counts.items() if count == top_count}
-
-    if len(candidates) == 1:
-        target = next(iter(candidates))
-        return target, "hard_bin_owner", {"hard_bins": hard_bins, "candidate_counts": dict(counts)}
-
-    target, tie_reason = choose_from_candidates_by_current_ownership(candidates, owners, load)
-    return target, f"hard_bin_owner_tie_{tie_reason}", {"hard_bins": hard_bins, "candidate_counts": dict(counts)}
-
-
-def build_director_hints(
-    records: list[dict[str, Any]],
-    load: dict[int, int],
-    source_ids: set[int],
-) -> dict[str, int]:
-    hints: dict[str, int] = {}
-    buckets: dict[str, list[tuple[int, str]]] = defaultdict(list)
-
-    for record in records:
-        director = record_director(record)
-        if not director:
-            continue
-        normalized = director_identity_key(director) or _normalize_text(director)
-        bin_value = record_bin(record)
-        owner = record.get("owner_id")
-
-        if bin_value in HARD_BIN_OWNERS and not is_duplicate_hard_bin(bin_value):
-            target, _reason, _debug = choose_hard_owner({bin_value}, [owner] if owner else [], load)
-            buckets[normalized].append((target, "hard_bin_hint"))
-        elif owner in ALLOWED_USER_IDS and owner not in source_ids:
-            buckets[normalized].append((owner, "existing_owner_hint"))
-
-    for director_key, values in buckets.items():
-        counts = Counter(owner for owner, _reason in values)
-        if not counts:
-            continue
-        top_count = counts.most_common(1)[0][1]
-        candidates = {owner for owner, count in counts.items() if count == top_count}
-        if len(candidates) == 1:
-            hints[director_key] = next(iter(candidates))
-        else:
-            min_load = min(load.get(owner, 0) for owner in candidates)
-            best = sorted(owner for owner in candidates if load.get(owner, 0) == min_load)[0]
-            hints[director_key] = best
-
-    return hints
+def _eligible_historical_owner(record: dict[str, Any], source_ids: set[int]) -> int | None:
+    user_id = record.get("owner_id")
+    if not isinstance(user_id, int):
+        return None
+    if user_id in source_ids:
+        return None
+    if user_id not in ALLOWED_USER_IDS:
+        return None
+    return user_id
 
 
 def choose_target(
     group_records: list[dict[str, Any]],
-    load: dict[int, int],
+    client_load: dict[int, int],
     active_deal_load: dict[int, int],
     source_ids: set[int],
-    director_hints: dict[str, int],
     limit_per_manager_companies: int,
     limit_per_manager_active_deals: int,
 ) -> tuple[int | None, str, dict[str, Any]]:
-    bins = {record_bin(record) for record in group_records if record_bin(record)}
-    directors = {record_director(record) for record in group_records if record_director(record)}
-    owners = [record.get("owner_id") for record in group_records if isinstance(record.get("owner_id"), int)]
-    hard_bins = {bin_value for bin_value in bins if bin_value in HARD_BIN_OWNERS}
+    """Choose package owner using the production business rule.
 
-    if hard_bins:
-        return choose_hard_owner(hard_bins, owners, load)
+    1. Historical owner of the oldest existing deal in the package.
+    2. If no deal owner exists, historical owner of the oldest existing company.
+    3. If the package has no valid history, assign to the lowest-load active manager.
 
-    director_targets = set()
-    for director in directors:
-        hint = director_hints.get(director_identity_key(director) or _normalize_text(director))
-        if hint in ALLOWED_USER_IDS:
-            director_targets.add(hint)
+    Technical/source users such as 36/44 are never treated as historical owners.
+    Soft limits are used only for new packages without history.
+    """
+    deals = [record for record in group_records if record.get("entity_type") == "deal"]
+    historical_deals = [
+        record for record in deals
+        if _eligible_historical_owner(record, source_ids) is not None
+    ]
+    if historical_deals:
+        oldest = min(historical_deals, key=_record_sort_key)
+        target = _eligible_historical_owner(oldest, source_ids)
+        return target, "historical_first_deal_owner", {
+            "historical_entity_type": "deal",
+            "historical_entity_id": safe_str(oldest.get("entity_id")),
+            "historical_owner_id": target,
+            "historical_owner_name": user_name(target),
+            "historical_date_create": safe_str((oldest.get("entity") or {}).get("DATE_CREATE")) if isinstance(oldest.get("entity"), dict) else "",
+            "limits_applied": False,
+        }
 
-    if len(director_targets) == 1:
-        target = next(iter(director_targets))
-        return target, "existing_director_package_owner", {"director_targets": sorted(director_targets)}
-    if len(director_targets) > 1:
-        target, tie_reason = choose_from_candidates_by_current_ownership(director_targets, owners, load)
-        return target, f"existing_director_package_owner_tie_{tie_reason}", {"director_targets": sorted(director_targets)}
+    companies = [record for record in group_records if record.get("entity_type") == "company"]
+    historical_companies = [
+        record for record in companies
+        if _eligible_historical_owner(record, source_ids) is not None
+    ]
+    if historical_companies:
+        oldest = min(historical_companies, key=_record_sort_key)
+        target = _eligible_historical_owner(oldest, source_ids)
+        return target, "historical_first_company_owner", {
+            "historical_entity_type": "company",
+            "historical_entity_id": safe_str(oldest.get("entity_id")),
+            "historical_owner_id": target,
+            "historical_owner_name": user_name(target),
+            "historical_date_create": safe_str((oldest.get("entity") or {}).get("DATE_CREATE")) if isinstance(oldest.get("entity"), dict) else "",
+            "limits_applied": False,
+        }
 
-    allowed_owners = [owner for owner in owners if owner in ALLOWED_USER_IDS and owner not in source_ids]
-    if allowed_owners:
-        counts = Counter(allowed_owners)
-        top_count = counts.most_common(1)[0][1]
-        candidates = {owner for owner, count in counts.items() if count == top_count}
-        if len(candidates) == 1:
-            target = next(iter(candidates))
-            reason = "existing_package_owner" if len(counts) == 1 else "split_package_majority_owner"
-            return target, reason, {"owner_counts": dict(counts)}
-        target, tie_reason = choose_from_candidates_by_current_ownership(candidates, owners, load)
-        return target, f"split_package_tie_{tie_reason}", {"owner_counts": dict(counts)}
-
-    target, limit_debug = choose_lowest_load(
-        client_load=load,
-        active_deal_load=active_deal_load,
-        limit_per_manager_companies=limit_per_manager_companies,
-        limit_per_manager_active_deals=limit_per_manager_active_deals,
+    target, debug = choose_lowest_load(
+        client_load,
+        active_deal_load,
+        limit_per_manager_companies,
+        limit_per_manager_active_deals,
     )
-    if target is None:
-        return None, "skip_no_available_manager_below_limits", limit_debug
-    return target, "no_allowed_owner_below_limits_lowest_load", limit_debug
-
-
-def collect_group_contacts(client: BitrixClient, group_records: list[dict[str, Any]]) -> set[str]:
-    contact_ids: set[str] = set()
-    company_ids = {safe_str(record.get("company_id")) for record in group_records if safe_str(record.get("company_id")) not in {"", "0"}}
-    deal_ids = {safe_str(record.get("entity_id")) for record in group_records if record.get("entity_type") == "deal"}
-
-    for record in group_records:
-        if record.get("entity_type") == "deal":
-            contact_id = safe_str(record.get("entity", {}).get("CONTACT_ID"))
-            if contact_id and contact_id != "0":
-                contact_ids.add(contact_id)
-
-    for company_id in company_ids:
-        try:
-            contact_ids.update(client.company_contact_ids(company_id))
-        except Exception:  # noqa: BLE001
-            pass
-
-    for deal_id in deal_ids:
-        try:
-            contact_ids.update(client.deal_contact_ids(deal_id))
-        except Exception:  # noqa: BLE001
-            pass
-
-    return contact_ids
-
-
-def skipped_duplicate_hard_bin_row(
-    group_key: str,
-    group_type: str,
-    readable_name: str,
-    group_records: list[dict[str, Any]],
-    conflicts: dict[str, list[int]],
-) -> dict[str, Any]:
-    company_records = {
-        safe_str(record.get("company_id")): record
-        for record in group_records
-        if record.get("entity_type") == "company" and safe_str(record.get("company_id"))
-    }
-    deal_records = [record for record in group_records if record.get("entity_type") == "deal"]
-    owners_before = sorted({record.get("owner_id") for record in group_records if isinstance(record.get("owner_id"), int)})
-    bins = sorted({record_bin(record) for record in group_records if record_bin(record)})
-    directors = sorted({record_director(record) for record in group_records if record_director(record)})
-    conflict_names = {
-        bin_value: [user_name(owner_id) for owner_id in owner_ids]
-        for bin_value, owner_ids in conflicts.items()
-    }
-
-    row: dict[str, Any] = {
-        "group_key": group_key,
-        "group_type": group_type,
-        "readable_name": readable_name,
-        "bins": bins,
-        "directors": directors,
-        "target_user_id": None,
-        "target_user_name": "UNRESOLVED_DUPLICATE_HARD_BIN",
-        "reason": "skip_duplicate_hard_bin_conflict",
-        "reason_debug": {
-            "duplicate_hard_bins": conflicts,
-            "duplicate_hard_bin_names": conflict_names,
-        },
-        "owners_before": owners_before,
-        "owners_before_names": [user_name(owner) for owner in owners_before],
-        "is_split_before": len(set(owners_before)) > 1,
-        "company_count": len(company_records),
-        "deal_count": len(deal_records),
-        "actions": [],
-        "errors": [],
-    }
-
-    for record in sorted(group_records, key=lambda item: (safe_str(item.get("entity_type")), int(item.get("entity_id") or 0))):
-        old_owner = record.get("owner_id")
-        row["actions"].append(
-            {
-                "entity_type": record.get("entity_type"),
-                "entity_id": record.get("entity_id"),
-                "title": record.get("title"),
-                "company_id": record.get("company_id"),
-                "closed": bool(record.get("closed")),
-                "old_assigned_by_id": old_owner,
-                "old_assigned_by_name": user_name(old_owner),
-                "new_assigned_by_id": None,
-                "new_assigned_by_name": "UNRESOLVED_DUPLICATE_HARD_BIN",
-                "action": "skip_duplicate_hard_bin_conflict",
-                "error": None,
-            }
-        )
-
-    return row
+    debug["limits_applied"] = True
+    return target, "new_package_lowest_active_deal_load", debug
 
 
 def skipped_no_available_manager_row(
@@ -945,16 +788,11 @@ def should_process_group(
     needs_change: bool,
     is_split: bool,
     has_source_owner: bool,
-    is_hard: bool,
 ) -> bool:
     if repair_scope == "split_only":
         return is_split
-    if repair_scope == "split_and_hard":
-        return is_split or (is_hard and needs_change)
-    if repair_scope == "hard_bin_only":
-        return is_hard and needs_change
     if repair_scope == "all_actions":
-        return needs_change or is_split or has_source_owner or is_hard
+        return needs_change or is_split or has_source_owner
     raise ValueError(f"Unsupported repair_scope: {repair_scope}")
 
 
@@ -968,6 +806,7 @@ def main() -> int:
         raise SystemExit("BITRIX_WEBHOOK_URL is required")
 
     source_ids = parse_id_set(args.source_responsible_ids)
+    load_stage_ids = parse_stage_ids(args.active_deal_load_stage_ids)
     client = BitrixClient(settings.bitrix_webhook_url, timeout=settings.request_timeout)
 
     print("Fetching e-Qazyna deals...")
@@ -981,28 +820,25 @@ def main() -> int:
     records, companies, _company_deals = make_records(deals, companies)
     groups, meta = build_groups(records)
     load = initial_load(companies)
-    active_deal_load = initial_active_deal_load(records)
-    director_hints = build_director_hints(records, load, source_ids)
+    active_deal_load = initial_active_deal_load(records, load_stage_ids)
 
     print(f"Records: {len(records)}")
     print(f"Groups: {len(groups)}")
-    print(f"Hard BINs configured: {len(HARD_BIN_OWNERS)}")
     print(f"Dry run: {args.dry_run}")
     print(f"Repair scope: {args.repair_scope}")
-    print(f"Duplicate hard BIN policy: {args.duplicate_hard_bin_policy}")
     print(f"Limit per manager, companies: {args.limit_per_manager_companies}")
     print(f"Limit per manager, active deals: {args.limit_per_manager_active_deals}")
+    print(f"Active-deal load stages: {sorted(load_stage_ids)}")
     print(f"Source responsible IDs: {sorted(source_ids)}")
     print("No batch limit: true")
 
     rows: list[dict[str, Any]] = []
     skipped_clean_groups = 0
-    skipped_duplicate_hard_bin_groups = 0
 
     ordered_groups = sorted(
         groups.items(),
         key=lambda item: (
-            1 if meta[item[0]]["group_type"] == "hard_bin" else 0,
+            0,
             max((int(record.get("entity_id") or 0) for record in item[1] if record.get("entity_type") == "deal"), default=0),
             item[0],
         ),
@@ -1013,31 +849,12 @@ def main() -> int:
         group_type = meta[group_key]["group_type"]
         readable_name = meta[group_key]["readable_name"]
 
-        group_bins = {record_bin(record) for record in group_records if record_bin(record)}
-        duplicate_hard_conflicts = duplicate_hard_owner_map(group_bins)
-        if (
-            args.duplicate_hard_bin_policy == "skip"
-            and group_type == "hard_bin"
-            and duplicate_hard_conflicts
-        ):
-            rows.append(
-                skipped_duplicate_hard_bin_row(
-                    group_key=group_key,
-                    group_type=group_type,
-                    readable_name=readable_name,
-                    group_records=group_records,
-                    conflicts=duplicate_hard_conflicts,
-                )
-            )
-            skipped_duplicate_hard_bin_groups += 1
-            continue
 
         target, reason, debug = choose_target(
             group_records,
             load,
             active_deal_load,
             source_ids,
-            director_hints,
             args.limit_per_manager_companies,
             args.limit_per_manager_active_deals,
         )
@@ -1051,13 +868,11 @@ def main() -> int:
             owners = [record.get("owner_id") for record in relevant_records if isinstance(record.get("owner_id"), int)]
             is_split = len(set(owners)) > 1
             has_source_owner = any(owner in source_ids for owner in owners)
-            is_hard = group_type == "hard_bin"
             if should_process_group(
                 repair_scope=args.repair_scope,
                 needs_change=has_source_owner,
                 is_split=is_split,
                 has_source_owner=has_source_owner,
-                is_hard=is_hard,
             ):
                 row = skipped_no_available_manager_row(
                     group_key=group_key,
@@ -1081,14 +896,12 @@ def main() -> int:
         needs_change = any(owner != target for owner in owners)
         is_split = len(set(owners)) > 1
         has_source_owner = any(owner in source_ids for owner in owners)
-        is_hard = group_type == "hard_bin"
 
         if not should_process_group(
             repair_scope=args.repair_scope,
             needs_change=needs_change,
             is_split=is_split,
             has_source_owner=has_source_owner,
-            is_hard=is_hard,
         ):
             skipped_clean_groups += 1
             continue
@@ -1120,7 +933,7 @@ def main() -> int:
                 load[target] += 1
 
         for record in group_records:
-            if record.get("entity_type") != "deal" or record.get("closed"):
+            if not record_counts_for_active_deal_limit(record, load_stage_ids):
                 continue
             old = record.get("owner_id")
             if old == target:
@@ -1136,21 +949,19 @@ def main() -> int:
         "include_closed_deals": args.include_closed_deals,
         "sync_contacts": args.sync_contacts,
         "repair_scope": args.repair_scope,
-        "duplicate_hard_bin_policy": args.duplicate_hard_bin_policy,
         "limit_per_manager_companies": args.limit_per_manager_companies,
         "limit_per_manager_active_deals": args.limit_per_manager_active_deals,
+        "active_deal_load_stage_ids": sorted(load_stage_ids),
         "source_responsible_ids": sorted(source_ids),
         "source_responsible_names": [user_name(user_id) for user_id in sorted(source_ids)],
         "allowed_user_ids": ALLOWED_USER_IDS,
         "allowed_users": {str(user_id): user_name(user_id) for user_id in ALLOWED_USER_IDS},
-        "hard_bin_count": len(HARD_BIN_OWNERS),
         "total_deals": len(deals),
         "total_companies": len(companies),
         "total_records": len(records),
         "total_groups": len(groups),
-        "groups_with_actions_or_hard_check": len(rows),
+        "groups_with_actions": len(rows),
         "skipped_clean_groups": skipped_clean_groups,
-        "skipped_duplicate_hard_bin_groups": skipped_duplicate_hard_bin_groups,
         "action_counts": action_counts(rows),
         "final_planned_client_load": {
             str(user_id): {"user_name": user_name(user_id), "client_load": count}
@@ -1160,7 +971,7 @@ def main() -> int:
             str(user_id): {"user_name": user_name(user_id), "active_deal_load": count}
             for user_id, count in sorted(active_deal_load.items())
         },
-        "distribution_mode": f"audit_all_eqazyna_deals_no_limit_scope_{args.repair_scope}_duplicate_hard_bin_policy_{args.duplicate_hard_bin_policy}_hard_bin_absolute_then_director_then_existing_owner_then_below_limits_lowest_active_deal_load",
+        "distribution_mode": f"audit_all_eqazyna_deals_scope_{args.repair_scope}_director_history_first_then_lowest_active_deal_load",
     }
 
     output = {"summary": summary, "groups": rows}

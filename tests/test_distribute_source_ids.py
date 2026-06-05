@@ -1,5 +1,5 @@
 from eqazyna_bitrix.distribute_companies import (
-    _choose_existing_allowed_owner,
+    _company_group_key,
     _parse_source_responsible_ids,
 )
 
@@ -12,19 +12,26 @@ def test_parse_source_responsible_ids_falls_back_to_legacy_id_when_empty():
     assert _parse_source_responsible_ids("", 36) == {36}
 
 
-def test_existing_owner_ignores_all_source_responsible_ids():
-    companies = [
-        {"ASSIGNED_BY_ID": "36"},
-        {"ASSIGNED_BY_ID": "44"},
-        {"ASSIGNED_BY_ID": "70"},
-    ]
-    load = {70: 0}
+def test_company_group_key_uses_director_from_company_comment_first():
+    key, group_type, readable = _company_group_key(
+        {"ID": "10", "TITLE": "Тест", "ORIGIN_ID": "123456789012", "COMMENTS": "Руководитель: Иванов Иван Иванович"},
+        [{"ID": "20", "COMMENTS": "Руководитель: Петров Петр Петрович"}],
+    )
 
-    assert _choose_existing_allowed_owner(companies, {36, 44}, load) == 70
+    assert group_type == "director"
+    assert key.startswith("director|")
+    assert readable == "Иванов Иван Иванович"
 
 
-def test_package_with_only_second_source_id_has_no_existing_allowed_owner():
-    companies = [{"ASSIGNED_BY_ID": "44"}]
-    load = {70: 0}
+def test_company_group_key_uses_director_from_related_deal_when_company_comment_is_empty():
+    key, group_type, readable = _company_group_key(
+        {"ID": "10", "TITLE": "Тест", "ORIGIN_ID": "123456789012", "COMMENTS": ""},
+        [
+            {"ID": "20", "DATE_CREATE": "2026-02-01", "COMMENTS": "Руководитель: Петров Петр Петрович"},
+            {"ID": "19", "DATE_CREATE": "2026-01-01", "COMMENTS": "Руководитель: Иванов Иван Иванович"},
+        ],
+    )
 
-    assert _choose_existing_allowed_owner(companies, {36, 44}, load) is None
+    assert group_type == "director"
+    assert key.startswith("director|")
+    assert readable == "Иванов Иван Иванович"

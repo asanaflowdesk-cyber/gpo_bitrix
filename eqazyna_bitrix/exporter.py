@@ -39,6 +39,9 @@ COLUMNS = [
     ("assigned_by_id", "Ответственный ID"),
     ("assigned_by_name", "Ответственный"),
     ("assignment_reason", "Причина распределения"),
+    ("inherited_failed_stage_id", "Наследованная провальная стадия"),
+    ("inherited_failed_reason", "Наследованная причина неудачи"),
+    ("inherited_failed_from_deal_id", "ID сделки-источника провала"),
     ("error", "Ошибка"),
     ("source_url", "Источник e-Qazyna"),
 ]

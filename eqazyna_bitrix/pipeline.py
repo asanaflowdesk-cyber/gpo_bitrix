@@ -10,10 +10,9 @@ from .bitrix_client import BitrixClient, BitrixError
 from .formatter import build_company_summary, build_deal_comment, build_deal_title, build_lead_comment, build_lead_title
 from .models import Application, CompanyEnrichment, ProcessResult
 from .director import director_identity_key, director_identity_keys, director_keys_match, split_director_fio
-from .config.assignment import load_manual_director_owners_raw
+from .config.assignment import DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS, is_assignment_load_deal, parse_stage_ids, stage_id_matches
 from .distribute_companies import (
     ALLOWED_USER_IDS,
-    HARD_BIN_OWNERS,
     SOURCE_RESPONSIBLE_IDS,
     USER_NAMES,
     _extract_director_from_comments,
@@ -21,33 +20,6 @@ from .distribute_companies import (
     _normalize_text,
 )
 
-
-def _build_manual_director_owner_index() -> dict[str, int]:
-    """Build one reusable index for hard director assignments.
-
-    manual_directors.yml is authoritative: if a director is fixed there, new
-    companies and deals must never be assigned to another manager.
-    """
-    index: dict[str, int] = {}
-    conflicts: dict[str, set[int]] = {}
-    for user_id, names in load_manual_director_owners_raw().items():
-        if user_id not in ALLOWED_USER_IDS:
-            raise RuntimeError(f"Manual director owner {user_id} is not an active manager")
-        for name in names:
-            keys = director_identity_keys(name) or [director_identity_key(name)]
-            for key in keys:
-                if not key:
-                    continue
-                previous = index.get(key)
-                if previous is not None and previous != user_id:
-                    conflicts.setdefault(key, {previous}).add(user_id)
-                index[key] = user_id
-    if conflicts:
-        raise RuntimeError(f"Conflicting manual director owners: {conflicts}")
-    return index
-
-
-MANUAL_DIRECTOR_OWNERS = _build_manual_director_owner_index()
 
 
 @dataclass(slots=True)
@@ -60,7 +32,8 @@ class BitrixPipelineConfig:
     requisite_preset_id: str | None = None
     requisite_bin_field: str = "RQ_BIN"
     dry_run: bool = False
-    assignment_limit_per_manager: int = 15
+    assignment_limit_per_manager: int = 30
+    assignment_load_stage_ids: str = DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS
     inherit_failed_deals_by_director: bool = True
     failed_deal_stage_ids: str = "LOSE"
     failed_deal_reason_fields: str = "UF_CRM_1779448756033"
@@ -68,7 +41,10 @@ class BitrixPipelineConfig:
 
 @dataclass(slots=True)
 class FailedDealInheritance:
+    # Target stage to write into the new deal. Keep this canonical (for example LOSE),
+    # even when an old source deal was stored as C2:LOSE.
     stage_id: str
+    source_stage_id: str | None = None
     reason: str | None = None
     reason_field: str | None = None
     source_deal_id: str | None = None
@@ -85,7 +61,7 @@ class BitrixPipeline:
         self._eqazyna_deals_cache: list[dict[str, Any]] | None = None
         self._failed_deal_by_director_cache: dict[str, FailedDealInheritance | None] = {}
         # Per-run assignment memory: one BIN / one director package must keep one manager
-        # even when several e-Qazyna applications are processed in the same GitHub run.
+        # while a single parser call processes several e-Qazyna applications.
         self._assignment_cache: dict[str, tuple[int, str]] = {}
         self._projected_load_delta: Counter[int] = Counter()
 
@@ -93,6 +69,22 @@ class BitrixPipeline:
         if (self.config.crm_mode or "deal").lower() == "lead":
             return self.process_lead(app, enrichment)
         try:
+            # Deal origin is the immutable application key. If the application was
+            # already loaded earlier, the row is intentionally skipped: no company
+            # update, no owner rewrite, no stage rewrite, no contact/requisite work.
+            existing_deal = self.client.find_deal_by_origin(app.application_key)
+            if existing_deal:
+                return ProcessResult(
+                    app,
+                    enrichment,
+                    action="existing_deal_skipped",
+                    company_id=str(existing_deal.get("COMPANY_ID") or "") or None,
+                    deal_id=str(existing_deal.get("ID") or "") or None,
+                    assigned_by_id=self._record_assigned_by_id(existing_deal),
+                    assigned_by_name=self._user_name(self._record_assigned_by_id(existing_deal)),
+                    assignment_reason="existing_deal_no_update",
+                )
+
             company = self.client.find_company_by_origin(app.bin)
             if not company:
                 company = self.client.find_company_by_requisite_bin(app.bin, self.config.requisite_bin_field)
@@ -115,6 +107,7 @@ class BitrixPipeline:
                 company_fields = self._company_fields(app, enrichment, responsible_id=target_responsible_id)
                 if self.config.dry_run:
                     failed_inheritance = self._failed_deal_inheritance_for_director(enrichment.director)
+                    self._remember_created_deal_load(target_responsible_id, failed_inheritance.stage_id if failed_inheritance else self.config.deal_stage_id)
                     return ProcessResult(
                         app,
                         enrichment,
@@ -135,36 +128,10 @@ class BitrixPipeline:
             if not self.config.dry_run:
                 requisite_id = self.ensure_requisite(company_id, app, enrichment)
 
-            deal = self.client.find_deal_by_origin(app.application_key)
-            if deal:
-                deal_id = str(deal["ID"])
-                if not self.config.dry_run:
-                    company_update = self._company_update_fields(app, enrichment)
-                    deal_update = {"TITLE": build_deal_title(app, enrichment), "COMMENTS": build_deal_comment(app, enrichment)}
-                    if target_responsible_id:
-                        deal_update["ASSIGNED_BY_ID"] = target_responsible_id
-                        company_update["ASSIGNED_BY_ID"] = target_responsible_id
-                    self.client.update_company(company_id, company_update)
-                    self.client.update_deal(deal_id, deal_update)
-                contact_id, contact_action, contact_error = self.ensure_director_contact(company_id, deal_id, enrichment, responsible_id=target_responsible_id)
-                return ProcessResult(
-                    app,
-                    enrichment,
-                    action="existing_company_existing_deal" if not company_created else "created_company_existing_deal",
-                    company_id=company_id,
-                    deal_id=deal_id,
-                    requisite_id=requisite_id,
-                    director_contact_id=contact_id,
-                    director_contact_action=contact_action,
-                    director_contact_error=contact_error,
-                    assigned_by_id=target_responsible_id,
-                    assigned_by_name=self._user_name(target_responsible_id),
-                    assignment_reason=assignment_reason,
-                )
-
             failed_inheritance = self._failed_deal_inheritance_for_director(enrichment.director)
             deal_fields = self._deal_fields(app, enrichment, company_id, responsible_id=target_responsible_id, failed_inheritance=failed_inheritance)
             if self.config.dry_run:
+                self._remember_created_deal_load(target_responsible_id, failed_inheritance.stage_id if failed_inheritance else self.config.deal_stage_id)
                 return ProcessResult(
                     app,
                     enrichment,
@@ -180,6 +147,7 @@ class BitrixPipeline:
                 )
 
             deal_id = self.client.create_deal(deal_fields)
+            self._remember_created_deal_load(target_responsible_id, failed_inheritance.stage_id if failed_inheritance else self.config.deal_stage_id)
             company_update = self._company_update_fields(app, enrichment)
             if target_responsible_id:
                 company_update["ASSIGNED_BY_ID"] = target_responsible_id
@@ -323,15 +291,6 @@ class BitrixPipeline:
     def _is_source_responsible(self, user_id: int | None) -> bool:
         return user_id in self._source_responsible_ids()
 
-    def _hard_owner_for_bin(self, bin_value: str, current_owner_id: int | None = None) -> tuple[int | None, str | None]:
-        owners = HARD_BIN_OWNERS.get(_normalize_bin(bin_value), [])
-        owners = [owner_id for owner_id in owners if owner_id in ALLOWED_USER_IDS]
-        if not owners:
-            return None, None
-        if current_owner_id in owners:
-            return current_owner_id, "hard_bin_existing_owner"
-        return owners[0], "hard_bin_owner" if len(owners) == 1 else "hard_bin_owner_first_from_multi_owner_bin"
-
     def _assignment_cache_keys(self, bin_value: str | None, director: str | None) -> list[str]:
         keys: list[str] = []
         normalized_bin = _normalize_bin(bin_value or "")
@@ -352,7 +311,7 @@ class BitrixPipeline:
         """Remember one owner for every BIN/director key and reject split packages.
 
         The previous implementation used ``setdefault``. If a second BIN of the
-        same director had another hard owner, the BIN key was stored for the new
+        same director received another owner, the BIN key was stored for the new
         manager while the director key silently stayed on the old manager. That
         is exactly how one director could receive deals under different people.
         """
@@ -376,11 +335,34 @@ class BitrixPipeline:
         for key in keys:
             self._assignment_cache[key] = (user_id, cache_reason)
 
-    def _remember_new_package_load(self, user_id: int | None, reason: str | None) -> None:
+    def _assignment_load_stage_ids(self) -> set[str]:
+        return parse_stage_ids(self.config.assignment_load_stage_ids)
+
+    def _deal_counts_for_assignment_limit(self, deal: dict[str, Any]) -> bool:
+        return is_assignment_load_deal(deal, self._assignment_load_stage_ids())
+
+    def _stage_counts_for_assignment_limit(self, stage_id: str | None) -> bool:
+        return stage_id_matches(stage_id, self._assignment_load_stage_ids())
+
+    def _remember_created_deal_load(self, user_id: int | None, stage_id: str | None = None) -> None:
+        """Project every newly-created deal that consumes the assignment limit.
+
+        This is deliberately separate from owner selection. Historical director
+        deals ignore the limit when they are assigned, but once they are created
+        they still exist in the manager's New/In-work load and should be visible
+        to later brand-new director assignments in the same run.
+        """
         if not user_id:
             return
-        if reason in {"random_lowest_load_new_package", "random_lowest_load_limit_expanded", "configured_manager_fallback"}:
-            self._projected_load_delta[user_id] += 1
+        stage_to_count = stage_id if stage_id is not None else self.config.deal_stage_id
+        if not self._stage_counts_for_assignment_limit(stage_to_count):
+            return
+        self._projected_load_delta[user_id] += 1
+
+    # Backward-compatible alias for older tests/scripts. It now counts any newly
+    # created deal in configured load stages; the reason is ignored intentionally.
+    def _remember_new_package_load(self, user_id: int | None, reason: str | None = None) -> None:
+        self._remember_created_deal_load(user_id)
 
     def _list_eqazyna_companies_cached(self) -> list[dict[str, Any]]:
         if self._eqazyna_companies_cache is None:
@@ -404,19 +386,6 @@ class BitrixPipeline:
             else:
                 self._eqazyna_deals_cache = self.client.list_eqazyna_deals()
         return self._eqazyna_deals_cache
-
-    def _manual_owner_by_director(self, director: str | None) -> tuple[int | None, str | None]:
-        keys = director_identity_keys(director)
-        owners = {MANUAL_DIRECTOR_OWNERS[key] for key in keys if key in MANUAL_DIRECTOR_OWNERS}
-        if not owners:
-            return None, None
-        if len(owners) > 1:
-            details = ", ".join(f"{owner_id} ({self._user_name(owner_id)})" for owner_id in sorted(owners))
-            raise BitrixError(
-                f"MANUAL_DIRECTOR_OWNER_CONFLICT: director {director!r} is mapped to multiple managers: {details}"
-            )
-        owner_id = next(iter(owners))
-        return owner_id, "manual_director_owner"
 
     def _contact_owner_by_director(self, director: str | None) -> tuple[int | None, str | None]:
         keys = director_identity_keys(director)
@@ -523,10 +492,19 @@ class BitrixPipeline:
         return None, None
 
     def _manager_load(self, user_id: int) -> int:
+        """Current e-Qazyna load for soft assignment balancing.
+
+        The 30-deal capacity counts only configured working stages. It does not
+        count agreement, document collection, failed or any other stage outside
+        assignment_load_stage_ids.
+        """
         count = 0
-        for company in self._list_eqazyna_companies_cached():
-            if self._record_assigned_by_id(company) == user_id:
-                count += 1
+        for deal in self._list_eqazyna_deals_cached():
+            if self._record_assigned_by_id(deal) != user_id:
+                continue
+            if not self._deal_counts_for_assignment_limit(deal):
+                continue
+            count += 1
         return count
 
     def _effective_manager_load(self, user_id: int) -> int:
@@ -541,10 +519,10 @@ class BitrixPipeline:
         if not candidates:
             min_load = min(load.values())
             candidates = [user_id for user_id, current in load.items() if current == min_load]
-            return random.choice(candidates), "random_lowest_load_limit_expanded"
+            return random.choice(candidates), "lowest_active_deal_load_limit_expanded"
         min_load = min(load[user_id] for user_id in candidates)
         candidates = [user_id for user_id in candidates if load[user_id] == min_load]
-        return random.choice(candidates), "random_lowest_load_new_package"
+        return random.choice(candidates), "lowest_active_deal_load_new_director"
 
     def _resolve_target_responsible(
         self,
@@ -552,40 +530,26 @@ class BitrixPipeline:
         enr: CompanyEnrichment,
         company: dict | None,
     ) -> tuple[int | None, str | None]:
-        """Resolve one strict owner for BIN + director package.
+        """Resolve one strict owner for the new application package.
 
-        Priority is deliberately director-first. The previous order was
-        ``hard BIN -> existing company -> director package``; therefore two
-        companies of one director could keep different owners and every new
-        deal followed its own company. That violated the core rule.
+        Canonical rule: director/founder history wins. Manual YAML overrides
+        and BIN-level overrides are intentionally not used in the automatic
+        pipeline, because they can split one director package across managers.
+        Manual movement is handled only by the admin reassignment workflow.
         """
         current_owner_id = self._record_assigned_by_id(company)
         director = enr.director
 
-        # 1) Manual director fixation is authoritative and may repair older
-        # company/deal owners as the package is touched by the parser.
-        manual_owner_id, manual_reason = self._manual_owner_by_director(director)
-        if manual_owner_id:
-            self._remember_assignment(app.bin, director, manual_owner_id, manual_reason)
-            return manual_owner_id, manual_reason
-
-        # 2) Read all available director-level signals before considering a BIN
-        # or a company card. Historical package owner is the strongest CRM signal.
         cached_owner_id, cached_reason = self._cached_assignment(app.bin, director)
         package_owner_id, package_reason = self._package_owner_by_director(director)
         contact_owner_id: int | None = None
         contact_reason: str | None = None
         if not package_owner_id:
             contact_owner_id, contact_reason = self._contact_owner_by_director(director)
-        # Existing historical package owner is the anchor. A contact owner is
-        # only allowed to seed a package that has no historical deal/company yet.
+
         director_owner_id = package_owner_id or contact_owner_id
         director_reason = package_reason or contact_reason
 
-        hard_owner_id, hard_reason = self._hard_owner_for_bin(app.bin, current_owner_id=current_owner_id)
-
-        # 3) A current-run assignment must agree with any existing director
-        # owner and with a hard BIN. Otherwise stop the row instead of splitting.
         if cached_owner_id:
             if director_owner_id and director_owner_id != cached_owner_id:
                 raise BitrixError(
@@ -593,50 +557,24 @@ class BitrixPipeline:
                     f"{cached_owner_id} ({self._user_name(cached_owner_id)}) but CRM package owner is "
                     f"{director_owner_id} ({self._user_name(director_owner_id)})."
                 )
-            if hard_owner_id and hard_owner_id != cached_owner_id:
-                raise BitrixError(
-                    f"DIRECTOR_HARD_BIN_OWNER_CONFLICT: BIN {app.bin} is hard-fixed to "
-                    f"{hard_owner_id} ({self._user_name(hard_owner_id)}), but director {director!r} is already "
-                    f"assigned to {cached_owner_id} ({self._user_name(cached_owner_id)})."
-                )
             return cached_owner_id, f"{cached_reason}_runtime_cache"
 
-        # 4) Existing director owner wins over company owner and randomizer. A
-        # conflicting hard BIN is not allowed to split the package silently.
         if director_owner_id:
-            if hard_owner_id and hard_owner_id != director_owner_id:
-                raise BitrixError(
-                    f"DIRECTOR_HARD_BIN_OWNER_CONFLICT: BIN {app.bin} is hard-fixed to "
-                    f"{hard_owner_id} ({self._user_name(hard_owner_id)}), but director {director!r} belongs to "
-                    f"{director_owner_id} ({self._user_name(director_owner_id)})."
-                )
             self._remember_assignment(app.bin, director, director_owner_id, director_reason)
             return director_owner_id, director_reason
 
-        # 5) No director package exists yet: a hard BIN may seed the package.
-        if hard_owner_id:
-            self._remember_assignment(app.bin, director, hard_owner_id, hard_reason)
-            return hard_owner_id, hard_reason
-
-        # 6) Existing company owner may seed a brand-new director package, but
-        # never override a director owner found above.
+        # If there is no director history yet, an existing non-technical company
+        # owner can seed the package. This is only a fallback for genuinely new
+        # director packages; it never overrides director history above.
         if self._is_allowed_manager(current_owner_id) and not self._is_source_responsible(current_owner_id):
-            reason = "existing_company_owner_seeds_director_package"
+            reason = "existing_company_owner_seeds_new_director_package"
             self._remember_assignment(app.bin, director, current_owner_id, reason)
             return current_owner_id, reason
 
-        # 7) Optional fallback, only if it is a real manager.
-        configured_id = self._configured_assigned_by_id()
-        if self._is_allowed_manager(configured_id) and not self._is_source_responsible(configured_id):
-            reason = "configured_manager_fallback"
-            self._remember_assignment(app.bin, director, configured_id, reason)
-            self._remember_new_package_load(configured_id, reason)
-            return configured_id, reason
-
-        # 8) Brand-new BIN + brand-new director: distribute once, then cache.
+        # Fully new director/BIN: choose by the lowest e-Qazyna deal load in the configured limit stages.
+        # The limit is soft: if everyone is at/above it, choose the lowest load.
         owner_id, reason = self._random_owner_from_current_load()
         self._remember_assignment(app.bin, director, owner_id, reason)
-        self._remember_new_package_load(owner_id, reason)
         return owner_id, reason
 
     def ensure_director_contact(self, company_id: str, deal_id: str | None, enr: CompanyEnrichment, responsible_id: int | None = None) -> tuple[str | None, str | None, str | None]:
@@ -772,7 +710,17 @@ class BitrixPipeline:
 
     def _failed_stage_ids(self) -> set[str]:
         raw = self.config.failed_deal_stage_ids or ""
-        return {part.strip().upper() for part in raw.split(",") if part.strip()}
+        return parse_stage_ids(raw)
+
+    def _target_failed_stage_id(self) -> str:
+        # Business requirement: when a failed package is inherited, write the plain
+        # configured stage (usually LOSE), not a category-prefixed source stage such as C2:LOSE.
+        raw = self.config.failed_deal_stage_ids or "LOSE"
+        for part in str(raw).split(","):
+            stage = part.strip()
+            if stage:
+                return stage
+        return "LOSE"
 
     def _failed_reason_fields(self) -> list[str]:
         raw = self.config.failed_deal_reason_fields or ""
@@ -805,7 +753,7 @@ class BitrixPipeline:
         semantic = str(deal.get("STAGE_SEMANTIC_ID") or "").strip().upper()
         if semantic == "F":
             return True
-        if stage_id and stage_id in self._failed_stage_ids():
+        if stage_id and stage_id_matches(stage_id, self._failed_stage_ids()):
             return True
         return False
 
@@ -833,13 +781,13 @@ class BitrixPipeline:
                 if company.get("ID") is not None:
                     company_ids.add(str(company.get("ID")))
 
-        if not company_ids:
-            self._failed_deal_by_director_cache[director_key] = None
-            return None
-
         failed_deals: list[dict[str, Any]] = []
         for deal in self._list_eqazyna_deals_cached():
-            if str(deal.get("COMPANY_ID") or "") not in company_ids:
+            deal_company_id = str(deal.get("COMPANY_ID") or "")
+            deal_director = _extract_director_from_comments(str(deal.get("COMMENTS") or ""))
+            matches_by_company = bool(deal_company_id and deal_company_id in company_ids)
+            matches_by_comment = bool(director_keys.intersection(director_identity_keys(deal_director)))
+            if not (matches_by_company or matches_by_comment):
                 continue
             if self._is_failed_deal(deal):
                 failed_deals.append(deal)
@@ -858,7 +806,8 @@ class BitrixPipeline:
         source_deal = sorted(failed_deals, key=sort_key, reverse=True)[0]
         reason, reason_field = self._failed_reason_from_deal(source_deal)
         inheritance = FailedDealInheritance(
-            stage_id=str(source_deal.get("STAGE_ID") or ""),
+            stage_id=self._target_failed_stage_id(),
+            source_stage_id=str(source_deal.get("STAGE_ID") or "") or None,
             reason=reason,
             reason_field=reason_field,
             source_deal_id=str(source_deal.get("ID")) if source_deal.get("ID") is not None else None,
@@ -896,7 +845,7 @@ class BitrixPipeline:
             fields["COMMENTS"] = (
                 f"{comments}\n\n"
                 "Автозавершение по правилу руководителя:\n"
-                f"у этого руководителя уже есть сделка в финальной стадии '{failed_inheritance.stage_id}'.\n"
+                f"у этого руководителя уже есть сделка в финальной стадии '{failed_inheritance.source_stage_id or failed_inheritance.stage_id}'.\n"
                 f"Старая сделка: {failed_inheritance.source_deal_id or 'не определена'}"
                 f"{(' — ' + failed_inheritance.source_deal_title) if failed_inheritance.source_deal_title else ''}.\n"
                 f"Наследованная причина: {reason_text}"

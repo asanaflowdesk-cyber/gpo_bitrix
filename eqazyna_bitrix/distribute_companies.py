@@ -22,11 +22,15 @@ SOURCE_RESPONSIBLE_ID = 36
 # ЕДИНЫЙ СПРАВОЧНИК МЕНЕДЖЕРОВ
 # ---------------------------------------------------------------------
 # Менеджеры, их ФИО и филиалы теперь хранятся в eqazyna_bitrix/config/managers.yml.
-# Добавляешь нового менеджера туда — pipeline, audit-repair и manual-fix
+# Добавляешь нового менеджера туда — pipeline, audit/repair и admin reassignment
 # подхватывают его автоматически через эти константы.
 
 from .manager_config import load_manager_config
-from .config.assignment import load_hard_bin_owners, load_hard_bin_owners_raw
+from .config.assignment import (
+    DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS,
+    is_assignment_load_deal,
+    parse_stage_ids,
+)
 from .director import director_identity_key
 
 _MANAGER_CONFIG = load_manager_config()
@@ -40,15 +44,6 @@ USER_BRANCH_IDS = _MANAGER_CONFIG.branch_id_by_user_id
 # константами 36/44, чтобы старые workflow продолжали работать без сюрпризов.
 SOURCE_RESPONSIBLE_IDS = _MANAGER_CONFIG.source_responsible_ids
 
-# ---------------------------------------------------------------------
-# ЖЁСТКОЕ ЗАКРЕПЛЕНИЕ БИНов
-# ---------------------------------------------------------------------
-# Список хранится в eqazyna_bitrix/config/hard_bins.yml.
-# В Python оставлены только готовые константы для обратной совместимости:
-# audit_repair_deal_packages.py, pipeline.py и тесты импортируют их отсюда.
-
-HARD_BIN_OWNERS_RAW = load_hard_bin_owners_raw()
-HARD_BIN_OWNERS = load_hard_bin_owners()
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -68,22 +63,30 @@ def parse_args() -> argparse.Namespace:
         default=",".join(str(user_id) for user_id in SOURCE_RESPONSIBLE_IDS),
         help="Comma-separated source responsible IDs to redistribute, for example: 36,44",
     )
-    parser.add_argument("--limit-per-manager", type=int, default=15)
+    parser.add_argument("--limit-per-manager", type=int, default=0)
     parser.add_argument(
         "--limit-per-manager-active-deals",
         type=int,
-        default=80,
+        default=30,
         help=(
-            "Soft limit of active e-Qazyna deals per manager. "
+            "Soft limit of e-Qazyna deals per manager in the configured load stages. "
             "Random/new packages are assigned only to managers below this limit before assignment. "
-            "0 = ignore active-deal limit."
+            "0 = ignore the deal limit. If everyone is above the limit, the lowest-load manager is still selected."
+        ),
+    )
+    parser.add_argument(
+        "--active-deal-load-stage-ids",
+        default=DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS,
+        help=(
+            "Comma-separated STAGE_ID values that consume the active-deal limit. "
+            "Default: NEW,EXECUTING. Other stages are ignored for the limit."
         ),
     )
     parser.add_argument(
         "--max-new-clients",
         type=int,
         default=18,
-        help="Soft max changed company/client cards per run for non-hard packages. 0 = no batch limit",
+        help="Soft max changed company/client cards per run for repair packages. 0 = no batch limit",
     )
     parser.add_argument("--seed", type=int, default=None)
 
@@ -226,8 +229,18 @@ def _company_director(company: dict[str, Any]) -> str:
     return _extract_director_from_comments(_safe_str(company.get("COMMENTS")))
 
 
-def _company_group_key(company: dict[str, Any]) -> tuple[str, str, str]:
+def _deal_director(deal: dict[str, Any]) -> str:
+    return _extract_director_from_comments(_safe_str(deal.get("COMMENTS")))
+
+
+def _company_group_key(company: dict[str, Any], deals: list[dict[str, Any]] | None = None) -> tuple[str, str, str]:
     director = _company_director(company)
+
+    if not director:
+        for deal in sorted(deals or [], key=_historical_sort_key):
+            director = _deal_director(deal)
+            if director:
+                break
 
     if director:
         normalized = director_identity_key(director) or _normalize_text(director)
@@ -256,6 +269,7 @@ def _list_eqazyna_companies(client: BitrixClient) -> list[dict[str, Any]]:
                 "ORIGINATOR_ID",
                 "ORIGIN_ID",
                 "COMMENTS",
+                "DATE_CREATE",
             ],
         },
     )
@@ -278,6 +292,8 @@ def _list_company_deals(client: BitrixClient, company_id: str) -> list[dict[str,
                 "COMPANY_ID",
                 "ORIGINATOR_ID",
                 "ORIGIN_ID",
+                "DATE_CREATE",
+                "COMMENTS",
             ],
         },
     )
@@ -329,12 +345,15 @@ def _deal_owner_id(deal: dict[str, Any]) -> int | None:
     return _to_int(deal.get("ASSIGNED_BY_ID"))
 
 
-def _initial_active_deal_load(deal_cache: dict[str, list[dict[str, Any]]]) -> dict[int, int]:
+def _initial_active_deal_load(
+    deal_cache: dict[str, list[dict[str, Any]]],
+    load_stage_ids: set[str],
+) -> dict[int, int]:
     load = {user_id: 0 for user_id in ALLOWED_USER_IDS}
 
     for deals in deal_cache.values():
         for deal in deals:
-            if not _is_active_deal(deal):
+            if not is_assignment_load_deal(deal, load_stage_ids):
                 continue
 
             owner_id = _deal_owner_id(deal)
@@ -349,6 +368,7 @@ def _group_active_deal_inbound_count(
     group_companies: list[dict[str, Any]],
     deal_cache: dict[str, list[dict[str, Any]]],
     target_user_id: int,
+    load_stage_ids: set[str],
 ) -> int:
     count = 0
 
@@ -356,7 +376,7 @@ def _group_active_deal_inbound_count(
         company_id = str(company.get("ID"))
 
         for deal in deal_cache.get(company_id, []):
-            if not _is_active_deal(deal):
+            if not is_assignment_load_deal(deal, load_stage_ids):
                 continue
 
             if _deal_owner_id(deal) != target_user_id:
@@ -391,6 +411,7 @@ def _choose_random_available(
     limit_per_manager_active_deals: int,
     group_companies: list[dict[str, Any]],
     deal_cache: dict[str, list[dict[str, Any]]],
+    load_stage_ids: set[str],
 ) -> tuple[int | None, bool, dict[str, Any]]:
     eligible: list[int] = []
     blocked: dict[int, dict[str, int]] = {}
@@ -415,11 +436,10 @@ def _choose_random_available(
         eligible.append(user_id)
 
     if not eligible:
-        return None, False, {
-            "blocked_managers": {str(user_id): data for user_id, data in sorted(blocked.items())},
-            "client_limit": limit_per_manager,
-            "active_deal_limit": limit_per_manager_active_deals,
-        }
+        eligible = list(ALLOWED_USER_IDS)
+        blocked_debug = {str(user_id): data for user_id, data in sorted(blocked.items())}
+    else:
+        blocked_debug = {str(user_id): data for user_id, data in sorted(blocked.items())}
 
     min_active_deals = min(active_deal_load.get(user_id, 0) for user_id in eligible)
     active_deal_candidates = [
@@ -442,7 +462,7 @@ def _choose_random_available(
         for company in group_companies
         if _company_owner_id(company) != target_user_id
     )
-    active_deal_inbound = _group_active_deal_inbound_count(group_companies, deal_cache, target_user_id)
+    active_deal_inbound = _group_active_deal_inbound_count(group_companies, deal_cache, target_user_id, load_stage_ids)
 
     client_after = client_load.get(target_user_id, 0) + company_inbound
     active_deal_after = active_deal_load.get(target_user_id, 0) + active_deal_inbound
@@ -458,7 +478,8 @@ def _choose_random_available(
 
     return target_user_id, bool(soft_limit_expanded), {
         "eligible_manager_ids": sorted(eligible),
-        "selected_by": "lowest_active_deal_load_then_lowest_client_load_then_random",
+        "blocked_managers": blocked_debug,
+        "selected_by": "below_soft_limit_or_lowest_active_deal_load_then_lowest_client_load_then_random",
         "client_load_before": client_load.get(target_user_id, 0),
         "client_load_after": client_after,
         "active_deal_load_before": active_deal_load.get(target_user_id, 0),
@@ -467,131 +488,6 @@ def _choose_random_available(
         "active_deal_limit": limit_per_manager_active_deals,
     }
 
-
-def _choose_existing_allowed_owner(
-    group_companies: list[dict[str, Any]],
-    source_responsible_ids: set[int],
-    load: dict[int, int],
-) -> int | None:
-    counts: Counter[int] = Counter()
-
-    for company in group_companies:
-        owner_id = _company_owner_id(company)
-
-        if owner_id is None:
-            continue
-
-        if owner_id in source_responsible_ids:
-            continue
-
-        if owner_id not in ALLOWED_USER_IDS:
-            continue
-
-        counts[owner_id] += 1
-
-    if not counts:
-        return None
-
-    max_count = max(counts.values())
-
-    candidates = [
-        user_id
-        for user_id, count in counts.items()
-        if count == max_count
-    ]
-
-    candidates.sort(key=lambda user_id: (load.get(user_id, 0), user_id))
-
-    return candidates[0]
-
-
-def _choose_hard_owner_for_group(
-    group_companies: list[dict[str, Any]],
-    load: dict[int, int],
-) -> dict[str, Any] | None:
-    votes: Counter[int] = Counter()
-    current_owner_votes: Counter[int] = Counter()
-    matched_bins: list[dict[str, Any]] = []
-
-    for company in group_companies:
-        bin_value = _company_bin(company)
-
-        if not bin_value:
-            continue
-
-        owner_ids = HARD_BIN_OWNERS.get(bin_value, [])
-
-        if not owner_ids:
-            continue
-
-        current_owner_id = _company_owner_id(company)
-
-        matched_bins.append(
-            {
-                "company_id": company.get("ID"),
-                "company_title": company.get("TITLE"),
-                "bin": bin_value,
-                "hard_owner_ids": owner_ids,
-                "hard_owner_names": [_user_name(user_id) for user_id in owner_ids],
-                "current_owner_id": current_owner_id,
-                "current_owner_name": _user_name(current_owner_id),
-            }
-        )
-
-        for owner_id in owner_ids:
-            if owner_id in ALLOWED_USER_IDS:
-                votes[owner_id] += 1
-
-            if current_owner_id == owner_id:
-                current_owner_votes[owner_id] += 1
-
-    if not votes:
-        return None
-
-    max_votes = max(votes.values())
-
-    candidates = [
-        user_id
-        for user_id, count in votes.items()
-        if count == max_votes
-    ]
-
-    if len(candidates) == 1:
-        target_user_id = candidates[0]
-        reason = "hard_bin_owner"
-    else:
-        max_current_votes = max(
-            current_owner_votes.get(user_id, 0)
-            for user_id in candidates
-        )
-
-        current_owner_candidates = [
-            user_id
-            for user_id in candidates
-            if current_owner_votes.get(user_id, 0) == max_current_votes
-        ]
-
-        if max_current_votes > 0 and len(current_owner_candidates) == 1:
-            target_user_id = current_owner_candidates[0]
-            reason = "hard_bin_owner_tie_resolved_by_current_owner"
-        else:
-            current_owner_candidates.sort(key=lambda user_id: (load.get(user_id, 0), user_id))
-            target_user_id = current_owner_candidates[0]
-            reason = "hard_bin_owner_tie_resolved_by_lowest_load"
-
-    return {
-        "target_user_id": target_user_id,
-        "target_user_name": _user_name(target_user_id),
-        "reason": reason,
-        "hard_votes": {
-            str(user_id): {
-                "user_name": _user_name(user_id),
-                "votes": count,
-            }
-            for user_id, count in sorted(votes.items())
-        },
-        "matched_bins": matched_bins,
-    }
 
 
 def _company_short(company: dict[str, Any]) -> dict[str, Any]:
@@ -607,26 +503,8 @@ def _company_short(company: dict[str, Any]) -> dict[str, Any]:
 
 
 def _strict_target_for_company(company: dict[str, Any], package_target_user_id: int) -> tuple[int, str | None]:
-    """Hard BIN ownership is absolute for that BIN.
-
-    A director package may be normalized to one manager, but if a specific BIN
-    is hard-fixed to another manager, that exact company/deals must not be
-    moved away from the hard owner. This is the iron rule above package repair.
-    """
-    bin_value = _company_bin(company)
-    hard_owner_ids = [user_id for user_id in HARD_BIN_OWNERS.get(bin_value, []) if user_id in ALLOWED_USER_IDS]
-
-    if not hard_owner_ids:
-        return package_target_user_id, None
-
-    if package_target_user_id in hard_owner_ids:
-        return package_target_user_id, "package_target_matches_hard_bin_owner"
-
-    current_owner_id = _company_owner_id(company)
-    if current_owner_id in hard_owner_ids:
-        return current_owner_id, "hard_bin_exact_owner_preserved"
-
-    return hard_owner_ids[0], "hard_bin_exact_owner_override"
+    """Keep every company of the director/founder package on the same target."""
+    return package_target_user_id, None
 
 
 def _sync_company_and_deals(
@@ -736,8 +614,35 @@ def _sync_company_and_deals(
     return sync, company_changes, deal_changes
 
 
-def _group_has_hard_bin(group_companies: list[dict[str, Any]]) -> bool:
-    return any(_company_bin(company) in HARD_BIN_OWNERS for company in group_companies)
+
+def _historical_sort_key(record: dict[str, Any]) -> tuple[str, int]:
+    return (_safe_str(record.get("DATE_CREATE")), _to_int(record.get("ID")) or 0)
+
+
+def _choose_historical_owner_for_group(
+    group_companies: list[dict[str, Any]],
+    deal_cache: dict[str, list[dict[str, Any]]],
+    source_responsible_ids: set[int],
+) -> tuple[int | None, str | None]:
+    eligible_deals: list[dict[str, Any]] = []
+    for company in group_companies:
+        for deal in deal_cache.get(str(company.get("ID")), []):
+            owner = _deal_owner_id(deal)
+            if owner in ALLOWED_USER_IDS and owner not in source_responsible_ids:
+                eligible_deals.append(deal)
+    if eligible_deals:
+        deal = min(eligible_deals, key=_historical_sort_key)
+        return _deal_owner_id(deal), "historical_first_deal_owner"
+
+    eligible_companies = [
+        company for company in group_companies
+        if _company_owner_id(company) in ALLOWED_USER_IDS and _company_owner_id(company) not in source_responsible_ids
+    ]
+    if eligible_companies:
+        company = min(eligible_companies, key=_historical_sort_key)
+        return _company_owner_id(company), "historical_first_company_owner"
+
+    return None, None
 
 
 def _group_latest_active_deal_id(
@@ -761,11 +666,10 @@ def _group_sort_key(
     deal_cache: dict[str, list[dict[str, Any]]],
 ) -> tuple[int, int, int, int]:
     _group_key, group_companies = item
-    has_hard = 1 if _group_has_hard_bin(group_companies) else 0
     source_count = sum(1 for company in group_companies if _company_owner_id(company) in source_responsible_ids)
     latest_deal_id = _group_latest_active_deal_id(group_companies, deal_cache)
     latest_company_id = max((_to_int(company.get("ID")) or 0) for company in group_companies)
-    return (has_hard, source_count, latest_deal_id, latest_company_id)
+    return (source_count, latest_deal_id, latest_company_id, 0)
 
 
 def _apply_planned_load_change(
@@ -791,12 +695,13 @@ def _apply_planned_active_deal_load_change(
     group_companies: list[dict[str, Any]],
     deal_cache: dict[str, list[dict[str, Any]]],
     target_user_id: int,
+    load_stage_ids: set[str],
 ) -> None:
     for company in group_companies:
         company_id = str(company.get("ID"))
 
         for deal in deal_cache.get(company_id, []):
-            if not _is_active_deal(deal):
+            if not is_assignment_load_deal(deal, load_stage_ids):
                 continue
 
             old_owner_id = _deal_owner_id(deal)
@@ -832,27 +737,18 @@ def main() -> int:
 
     print(f"Source responsible IDs: {source_responsible_ids_sorted}")
     print(f"Allowed users: {len(ALLOWED_USER_IDS)}")
-    print(f"Hard BINs: {len(HARD_BIN_OWNERS)}")
+    load_stage_ids = parse_stage_ids(args.active_deal_load_stage_ids)
+
     print(f"Limit per manager, clients: {args.limit_per_manager}")
     print(f"Limit per manager, active deals: {args.limit_per_manager_active_deals}")
-    print(f"Max changed clients per run, non-hard only: {args.max_new_clients}")
+    print(f"Active-deal load stages: {sorted(load_stage_ids)}")
+    print(f"Max changed clients per run, repair packages: {args.max_new_clients}")
 
     load = _initial_client_load(companies)
 
     print("Initial client load:")
     for user_id, count in sorted(load.items(), key=lambda item: (item[1], item[0])):
         print(f"  {user_id} {_user_name(user_id)}: {count}")
-
-    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    group_meta: dict[str, dict[str, str]] = {}
-
-    for company in companies:
-        group_key, group_type, readable_name = _company_group_key(company)
-        groups[group_key].append(company)
-        group_meta[group_key] = {
-            "group_type": group_type,
-            "readable_name": readable_name,
-        }
 
     deal_cache: dict[str, list[dict[str, Any]]] = {}
     for company in companies:
@@ -863,7 +759,19 @@ def main() -> int:
             print(f"WARN: could not list deals for company {company_id}: {exc}")
             deal_cache[company_id] = []
 
-    active_deal_load = _initial_active_deal_load(deal_cache)
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    group_meta: dict[str, dict[str, str]] = {}
+
+    for company in companies:
+        company_id = str(company.get("ID"))
+        group_key, group_type, readable_name = _company_group_key(company, deal_cache.get(company_id, []))
+        groups[group_key].append(company)
+        group_meta[group_key] = {
+            "group_type": group_type,
+            "readable_name": readable_name,
+        }
+
+    active_deal_load = _initial_active_deal_load(deal_cache, load_stage_ids)
 
     print("Initial active deal load:")
     for user_id, count in sorted(active_deal_load.items(), key=lambda item: (item[1], item[0])):
@@ -880,10 +788,6 @@ def main() -> int:
     changed_clients_planned = 0
     changed_groups_planned = 0
     changed_deals_planned = 0
-
-    hard_changed_clients_planned = 0
-    hard_changed_groups_planned = 0
-    hard_changed_deals_planned = 0
 
     action_counter: Counter[str] = Counter()
     reason_counter: Counter[str] = Counter()
@@ -903,18 +807,10 @@ def main() -> int:
             str(user_id): _user_name(user_id)
             for user_id in ALLOWED_USER_IDS
         },
-        "hard_bin_count": len(HARD_BIN_OWNERS),
-        "hard_bin_owners": {
-            bin_value: {
-                "owner_ids": owner_ids,
-                "owner_names": [_user_name(user_id) for user_id in owner_ids],
-            }
-            for bin_value, owner_ids in sorted(HARD_BIN_OWNERS.items())
-        },
         "limit_per_manager_clients": args.limit_per_manager,
         "limit_per_manager_active_deals": args.limit_per_manager_active_deals,
-        "max_changed_clients_non_hard": args.max_new_clients,
-        "distribution_mode": "hard_bin_absolute_then_existing_director_or_bin_owner_then_newest_random_package",
+        "max_changed_clients": args.max_new_clients,
+        "distribution_mode": "historical_director_first_then_lowest_active_deal_load_new_package",
         "seed": args.seed,
     }
 
@@ -974,8 +870,6 @@ def main() -> int:
                 _user_name(owner_id)
                 for owner_id in non_allowed_owner_ids
             ],
-            "is_hard_package": False,
-            "hard_decision": None,
             "target_user_id": None,
             "target_user_name": None,
             "reason": None,
@@ -999,131 +893,86 @@ def main() -> int:
             "error": None,
         }
 
-        hard_decision = _choose_hard_owner_for_group(
+        existing_allowed_owner, existing_reason = _choose_historical_owner_for_group(
             group_companies=group_companies,
-            load=load,
+            deal_cache=deal_cache,
+            source_responsible_ids=source_responsible_ids,
         )
 
-        if hard_decision is not None:
-            target_user_id = hard_decision["target_user_id"]
-            target_reason = hard_decision["reason"]
-
-            row["is_hard_package"] = True
-            row["hard_decision"] = hard_decision
+        if existing_allowed_owner is not None:
+            target_user_id = existing_allowed_owner
+            target_reason = existing_reason
 
             manager_load_before = load.get(target_user_id, 0)
-
             inbound_to_target = sum(
                 1
                 for company in group_companies
                 if _company_owner_id(company) != target_user_id
             )
-
             manager_load_after = manager_load_before + inbound_to_target
-            manager_limit_expanded = manager_load_after > args.limit_per_manager
             manager_active_deal_load_before = active_deal_load.get(target_user_id, 0)
             manager_active_deal_load_after = manager_active_deal_load_before + _group_active_deal_inbound_count(
                 group_companies,
                 deal_cache,
                 target_user_id,
+                load_stage_ids,
             )
             manager_active_deal_limit_expanded = (
                 args.limit_per_manager_active_deals > 0
                 and manager_active_deal_load_after > args.limit_per_manager_active_deals
             )
-            manager_active_deal_load_before = active_deal_load.get(target_user_id, 0)
-            manager_active_deal_load_after = manager_active_deal_load_before + _group_active_deal_inbound_count(
-                group_companies,
-                deal_cache,
-                target_user_id,
-            )
-            manager_active_deal_limit_expanded = (
-                args.limit_per_manager_active_deals > 0
-                and manager_active_deal_load_after > args.limit_per_manager_active_deals
-            )
+            manager_limit_expanded = bool(args.limit_per_manager and manager_load_after > args.limit_per_manager)
 
-        else:
-            existing_allowed_owner = _choose_existing_allowed_owner(
+        elif has_source_companies:
+            target_user_id, manager_limit_expanded, random_limit_debug = _choose_random_available(
+                client_load=load,
+                active_deal_load=active_deal_load,
+                limit_per_manager=args.limit_per_manager,
+                limit_per_manager_active_deals=args.limit_per_manager_active_deals,
                 group_companies=group_companies,
-                source_responsible_ids=source_responsible_ids,
-                load=load,
+                deal_cache=deal_cache,
+                load_stage_ids=load_stage_ids,
             )
-
-            if existing_allowed_owner is not None:
-                target_user_id = existing_allowed_owner
-
-                if has_split_companies:
-                    target_reason = "repair_split_package_to_dominant_allowed_owner"
-                else:
-                    target_reason = "sync_clean_package_to_existing_allowed_owner"
-
-                manager_load_before = load.get(target_user_id, 0)
-
-                inbound_to_target = sum(
-                    1
-                    for company in group_companies
-                    if _company_owner_id(company) != target_user_id
-                )
-
-                manager_load_after = manager_load_before + inbound_to_target
-                manager_active_deal_load_before = active_deal_load.get(target_user_id, 0)
-                manager_active_deal_load_after = manager_active_deal_load_before + _group_active_deal_inbound_count(
-                    group_companies,
-                    deal_cache,
-                    target_user_id,
-                )
-                manager_active_deal_limit_expanded = (
-                    args.limit_per_manager_active_deals > 0
-                    and manager_active_deal_load_after > args.limit_per_manager_active_deals
-                )
-                manager_limit_expanded = manager_load_after > args.limit_per_manager
-
-            elif has_source_companies:
-                target_user_id, manager_limit_expanded, random_limit_debug = _choose_random_available(
-                    client_load=load,
-                    active_deal_load=active_deal_load,
-                    limit_per_manager=args.limit_per_manager,
-                    limit_per_manager_active_deals=args.limit_per_manager_active_deals,
-                    group_companies=group_companies,
-                    deal_cache=deal_cache,
-                )
-
-                if target_user_id is None:
-                    row["action"] = "skip_no_available_managers"
-                    row["reason"] = "no_manager_below_client_or_active_deal_limit"
-                    row["limit_debug"] = random_limit_debug
-                    row["companies"] = [_company_short(company) for company in group_companies]
-
-                    results.append(row)
-                    action_counter[row["action"]] += 1
-                    reason_counter[row["reason"]] += 1
-                    continue
-
-                target_reason = (
-                    "random_with_soft_client_or_active_deal_limit_expanded_for_package"
-                    if manager_limit_expanded
-                    else "random_new_package_below_limits"
-                )
-
-                manager_load_before = load.get(target_user_id, 0)
-
-                inbound_to_target = sum(
-                    1
-                    for company in group_companies
-                    if _company_owner_id(company) != target_user_id
-                )
-
-                manager_load_after = manager_load_before + inbound_to_target
-
-            else:
-                row["action"] = "skip_no_source_and_no_allowed_owner"
-                row["reason"] = "package_has_no_source_companies_no_allowed_owner_no_hard_bin"
+            if target_user_id is None:
+                row["action"] = "skip_no_available_managers"
+                row["reason"] = "no_manager_available"
+                row["limit_debug"] = random_limit_debug
                 row["companies"] = [_company_short(company) for company in group_companies]
-
                 results.append(row)
                 action_counter[row["action"]] += 1
                 reason_counter[row["reason"]] += 1
                 continue
+            target_reason = (
+                "lowest_active_deal_load_limit_expanded_for_new_package"
+                if manager_limit_expanded
+                else "lowest_active_deal_load_new_package"
+            )
+            manager_load_before = load.get(target_user_id, 0)
+            inbound_to_target = sum(
+                1
+                for company in group_companies
+                if _company_owner_id(company) != target_user_id
+            )
+            manager_load_after = manager_load_before + inbound_to_target
+            manager_active_deal_load_before = active_deal_load.get(target_user_id, 0)
+            manager_active_deal_load_after = manager_active_deal_load_before + _group_active_deal_inbound_count(
+                group_companies,
+                deal_cache,
+                target_user_id,
+                load_stage_ids,
+            )
+            manager_active_deal_limit_expanded = (
+                args.limit_per_manager_active_deals > 0
+                and manager_active_deal_load_after > args.limit_per_manager_active_deals
+            )
+        else:
+            row["action"] = "skip_no_source_and_no_historical_owner"
+            row["reason"] = "package_has_no_source_companies_no_historical_owner"
+            row["companies"] = [_company_short(company) for company in group_companies]
+            results.append(row)
+            action_counter[row["action"]] += 1
+            reason_counter[row["reason"]] += 1
+            continue
 
         changed_company_count = sum(
             1
@@ -1131,36 +980,27 @@ def main() -> int:
             if _company_owner_id(company) != target_user_id
         )
 
-        # Лимит запуска применяется только к НЕжёстким пакетам.
-        # HARD-пакеты идут всегда, даже если лимит уже превышен.
-        if not row["is_hard_package"]:
-            if changed_company_count > 0 and args.max_new_clients and args.max_new_clients > 0:
-                remaining_batch_capacity = args.max_new_clients - changed_clients_planned
+        # Batch limit is applied to changed company cards only. Director packages are never split.
+        if changed_company_count > 0 and args.max_new_clients and args.max_new_clients > 0:
+            remaining_batch_capacity = args.max_new_clients - changed_clients_planned
 
-                if remaining_batch_capacity <= 0:
-                    row["action"] = "skip_batch_limit_reached"
-                    row["reason"] = "max_changed_clients_for_this_run_reached"
-                    row["target_user_id"] = target_user_id
-                    row["target_user_name"] = _user_name(target_user_id)
-                    row["companies"] = [_company_short(company) for company in group_companies]
+            if remaining_batch_capacity <= 0:
+                row["action"] = "skip_batch_limit_reached"
+                row["reason"] = "max_changed_clients_for_this_run_reached"
+                row["target_user_id"] = target_user_id
+                row["target_user_name"] = _user_name(target_user_id)
+                row["companies"] = [_company_short(company) for company in group_companies]
 
-                    results.append(row)
-                    action_counter[row["action"]] += 1
-                    reason_counter[row["reason"]] += 1
-                    continue
+                results.append(row)
+                action_counter[row["action"]] += 1
+                reason_counter[row["reason"]] += 1
+                continue
 
-                if changed_company_count > remaining_batch_capacity:
-                    row["batch_limit_expanded"] = True
+            if changed_company_count > remaining_batch_capacity:
+                row["batch_limit_expanded"] = True
 
-                row["batch_load_before"] = changed_clients_planned
-                row["batch_load_after"] = changed_clients_planned + changed_company_count
-        else:
-            if changed_company_count > 0 and args.max_new_clients and args.max_new_clients > 0:
-                row["batch_load_before"] = changed_clients_planned
-                row["batch_load_after"] = changed_clients_planned + changed_company_count
-
-                if changed_clients_planned + changed_company_count > args.max_new_clients:
-                    row["batch_limit_expanded"] = True
+            row["batch_load_before"] = changed_clients_planned
+            row["batch_load_after"] = changed_clients_planned + changed_company_count
 
         row["target_user_id"] = target_user_id
         row["target_user_name"] = _user_name(target_user_id)
@@ -1193,11 +1033,6 @@ def main() -> int:
                     "new_assigned_by_id": company_target_user_id,
                     "new_assigned_by_name": _user_name(company_target_user_id),
                     "company_target_override_reason": company_target_override_reason,
-                    "hard_bin_owners": HARD_BIN_OWNERS.get(_company_bin(company), []),
-                    "hard_bin_owner_names": [
-                        _user_name(user_id)
-                        for user_id in HARD_BIN_OWNERS.get(_company_bin(company), [])
-                    ],
                 }
             )
 
@@ -1227,22 +1062,16 @@ def main() -> int:
             changed_clients_planned += package_company_changes
             changed_groups_planned += 1
 
-            if row["is_hard_package"]:
-                hard_changed_clients_planned += package_company_changes
-                hard_changed_groups_planned += 1
-
         if package_deal_changes > 0:
             _apply_planned_active_deal_load_change(
                 active_deal_load=active_deal_load,
                 group_companies=group_companies,
                 deal_cache=deal_cache,
                 target_user_id=target_user_id,
+                load_stage_ids=load_stage_ids,
             )
 
         changed_deals_planned += package_deal_changes
-
-        if row["is_hard_package"]:
-            hard_changed_deals_planned += package_deal_changes
 
         results.append(row)
         action_counter[row["action"]] += 1
@@ -1251,10 +1080,6 @@ def main() -> int:
     summary["changed_clients_planned"] = changed_clients_planned
     summary["changed_groups_planned"] = changed_groups_planned
     summary["changed_deals_planned"] = changed_deals_planned
-
-    summary["hard_changed_clients_planned"] = hard_changed_clients_planned
-    summary["hard_changed_groups_planned"] = hard_changed_groups_planned
-    summary["hard_changed_deals_planned"] = hard_changed_deals_planned
 
     summary["action_counts"] = dict(action_counter)
     summary["reason_counts"] = dict(reason_counter)

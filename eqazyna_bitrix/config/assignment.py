@@ -1,71 +1,58 @@
 from __future__ import annotations
 
-import re
-from collections import defaultdict
-from pathlib import Path
 from typing import Any
 
-from .common import ConfigError, as_int, as_str, read_yaml, resolve_config_path
+
+DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS = "NEW,EXECUTING"
 
 
-def _normalize_bin(raw: Any) -> str:
-    digits = re.sub(r"\D", "", str(raw or ""))
-    return digits if len(digits) == 12 else ""
+def parse_stage_ids(raw: Any) -> set[str]:
+    """Parse comma-separated Bitrix STAGE_ID values for assignment-load counting.
+
+    The 30-deal capacity is stage-based: by default only New + In work
+    consume manager capacity. Approval, document collection, failed and closed
+    deals are outside the limit unless explicitly added to the setting.
+    """
+    if raw is None:
+        raw = DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS
+    if isinstance(raw, (list, tuple, set)):
+        parts = raw
+    else:
+        parts = str(raw).split(",")
+    return {str(part).strip().upper() for part in parts if str(part).strip()}
 
 
-def load_hard_bin_owners_raw(path: str | Path | None = None) -> dict[int, list[str]]:
-    config_path = resolve_config_path("hard_bins.yml", path)
-    data = read_yaml(config_path)
-    rows = data.get("hard_bin_owners", [])
-    if not isinstance(rows, list):
-        raise ConfigError("hard_bin_owners must be a list")
+def stage_id_matches(stage_id: Any, allowed_stage_ids: set[str]) -> bool:
+    """Return True when a Bitrix STAGE_ID matches configured stages.
 
-    result: dict[int, list[str]] = {}
-    for index, row in enumerate(rows):
-        if not isinstance(row, dict):
-            raise ConfigError(f"hard_bin_owners[{index}] must be a mapping")
-        user_id = as_int(row.get("user_id"), f"hard_bin_owners[{index}].user_id")
-        bins = row.get("bins", [])
-        if not isinstance(bins, list):
-            raise ConfigError(f"hard_bin_owners[{index}].bins must be a list")
-        cleaned: list[str] = []
-        for value in bins:
-            bin_value = _normalize_bin(value)
-            if not bin_value:
-                raise ConfigError(f"Invalid BIN for user {user_id}: {value!r}")
-            cleaned.append(bin_value)
-        result[user_id] = cleaned
-    return result
+    A config value NEW matches both NEW and category-prefixed C2:NEW.
+    A config value C2:NEW matches only that exact category stage.
+    """
+    allowed = {value.strip().upper() for value in allowed_stage_ids if value and value.strip()}
+    if not allowed:
+        return False
+    if "*" in allowed or "ALL" in allowed:
+        return True
+    normalized = str(stage_id or "").strip().upper()
+    if not normalized:
+        return False
+    if normalized in allowed:
+        return True
+    if ":" in normalized and normalized.split(":", 1)[1] in allowed:
+        return True
+    return False
 
 
-def build_hard_bin_owners(raw: dict[int, list[str]]) -> dict[str, list[int]]:
-    index: dict[str, set[int]] = defaultdict(set)
-    for user_id, bins in raw.items():
-        for bin_value in bins:
-            normalized = _normalize_bin(bin_value)
-            if normalized:
-                index[normalized].add(int(user_id))
-    return {bin_value: sorted(owner_ids) for bin_value, owner_ids in index.items()}
+def is_closed_deal_record(deal: dict[str, Any]) -> bool:
+    return str(deal.get("CLOSED") or "").strip().upper() == "Y"
 
 
-def load_hard_bin_owners(path: str | Path | None = None) -> dict[str, list[int]]:
-    return build_hard_bin_owners(load_hard_bin_owners_raw(path))
+def is_assignment_load_deal(deal: dict[str, Any], allowed_stage_ids: set[str]) -> bool:
+    """Return True when a deal consumes manager capacity.
 
-
-def load_manual_director_owners_raw(path: str | Path | None = None) -> dict[int, list[str]]:
-    config_path = resolve_config_path("manual_directors.yml", path)
-    data = read_yaml(config_path)
-    rows = data.get("manual_director_owners", [])
-    if not isinstance(rows, list):
-        raise ConfigError("manual_director_owners must be a list")
-
-    result: dict[int, list[str]] = {}
-    for index, row in enumerate(rows):
-        if not isinstance(row, dict):
-            raise ConfigError(f"manual_director_owners[{index}] must be a mapping")
-        user_id = as_int(row.get("user_id"), f"manual_director_owners[{index}].user_id")
-        directors = row.get("directors", [])
-        if not isinstance(directors, list):
-            raise ConfigError(f"manual_director_owners[{index}].directors must be a list")
-        result[user_id] = [as_str(name, f"manual_director_owners[{index}].directors") for name in directors]
-    return result
+    Business rule: the limit counts only stages configured as New + In work.
+    Other open stages are ignored for capacity.
+    """
+    if is_closed_deal_record(deal):
+        return False
+    return stage_id_matches(deal.get("STAGE_ID"), allowed_stage_ids)

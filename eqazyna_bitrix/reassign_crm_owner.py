@@ -24,6 +24,21 @@ import requests
 TRUE_VALUES = {"1", "true", "yes", "y", "да", "д", "on"}
 FALSE_VALUES = {"0", "false", "no", "n", "нет", "н", "off"}
 ALL_VALUES = {"", "all", "*", "все", "любой", "любая"}
+NONE_VALUES = {"", "none", "нет", "no", "0", "-"}
+DEFAULT_FAILURE_REASON_FIELD = "UF_CRM_1779448756033"
+
+CLOSE_REASON_OPTIONS: Dict[str, str] = {
+    "400": "Дубль сделки",
+    "394": "Клиент отказался",
+    "402": "Не ведёт деятельность / компания неактивна",
+    "386": "Не дозвонились",
+    "396": "Не подходит по критериям",
+    "392": "Нет данных организации",
+    "398": "Ошибка данных",
+    "404": "Проиграли аукцион",
+    "390": "Уже работает с Евразией",
+    "388": "Уже работает с конкурентом",
+}
 
 
 @dataclass(frozen=True)
@@ -119,6 +134,25 @@ def parse_csv_values(value: Any) -> List[str]:
     return parts
 
 
+def parse_close_reason_id(value: Any) -> str:
+    """Return normalized Bitrix close-reason enum ID or an empty string."""
+    if value is None:
+        return ""
+    raw = str(value).strip()
+    if raw.lower() in NONE_VALUES:
+        return ""
+    # Supports both plain values ("394") and UI-friendly strings ("394 - Клиент отказался").
+    reason_id = raw.split("-", 1)[0].strip()
+    if reason_id not in CLOSE_REASON_OPTIONS:
+        allowed = ", ".join(f"{k}={v}" for k, v in CLOSE_REASON_OPTIONS.items())
+        raise ValueError(f"Invalid failure_reason_id={value!r}. Allowed: {allowed}")
+    return reason_id
+
+
+def close_reason_name(reason_id: str) -> str:
+    return CLOSE_REASON_OPTIONS.get(str(reason_id).strip(), "")
+
+
 def add_multi_filter(params: List[Tuple[str, Any]], field: str, values: Sequence[str]) -> None:
     if not values:
         return
@@ -138,7 +172,13 @@ class BitrixClient:
         self.sleep_seconds = sleep_seconds
         self.session = requests.Session()
 
-    def call(self, method: str, params: Optional[Sequence[Tuple[str, Any]]] = None) -> Any:
+    def call_full(self, method: str, params: Optional[Sequence[Tuple[str, Any]]] = None) -> Dict[str, Any]:
+        """Call Bitrix and return the full payload, including top-level pagination.
+
+        Bitrix list methods normally return `result` as a list and `next` on the
+        top level. Returning only `result` silently drops pages after the first 50
+        records, so admin reassignment must use the full payload for list calls.
+        """
         url = self.base_url + method + ".json"
         response = self.session.post(url, data=list(params or []), timeout=self.timeout)
         if self.sleep_seconds:
@@ -150,27 +190,30 @@ class BitrixClient:
             raise RuntimeError(f"Bitrix returned non-JSON response for {method}: {response.text[:500]}")
         if response.status_code >= 400 or "error" in payload:
             raise RuntimeError(f"Bitrix API error in {method}: status={response.status_code}, payload={payload}")
-        return payload.get("result")
+        return payload
+
+    def call(self, method: str, params: Optional[Sequence[Tuple[str, Any]]] = None) -> Any:
+        return self.call_full(method, params).get("result")
 
     def _paged_list(self, method: str, params_base: List[Tuple[str, Any]], limit: int = 0) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         start: Any = 0
         while True:
             params = list(params_base)
-            if start:
-                params.append(("start", start))
-            result = self.call(method, params)
+            params.append(("start", start))
+            payload = self.call_full(method, params)
+            result = payload.get("result")
             if isinstance(result, dict) and "items" in result:
                 items = result.get("items") or []
-                next_start = result.get("next")
+                next_start = result.get("next", payload.get("next"))
             else:
                 items = result or []
-                next_start = None
+                next_start = payload.get("next")
             for item in items:
                 rows.append(dict(item))
                 if limit and len(rows) >= limit:
                     return rows
-            if not next_start:
+            if next_start in (None, "", False):
                 break
             start = next_start
         return rows
@@ -238,8 +281,10 @@ class BitrixClient:
             return True
         return False
 
-    def update_owner(self, spec: EntitySpec, entity_id: str, target_user_id: int) -> Any:
+    def update_owner(self, spec: EntitySpec, entity_id: str, target_user_id: int, extra_fields: Optional[Dict[str, Any]] = None) -> Any:
         params = [("id", str(entity_id)), ("fields[ASSIGNED_BY_ID]", str(target_user_id))]
+        for field_name, value in (extra_fields or {}).items():
+            params.append((f"fields[{field_name}]", value))
         return self.call(spec.update_method, params)
 
     def get_entity(self, spec: EntitySpec, entity_id: Any) -> Dict[str, Any]:
@@ -288,7 +333,7 @@ def selected_entities(args: argparse.Namespace) -> List[str]:
         keys.append("companies")
     if parse_bool(args.include_contacts, default=True):
         keys.append("contacts")
-    if parse_bool(args.include_leads, default=True):
+    if parse_bool(args.include_leads, default=False):
         keys.append("leads")
     if parse_bool(args.include_deals, default=False):
         keys.append("deals")
@@ -301,7 +346,7 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         "entity_type", "entity_id", "entity_title", "source_user_id", "source_user_name",
         "target_user_id", "target_user_name", "action", "dry_run", "error",
         "filter_deal_stage_ids", "filter_lead_status_ids", "max_total", "company_id",
-        "contact_id", "category_id", "stage_id", "status_id", "closed", "selection_mode", "crm_url_hint",
+        "contact_id", "category_id", "stage_id", "target_stage_id", "failure_reason_field", "failure_reason_text", "failure_reason_id", "failure_reason_name", "failure_reason_value_written", "status_id", "closed", "selection_mode", "crm_url_hint",
     ]
     with path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -361,6 +406,10 @@ def base_log_row(
     max_total: int,
     portal_base_url: str,
     selection_mode: str,
+    target_stage_id: str = "",
+    failure_reason_field: str = "",
+    failure_reason_text: str = "",
+    failure_reason_id: str = "",
 ) -> Dict[str, Any]:
     entity_id = str(item.get("ID") or "")
     row = {
@@ -379,6 +428,12 @@ def base_log_row(
         "contact_id": item.get("CONTACT_ID", ""),
         "category_id": item.get("CATEGORY_ID", ""),
         "stage_id": item.get("STAGE_ID", ""),
+        "target_stage_id": target_stage_id,
+        "failure_reason_field": failure_reason_field,
+        "failure_reason_text": failure_reason_text,
+        "failure_reason_id": failure_reason_id,
+        "failure_reason_name": close_reason_name(failure_reason_id),
+        "failure_reason_value_written": failure_reason_id or failure_reason_text,
         "status_id": item.get("STATUS_ID", ""),
         "closed": item.get("CLOSED", ""),
         "crm_url_hint": crm_url_hint(key, entity_id, portal_base_url),
@@ -405,6 +460,10 @@ def update_or_log(
     selection_mode: str,
     rows_out: List[Dict[str, Any]],
     require_source_owner: bool = True,
+    target_stage_id: str = "",
+    failure_reason_field: str = "",
+    failure_reason_text: str = "",
+    failure_reason_id: str = "",
 ) -> Tuple[int, int]:
     """Return (updated_count, error_count)."""
     entity_id = str(item.get("ID") or "")
@@ -414,6 +473,10 @@ def update_or_log(
         target_user_id=target_user_id, target_user_name=target_user_name,
         dry_run=dry_run, deal_stage_ids=deal_stage_ids, lead_status_ids=lead_status_ids,
         max_total=max_total, portal_base_url=portal_base_url, selection_mode=selection_mode,
+        target_stage_id=target_stage_id if key == "deals" else "",
+        failure_reason_field=failure_reason_field if key == "deals" else "",
+        failure_reason_text=failure_reason_text if key == "deals" else "",
+        failure_reason_id=failure_reason_id if key == "deals" else "",
     )
     if not entity_id:
         rows_out.append({**base, "action": "skip_no_id", "error": "Entity ID is empty"})
@@ -429,7 +492,13 @@ def update_or_log(
         rows_out.append({**base, "action": "dry_run_update", "error": ""})
         return 0, 0
     try:
-        client.update_owner(spec, entity_id, target_user_id)
+        extra_fields: Dict[str, Any] = {}
+        if key == "deals" and target_stage_id:
+            extra_fields["STAGE_ID"] = target_stage_id
+        failure_reason_value = failure_reason_id or failure_reason_text
+        if key == "deals" and failure_reason_field and failure_reason_value:
+            extra_fields[failure_reason_field] = failure_reason_value
+        client.update_owner(spec, entity_id, target_user_id, extra_fields=extra_fields)
         rows_out.append({**base, "action": "updated", "error": ""})
         return 1, 0
     except Exception as exc:
@@ -453,6 +522,10 @@ def run_deal_package_mode(
     max_total: int,
     portal_base_url: str,
     rows_out: List[Dict[str, Any]],
+    target_stage_id: str = "",
+    failure_reason_field: str = "",
+    failure_reason_text: str = "",
+    failure_reason_id: str = "",
 ) -> Tuple[int, int, int, int]:
     """Deal-first reassignment.
 
@@ -497,6 +570,10 @@ def run_deal_package_mode(
             dry_run=dry_run, deal_stage_ids=deal_stage_ids, lead_status_ids=lead_status_ids,
             max_total=max_total, portal_base_url=portal_base_url, selection_mode=selection_mode,
             rows_out=rows_out, require_source_owner=True,
+            target_stage_id=target_stage_id,
+            failure_reason_field=failure_reason_field,
+            failure_reason_text=failure_reason_text,
+            failure_reason_id=failure_reason_id,
         )
         total_updated += upd
         total_errors += err
@@ -602,6 +679,16 @@ def run(args: argparse.Namespace) -> int:
     deal_stage_ids = parse_csv_values(args.deal_stage_ids)
     lead_status_ids = parse_csv_values(args.lead_status_ids)
     include_deals = parse_bool(args.include_deals, default=False)
+    target_stage_id = str(args.target_deal_stage_id or "").strip()
+    failure_reason_id = parse_close_reason_id(getattr(args, "failure_reason_id", ""))
+    failure_reason_field = str(args.failure_reason_field or "").strip()
+    failure_reason_text = str(args.failure_reason_text or "").strip()
+    if failure_reason_id and not failure_reason_field:
+        failure_reason_field = DEFAULT_FAILURE_REASON_FIELD
+    if failure_reason_text and not failure_reason_field:
+        raise ValueError("failure_reason_field is required when failure_reason_text is provided")
+    if failure_reason_id and failure_reason_text:
+        raise ValueError("Use either failure_reason_id or failure_reason_text, not both")
 
     portal_base_url = args.portal_base_url or os.getenv("BITRIX_PORTAL_URL", "")
     timeout = parse_int(os.getenv("REQUEST_TIMEOUT", "60"), "REQUEST_TIMEOUT", default=60) or 60
@@ -621,6 +708,10 @@ def run(args: argparse.Namespace) -> int:
             deal_stage_ids=deal_stage_ids, lead_status_ids=lead_status_ids,
             per_entity_limit=per_entity_limit, max_total=max_total,
             portal_base_url=portal_base_url, rows_out=rows_out,
+            target_stage_id=target_stage_id,
+            failure_reason_field=failure_reason_field,
+            failure_reason_text=failure_reason_text,
+            failure_reason_id=failure_reason_id,
         )
         selection_mode = "deal_package"
     else:
@@ -706,6 +797,11 @@ def run(args: argparse.Namespace) -> int:
     print(f"deal_stage_ids={','.join(deal_stage_ids) or 'all'}")
     print(f"lead_status_ids={','.join(lead_status_ids) or 'all'}")
     print(f"filter_company_contact_by_deal_stage={filter_company_contact_by_deal_stage}")
+    print(f"target_deal_stage_id={target_stage_id or 'keep_current'}")
+    print(f"failure_reason_field={failure_reason_field or 'not_set'}")
+    print(f"failure_reason_id={failure_reason_id or 'not_set'}")
+    print(f"failure_reason_name={close_reason_name(failure_reason_id) or 'not_set'}")
+    print(f"failure_reason_text_set={bool(failure_reason_text)}")
     print(f"limit_per_entity={per_entity_limit}")
     print(f"max_total={max_total}")
     if include_deals:
@@ -726,7 +822,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Do not write to Bitrix")
     parser.add_argument("--include-companies", default="true")
     parser.add_argument("--include-contacts", default="true")
-    parser.add_argument("--include-leads", default="true")
+    parser.add_argument("--include-leads", default="false")
     parser.add_argument("--include-deals", default="false")
     parser.add_argument("--include-closed-deals", default="false")
     parser.add_argument("--deal-category-id", default="all")
@@ -735,6 +831,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--filter-company-contact-by-deal-stage", default="false", help="For companies/contacts, update only if they have related source-user deal in selected deal stages")
     parser.add_argument("--limit", default="0", help="Max rows per entity type; 0 = no per-type limit")
     parser.add_argument("--max-total", default="0", help="Max total rows to update across all selected entity types; 0 = unlimited")
+    parser.add_argument("--target-deal-stage-id", default="", help="Optional target STAGE_ID for selected deals. Empty = keep current stage")
+    parser.add_argument("--failure-reason-field", default="", help=f"Optional deal field for failure reason. Defaults to {DEFAULT_FAILURE_REASON_FIELD} when --failure-reason-id is used")
+    parser.add_argument("--failure-reason-id", default="", help="Optional CloseReasonID enum value for selected deals")
+    parser.add_argument("--failure-reason-text", default="", help="Optional raw value to write into failure_reason_field for selected deals")
     parser.add_argument("--portal-base-url", default="https://b24-izmquv.bitrix24.kz")
     parser.add_argument("--out", default="exports/reassign_crm_owner_log.csv")
     return parser
