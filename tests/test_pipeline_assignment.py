@@ -434,3 +434,35 @@ def test_failed_deal_inheritance_matches_prefixed_failed_stage_id_without_semant
     assert inheritance.stage_id == "LOSE"
     assert inheritance.source_stage_id == "C2:LOSE"
     assert inheritance.source_deal_id == "102"
+
+
+def test_default_assignment_load_counts_every_non_closed_deal():
+    deals = [
+        {"ID": "1", "ASSIGNED_BY_ID": "70", "STAGE_ID": "NEW", "CLOSED": "N"},
+        {"ID": "2", "ASSIGNED_BY_ID": "70", "STAGE_ID": "C2:EXECUTING", "CLOSED": "N"},
+        {"ID": "3", "ASSIGNED_BY_ID": "70", "STAGE_ID": "PREPARATION", "CLOSED": "N"},
+        {"ID": "4", "ASSIGNED_BY_ID": "70", "STAGE_ID": "LOSE", "CLOSED": "Y"},
+    ]
+    pipe = BitrixPipeline(
+        client=FakeClientWithDeals(deals=deals),  # type: ignore[arg-type]
+        config=BitrixPipelineConfig(assigned_by_id="36"),
+    )
+
+    assert pipe._manager_load(70) == 3
+
+
+def test_lowest_loaded_owner_is_deterministic_and_prefers_real_minimum():
+    deals = []
+    for user_id in ALLOWED_USER_IDS:
+        if user_id == 116:
+            continue
+        deals.append({"ID": str(user_id), "ASSIGNED_BY_ID": str(user_id), "STAGE_ID": "NEW", "CLOSED": "N"})
+    pipe = BitrixPipeline(
+        client=FakeClientWithDeals(deals=deals),  # type: ignore[arg-type]
+        config=BitrixPipelineConfig(assigned_by_id="36", assignment_limit_per_manager=30),
+    )
+
+    target, reason = pipe._lowest_loaded_owner_from_current_load()
+
+    assert target == 116
+    assert reason == "lowest_active_deal_load_new_director"

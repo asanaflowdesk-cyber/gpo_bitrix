@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Iterable
-import random
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -510,19 +509,29 @@ class BitrixPipeline:
     def _effective_manager_load(self, user_id: int) -> int:
         return self._manager_load(user_id) + int(self._projected_load_delta.get(user_id, 0))
 
-    def _random_owner_from_current_load(self) -> tuple[int | None, str | None]:
+    def _lowest_loaded_owner_from_current_load(self) -> tuple[int | None, str | None]:
+        """Choose the least-loaded active manager deterministically.
+
+        The previous implementation used random.choice among minimum-load
+        candidates. That made dry-run logs noisy and could keep a low-load
+        manager from being filled predictably when many packages were processed.
+        This function is deliberately boring: lowest effective active-deal load
+        wins; user ID is only a stable tie-breaker.
+        """
         if not ALLOWED_USER_IDS:
             return None, None
         load = {user_id: self._effective_manager_load(user_id) for user_id in ALLOWED_USER_IDS}
         limit = max(0, int(self.config.assignment_limit_per_manager or 0))
         candidates = [user_id for user_id, current in load.items() if not limit or current < limit]
         if not candidates:
-            min_load = min(load.values())
-            candidates = [user_id for user_id, current in load.items() if current == min_load]
-            return random.choice(candidates), "lowest_active_deal_load_limit_expanded"
-        min_load = min(load[user_id] for user_id in candidates)
-        candidates = [user_id for user_id in candidates if load[user_id] == min_load]
-        return random.choice(candidates), "lowest_active_deal_load_new_director"
+            target = min(ALLOWED_USER_IDS, key=lambda user_id: (load.get(user_id, 0), user_id))
+            return target, "lowest_active_deal_load_limit_expanded"
+        target = min(candidates, key=lambda user_id: (load.get(user_id, 0), user_id))
+        return target, "lowest_active_deal_load_new_director"
+
+    # Backward-compatible alias for older tests/scripts.
+    def _random_owner_from_current_load(self) -> tuple[int | None, str | None]:
+        return self._lowest_loaded_owner_from_current_load()
 
     def _resolve_target_responsible(
         self,
@@ -573,7 +582,7 @@ class BitrixPipeline:
 
         # Fully new director/BIN: choose by the lowest e-Qazyna deal load in the configured limit stages.
         # The limit is soft: if everyone is at/above it, choose the lowest load.
-        owner_id, reason = self._random_owner_from_current_load()
+        owner_id, reason = self._lowest_loaded_owner_from_current_load()
         self._remember_assignment(app.bin, director, owner_id, reason)
         return owner_id, reason
 

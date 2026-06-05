@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--active-deal-load-stage-ids",
         default=DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS,
-        help="Comma-separated STAGE_ID values that consume the active-deal limit. Default: NEW,EXECUTING.",
+        help="Comma-separated STAGE_ID values that consume the active-deal limit. Default: ALL = every non-closed deal.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Optional seed for tie-breaks")
     return parser.parse_args()
@@ -430,10 +430,10 @@ def choose_lowest_load(
         if client_load.get(user_id, 0) == min_clients
     ]
 
-    target = random.choice(sorted(client_candidates))
+    target = sorted(client_candidates)[0]
     debug.update(
         {
-            "selected_by": "below_soft_limit_or_lowest_active_deal_load_then_lowest_client_load_then_random",
+            "selected_by": "below_soft_limit_or_lowest_active_deal_load_then_lowest_client_load_then_stable_id",
             "selected_user_id": target,
             "selected_user_name": user_name(target),
             "selected_active_deal_load": active_deal_load.get(target, 0),

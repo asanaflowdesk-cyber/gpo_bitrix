@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lead-status-id", default=os.getenv("BITRIX_LEAD_STATUS_ID", "NEW"))
     parser.add_argument("--assigned-by-id", default=os.getenv("BITRIX_ASSIGNED_BY_ID") or None)
     parser.add_argument("--assignment-limit-per-manager", type=int, default=int(os.getenv("BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER", "30")), help="Soft deal limit for brand-new director packages. Historical director packages ignore the limit.")
-    parser.add_argument("--assignment-load-stage-ids", default=os.getenv("BITRIX_ASSIGNMENT_LOAD_STAGE_IDS", "NEW,EXECUTING"), help="Comma-separated STAGE_ID values that consume the assignment limit. Default: NEW,EXECUTING. Other stages do not count.")
+    parser.add_argument("--assignment-load-stage-ids", default=os.getenv("BITRIX_ASSIGNMENT_LOAD_STAGE_IDS", "ALL"), help="Comma-separated STAGE_ID values that consume the assignment limit. Default: ALL = every non-closed deal. Use NEW,EXECUTING only if you intentionally want to count just those stages.")
     parser.add_argument("--inherit-failed-deals-by-director", default=os.getenv("BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR", "true"), help="true = new deals inherit failed final stage/reason from old deals for the same director")
     parser.add_argument("--failed-deal-stage-ids", default=os.getenv("BITRIX_FAILED_DEAL_STAGE_IDS", "LOSE"), help="Comma-separated failed deal STAGE_ID values. STAGE_SEMANTIC_ID=F is also treated as failed when returned by Bitrix.")
     parser.add_argument("--failed-deal-reason-fields", default=os.getenv("BITRIX_FAILED_DEAL_REASON_FIELDS", "UF_CRM_1779448756033"), help="Comma-separated deal fields to copy/read as failure reason")

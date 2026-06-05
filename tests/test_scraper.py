@@ -14,3 +14,35 @@ def test_parse_text_fallback():
     assert first.bin == "260140012851"
     assert first.doc_type == "Заявка на разведку ТПИ"
     assert first.status == "Отправлено на рассмотрение"
+
+from eqazyna_bitrix.scraper import EqazynaScraper
+
+
+class FakeScraperNoFallback(EqazynaScraper):
+    def __init__(self):
+        super().__init__(polite_delay_seconds=0)
+        self.calls = []
+
+    def fetch_page(self, page, doc_type, statuses):
+        self.calls.append((page, doc_type, tuple(sorted(statuses or []))))
+        if doc_type is None:
+            html = """
+            <table><tr><td>01.06.2026 10:00:00</td><td>1-NEA</td><td>123456789012</td><td>Test LLP</td><td>Заявка на разведку ТПИ</td><td>Принято</td></tr></table>
+            """
+            return html, "https://example.test/unfiltered"
+        return "<html><body>empty filtered page</body></html>", "https://example.test/filtered"
+
+
+def test_scraper_does_not_use_unfiltered_fallback_when_filters_active():
+    scraper = FakeScraperNoFallback()
+
+    rows = scraper.scrape(
+        pages=1,
+        doc_type="Заявка на разведку ТПИ",
+        statuses=["Принято"],
+        stop_on_empty_page=True,
+    )
+
+    assert rows == []
+    assert all(call[1] is not None for call in scraper.calls)
+    assert len(scraper.calls) == 1

@@ -3,15 +3,15 @@ from __future__ import annotations
 from typing import Any
 
 
-DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS = "NEW,EXECUTING"
+DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS = "ALL"
 
 
 def parse_stage_ids(raw: Any) -> set[str]:
     """Parse comma-separated Bitrix STAGE_ID values for assignment-load counting.
 
-    The 30-deal capacity is stage-based: by default only New + In work
-    consume manager capacity. Approval, document collection, failed and closed
-    deals are outside the limit unless explicitly added to the setting.
+    The 30-deal capacity is stage-based. By default ALL counts every
+    non-closed deal. Use concrete STAGE_ID values when the limit must be
+    narrower than all active work.
     """
     if raw is None:
         raw = DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS
@@ -50,9 +50,17 @@ def is_closed_deal_record(deal: dict[str, Any]) -> bool:
 def is_assignment_load_deal(deal: dict[str, Any], allowed_stage_ids: set[str]) -> bool:
     """Return True when a deal consumes manager capacity.
 
-    Business rule: the limit counts only stages configured as New + In work.
-    Other open stages are ignored for capacity.
+    By default the assignment load counts every non-closed e-Qazyna deal.
+    This matches the operational meaning of "active applications": New, In work,
+    agreement, document collection and any other non-final stage all consume a
+    manager's attention.
+
+    If a narrower limit is needed, pass concrete STAGE_ID values such as
+    NEW,EXECUTING. Values ALL, OPEN or * mean every non-closed deal.
     """
     if is_closed_deal_record(deal):
         return False
+    normalized = {str(value or "").strip().upper() for value in allowed_stage_ids}
+    if not normalized or normalized.intersection({"ALL", "OPEN", "*"}):
+        return True
     return stage_id_matches(deal.get("STAGE_ID"), allowed_stage_ids)

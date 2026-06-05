@@ -70,7 +70,8 @@ def parse_args() -> argparse.Namespace:
         default=30,
         help=(
             "Soft limit of e-Qazyna deals per manager in the configured load stages. "
-            "Random/new packages are assigned only to managers below this limit before assignment. "
+            "By default ALL counts every non-closed e-Qazyna deal. "
+            "New packages are assigned only to managers below this limit before assignment. "
             "0 = ignore the deal limit. If everyone is above the limit, the lowest-load manager is still selected."
         ),
     )
@@ -79,7 +80,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS,
         help=(
             "Comma-separated STAGE_ID values that consume the active-deal limit. "
-            "Default: NEW,EXECUTING. Other stages are ignored for the limit."
+            "Default: ALL = every non-closed deal. Use NEW,EXECUTING only for a narrower limit."
         ),
     )
     parser.add_argument(
@@ -455,7 +456,7 @@ def _choose_random_available(
         if client_load.get(user_id, 0) == min_clients
     ]
 
-    target_user_id = random.choice(sorted(client_candidates))
+    target_user_id = sorted(client_candidates)[0]
 
     company_inbound = sum(
         1
@@ -479,7 +480,7 @@ def _choose_random_available(
     return target_user_id, bool(soft_limit_expanded), {
         "eligible_manager_ids": sorted(eligible),
         "blocked_managers": blocked_debug,
-        "selected_by": "below_soft_limit_or_lowest_active_deal_load_then_lowest_client_load_then_random",
+        "selected_by": "below_soft_limit_or_lowest_active_deal_load_then_lowest_client_load_then_stable_id",
         "client_load_before": client_load.get(target_user_id, 0),
         "client_load_after": client_after,
         "active_deal_load_before": active_deal_load.get(target_user_id, 0),

@@ -253,28 +253,10 @@ class EqazynaScraper:
             consecutive_failed_pages = 0
             rows = parse_applications(html, url, doc_types=[doc_type] if doc_type else None)
 
-            # e-Qazyna sometimes returns an apparently empty filtered page while
-            # the unfiltered registry page still contains the rows. In that case
-            # fetch the same page without URL filters and apply our local filters
-            # below. This keeps new applications from being missed because of a
-            # fragile site-side filter.
-            if not rows and (doc_type or wanted_statuses):
-                try:
-                    fallback_html, fallback_url = self.fetch_page(page, None, [])
-                    fallback_rows = parse_applications(
-                        fallback_html,
-                        fallback_url,
-                        doc_types=[doc_type] if doc_type else None,
-                    )
-                    if fallback_rows:
-                        print(
-                            f"    page {page}: filtered page had no rows; "
-                            f"using unfiltered fallback rows={len(fallback_rows)}"
-                        )
-                        rows = fallback_rows
-                        url = f"{url} | fallback_unfiltered={fallback_url}"
-                except Exception as exc:  # noqa: BLE001 - keep main scrape alive
-                    print(f"    WARN: page {page} unfiltered fallback failed: {exc}")
+            # Important: do not fetch the unfiltered registry when filters are active.
+            # It can mix rows from another part of the e-Qazyna list into the current
+            # run. The local filters below are still kept as a second safety layer,
+            # but the source page itself must remain filtered.
 
             if not rows:
                 text_preview = clean_text(make_soup(html).get_text(" "))[:500]
