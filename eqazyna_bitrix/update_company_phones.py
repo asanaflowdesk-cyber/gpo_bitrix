@@ -13,10 +13,28 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
+import requests
+
 from .bitrix_client import BitrixClient, BitrixError
 
 MARKER_PREFIX = "AUTO_PHONE_IMPORT_BIN:"
+DIRECTOR_MARKER_PREFIX = "AUTO_DIRECTOR_CONTACT_PHONE_IMPORT_BIN:"
 DEFAULT_COMMENT_SOURCE = "файл BIN/MOBILE"
+
+MAX_RETRIES = 6
+RETRY_SLEEP_SECONDS = 3
+
+DIRECTOR_POST_KEYWORDS = (
+    "директор",
+    "руковод",
+    "генераль",
+    "исполнительн",
+    "председатель",
+    "owner",
+    "ceo",
+    "director",
+    "head",
+)
 
 
 @dataclass(slots=True)
@@ -38,8 +56,67 @@ class PhoneUpdateResult:
     existing_phones: str
     new_phones: str
     marker_present: bool
+    contact_ids: str
+    contact_names: str
+    contact_comment_action: str
     action: str
     error: str | None = None
+
+
+class DirectBitrixRest:
+    """Минимальный REST-клиент для методов, которых может не быть в bitrix_client.py."""
+
+    def __init__(self, webhook_url: str, timeout: int = 60):
+        if not webhook_url:
+            raise ValueError("BITRIX_WEBHOOK_URL is empty")
+        self.webhook_url = webhook_url.rstrip("/") + "/"
+        self.timeout = timeout
+
+    def call(self, method: str, payload: dict[str, Any] | None = None) -> Any:
+        payload = payload or {}
+        url = self.webhook_url + method + ".json"
+        last_error: Any = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = requests.post(
+                    url,
+                    json=payload,
+                    timeout=self.timeout,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                )
+                try:
+                    data = response.json()
+                except Exception as exc:  # noqa: BLE001
+                    raise BitrixError(
+                        f"Bitrix returned non-JSON response in {method}. "
+                        f"HTTP {response.status_code}. Text: {response.text[:500]}"
+                    ) from exc
+
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    last_error = data
+                    time.sleep(RETRY_SLEEP_SECONDS * attempt)
+                    continue
+
+                if isinstance(data, dict) and data.get("error"):
+                    error = str(data.get("error"))
+                    description = str(data.get("error_description", ""))
+                    if error in {"QUERY_LIMIT_EXCEEDED", "OPERATION_TIME_LIMIT", "OVERLOAD_LIMIT"}:
+                        last_error = data
+                        time.sleep(RETRY_SLEEP_SECONDS * attempt)
+                        continue
+                    raise BitrixError(f"Bitrix API error in {method}: {error} — {description}")
+
+                return data.get("result") if isinstance(data, dict) else data
+
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                time.sleep(RETRY_SLEEP_SECONDS * attempt)
+
+        raise BitrixError(f"Bitrix API failed after {MAX_RETRIES} attempts. Method: {method}. Last error: {last_error}")
 
 
 def normalize_bin(value: Any) -> str:
@@ -125,7 +202,6 @@ def _read_xlsx_first_sheet(path: Path) -> list[dict[str, str]]:
 
         rows: list[list[str]] = []
         for row in sheet.iter(f"{ns_main}row"):
-            values: list[str] = []
             max_col = -1
             cells: dict[int, str] = {}
             for c in row.findall(f"{ns_main}c"):
@@ -147,8 +223,7 @@ def _read_xlsx_first_sheet(path: Path) -> list[dict[str, str]]:
                     value = value_node.text or ""
                 cells[col_idx] = value
             if max_col >= 0:
-                values = [cells.get(i, "") for i in range(max_col + 1)]
-                rows.append(values)
+                rows.append([cells.get(i, "") for i in range(max_col + 1)])
 
     if not rows:
         return []
@@ -209,9 +284,16 @@ def load_phone_rows(path: Path) -> list[PhoneImportRow]:
         if not bin_number:
             continue
         if bin_number not in grouped:
-            grouped[bin_number] = PhoneImportRow(bin=bin_number, raw_bin=str(raw_bin), raw_mobile=str(raw_mobile), normalized_phones=[])
+            grouped[bin_number] = PhoneImportRow(
+                bin=bin_number,
+                raw_bin=str(raw_bin),
+                raw_mobile=str(raw_mobile),
+                normalized_phones=[],
+            )
         else:
-            grouped[bin_number].raw_mobile = ", ".join(x for x in [grouped[bin_number].raw_mobile, str(raw_mobile)] if x)
+            grouped[bin_number].raw_mobile = ", ".join(
+                x for x in [grouped[bin_number].raw_mobile, str(raw_mobile)] if x
+            )
         seen = set(grouped[bin_number].normalized_phones)
         for phone in phones:
             if phone not in seen:
@@ -264,20 +346,252 @@ def build_comment(old_comment: str, row: PhoneImportRow, phones_to_add: list[str
         f"Дата: {date_str}\n"
         f"БИН: {row.bin}\n"
         f"Телефоны из файла: {', '.join(row.normalized_phones) or '-'}\n"
-        f"Добавлены в карточку: {', '.join(phones_to_add) or 'нет новых номеров'}\n"
+        f"Добавлены в карточку компании: {', '.join(phones_to_add) or 'нет новых номеров'}\n"
         f"{marker}"
     )
     return (old_comment or "").rstrip() + block
 
 
+def contact_display_name(contact: dict[str, Any]) -> str:
+    parts = [
+        str(contact.get("LAST_NAME") or "").strip(),
+        str(contact.get("NAME") or "").strip(),
+        str(contact.get("SECOND_NAME") or "").strip(),
+    ]
+    fio = " ".join(x for x in parts if x).strip()
+    return fio or str(contact.get("ID") or "").strip()
+
+
+def get_contact_ids_from_company_payload(company: dict[str, Any]) -> list[str]:
+    """Фолбэк: если find_company_by_requisite_bin уже вернул CONTACT_ID/CONTACT_IDS."""
+    result: list[str] = []
+    for key in ("CONTACT_ID", "CONTACT_IDS", "CONTACTS"):
+        value = company.get(key)
+        if not value:
+            continue
+        if isinstance(value, (str, int)):
+            result.append(str(value))
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, (str, int)):
+                    result.append(str(item))
+                elif isinstance(item, dict):
+                    contact_id = item.get("CONTACT_ID") or item.get("ID") or item.get("contactId")
+                    if contact_id:
+                        result.append(str(contact_id))
+    return unique_values(result)
+
+
+def unique_values(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        value = str(value).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def get_company_contact_ids(rest: DirectBitrixRest, company: dict[str, Any], company_id: str) -> list[str]:
+    contact_ids = get_contact_ids_from_company_payload(company)
+
+    try:
+        linked = rest.call("crm.company.contact.items.get", {"id": int(company_id)})
+    except BitrixError:
+        linked = []
+
+    if isinstance(linked, list):
+        for item in linked:
+            if isinstance(item, dict):
+                contact_id = item.get("CONTACT_ID") or item.get("ID") or item.get("contactId")
+                if contact_id:
+                    contact_ids.append(str(contact_id))
+            elif isinstance(item, (str, int)):
+                contact_ids.append(str(item))
+
+    return unique_values(contact_ids)
+
+
+def is_director_like_contact(contact: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(contact.get(key) or "")
+        for key in ("POST", "TYPE_ID", "COMMENTS")
+    ).lower()
+    return any(keyword in text for keyword in DIRECTOR_POST_KEYWORDS)
+
+
+def select_contacts_for_comment(
+    contacts: list[dict[str, Any]],
+    *,
+    strict_director_match: bool,
+) -> tuple[list[dict[str, Any]], str]:
+    if not contacts:
+        return [], "no_linked_contact"
+
+    if len(contacts) == 1:
+        return contacts, "single_linked_contact"
+
+    director_like = [contact for contact in contacts if is_director_like_contact(contact)]
+    if director_like:
+        return director_like, "director_like_contact"
+
+    if strict_director_match:
+        return [], "multiple_contacts_unclear"
+
+    # Практичный режим по умолчанию: если контактов несколько и должность не заполнена,
+    # пишем во все привязанные контакты. Иначе Excel опять "доехал, но не туда".
+    return contacts, "all_linked_contacts_no_director_flag"
+
+
+def director_marker_begin(row: PhoneImportRow) -> str:
+    return f"[{DIRECTOR_MARKER_PREFIX}{row.bin}_BEGIN]"
+
+
+def director_marker_end(row: PhoneImportRow) -> str:
+    return f"[{DIRECTOR_MARKER_PREFIX}{row.bin}_END]"
+
+
+def build_director_contact_block(
+    row: PhoneImportRow,
+    *,
+    company_id: str,
+    company_title: str,
+    source_label: str,
+) -> str:
+    date_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        f"{director_marker_begin(row)}\n"
+        "[Дополнительные контакты из Excel]\n"
+        f"Источник: {source_label}\n"
+        f"Дата: {date_str}\n"
+        f"Компания: {company_title or '-'}\n"
+        f"ID компании: {company_id or '-'}\n"
+        f"БИН: {row.bin}\n"
+        f"Исходное значение MOBILE: {row.raw_mobile or '-'}\n"
+        f"Нормализованные телефоны: {', '.join(row.normalized_phones) or '-'}\n"
+        f"{director_marker_end(row)}"
+    )
+
+
+def upsert_director_comment(old_comment: str, row: PhoneImportRow, new_block: str) -> tuple[str, bool]:
+    old_comment = old_comment or ""
+    begin = re.escape(director_marker_begin(row))
+    end = re.escape(director_marker_end(row))
+    pattern = re.compile(begin + r".*?" + end, flags=re.DOTALL)
+    marker_present = bool(pattern.search(old_comment))
+
+    if marker_present:
+        return pattern.sub(new_block, old_comment).strip(), True
+
+    if old_comment.strip():
+        return old_comment.rstrip() + "\n\n" + new_block, False
+
+    return new_block, False
+
+
+def update_director_contact_comments(
+    rest: DirectBitrixRest,
+    *,
+    company: dict[str, Any],
+    company_id: str,
+    company_title: str,
+    row: PhoneImportRow,
+    source_label: str,
+    dry_run: bool,
+    force: bool,
+    strict_director_match: bool,
+) -> tuple[str, str, str, str | None]:
+    """
+    Пишет доп. контакты из Excel в COMMENTS контакта-руководителя.
+
+    Логика:
+    1. Берём привязанные к компании контакты.
+    2. Если контакт один — обновляем его.
+    3. Если контактов несколько — сначала ищем по должности директор/руководитель.
+    4. Если должность не заполнена и strict_director_match=False — обновляем все привязанные контакты.
+    """
+    try:
+        contact_ids = get_company_contact_ids(rest, company, company_id)
+        if not contact_ids:
+            return "", "", "no_linked_contact", None
+
+        contacts: list[dict[str, Any]] = []
+        for contact_id in contact_ids:
+            contact = rest.call("crm.contact.get", {"id": int(contact_id)})
+            if isinstance(contact, dict) and contact:
+                contacts.append(contact)
+
+        selected_contacts, select_action = select_contacts_for_comment(
+            contacts,
+            strict_director_match=strict_director_match,
+        )
+        if not selected_contacts:
+            names = "; ".join(contact_display_name(c) for c in contacts)
+            return ", ".join(contact_ids), names, select_action, None
+
+        updated_ids: list[str] = []
+        updated_names: list[str] = []
+        skipped_ids: list[str] = []
+
+        for contact in selected_contacts:
+            contact_id = str(contact.get("ID") or "").strip()
+            if not contact_id:
+                continue
+
+            old_comment = str(contact.get("COMMENTS") or "")
+            new_block = build_director_contact_block(
+                row,
+                company_id=company_id,
+                company_title=company_title,
+                source_label=source_label,
+            )
+            new_comment, marker_present = upsert_director_comment(old_comment, row, new_block)
+
+            if marker_present and not force:
+                skipped_ids.append(contact_id)
+                continue
+
+            if not dry_run:
+                rest.call(
+                    "crm.contact.update",
+                    {
+                        "id": int(contact_id),
+                        "fields": {
+                            "COMMENTS": new_comment,
+                        },
+                    },
+                )
+
+            updated_ids.append(contact_id)
+            updated_names.append(contact_display_name(contact))
+
+        if updated_ids:
+            action_prefix = "dry_run_contact_comment" if dry_run else "contact_comment_updated"
+            return ", ".join(updated_ids), "; ".join(updated_names), f"{action_prefix}:{select_action}", None
+
+        if skipped_ids:
+            names = "; ".join(contact_display_name(c) for c in selected_contacts)
+            return ", ".join(skipped_ids), names, "contact_comment_skipped_already_processed", None
+
+        return ", ".join(contact_ids), "", "contact_comment_no_target", None
+
+    except BitrixError as exc:
+        return "", "", "contact_comment_error", str(exc)
+
+
 def process_rows(
     client: BitrixClient,
+    rest: DirectBitrixRest,
     rows: list[PhoneImportRow],
     *,
     bin_field: str,
     dry_run: bool,
     force: bool,
     source_label: str,
+    skip_director_comments: bool,
+    strict_director_match: bool,
 ) -> list[PhoneUpdateResult]:
     results: list[PhoneUpdateResult] = []
     for row in rows:
@@ -293,6 +607,9 @@ def process_rows(
                     existing_phones="",
                     new_phones="",
                     marker_present=False,
+                    contact_ids="",
+                    contact_names="",
+                    contact_comment_action="not_processed",
                     action="invalid_bin",
                     error="BIN must contain 12 digits after normalization",
                 )
@@ -310,6 +627,9 @@ def process_rows(
                     existing_phones="",
                     new_phones="",
                     marker_present=False,
+                    contact_ids="",
+                    contact_names="",
+                    contact_comment_action="not_processed",
                     action="no_valid_phone",
                     error="No valid phones found in MOBILE column",
                 )
@@ -329,6 +649,9 @@ def process_rows(
                         existing_phones="",
                         new_phones="",
                         marker_present=False,
+                        contact_ids="",
+                        contact_names="",
+                        contact_comment_action="not_processed",
                         action="company_not_found",
                     )
                 )
@@ -343,33 +666,41 @@ def process_rows(
             existing_set = set(existing)
             phones_to_add = [p for p in row.normalized_phones if p not in existing_set]
 
+            company_action = "skipped_already_processed"
+            company_error: str | None = None
+
             if marker_present and not force:
-                results.append(
-                    PhoneUpdateResult(
-                        bin=row.bin,
-                        raw_bin=row.raw_bin,
-                        company_id=company_id,
-                        company_title=title,
-                        input_mobile=row.raw_mobile,
-                        normalized_phones=", ".join(row.normalized_phones),
-                        existing_phones=", ".join(existing),
-                        new_phones=", ".join(phones_to_add),
-                        marker_present=True,
-                        action="skipped_already_processed",
-                    )
+                company_action = "skipped_already_processed"
+            else:
+                fields: dict[str, Any] = {
+                    "COMMENTS": build_comment(comments, row, phones_to_add, source_label),
+                }
+                if phones_to_add:
+                    fields["PHONE"] = build_phone_payload(company, phones_to_add)
+
+                company_action = "dry_run_update" if dry_run else "updated"
+                if not dry_run:
+                    client.update_company(company_id, fields)
+
+            contact_ids = ""
+            contact_names = ""
+            contact_comment_action = "skipped_by_arg"
+            contact_error: str | None = None
+
+            if not skip_director_comments:
+                contact_ids, contact_names, contact_comment_action, contact_error = update_director_contact_comments(
+                    rest,
+                    company=company,
+                    company_id=company_id,
+                    company_title=title,
+                    row=row,
+                    source_label=source_label,
+                    dry_run=dry_run,
+                    force=force,
+                    strict_director_match=strict_director_match,
                 )
-                continue
 
-            fields: dict[str, Any] = {
-                "COMMENTS": build_comment(comments, row, phones_to_add, source_label),
-            }
-            if phones_to_add:
-                fields["PHONE"] = build_phone_payload(company, phones_to_add)
-
-            action = "dry_run_update" if dry_run else "updated"
-            if not dry_run:
-                client.update_company(company_id, fields)
-
+            error_parts = [x for x in [company_error, contact_error] if x]
             results.append(
                 PhoneUpdateResult(
                     bin=row.bin,
@@ -381,7 +712,11 @@ def process_rows(
                     existing_phones=", ".join(existing),
                     new_phones=", ".join(phones_to_add),
                     marker_present=marker_present,
-                    action=action,
+                    contact_ids=contact_ids,
+                    contact_names=contact_names,
+                    contact_comment_action=contact_comment_action,
+                    action=company_action,
+                    error=" | ".join(error_parts) if error_parts else None,
                 )
             )
         except BitrixError as exc:
@@ -396,6 +731,9 @@ def process_rows(
                     existing_phones="",
                     new_phones="",
                     marker_present=False,
+                    contact_ids="",
+                    contact_names="",
+                    contact_comment_action="not_processed",
                     action="error",
                     error=str(exc),
                 )
@@ -422,9 +760,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Update Bitrix company phones by BIN from XLSX/CSV file")
     parser.add_argument("--file", required=True, help="Path to .xlsx/.csv file with BIN and MOBILE columns")
     parser.add_argument("--dry-run", action="store_true", help="Do not write to Bitrix")
-    parser.add_argument("--force", action="store_true", help="Update even if AUTO_PHONE_IMPORT_BIN marker already exists")
+    parser.add_argument("--force", action="store_true", help="Update even if import markers already exist")
     parser.add_argument("--bin-field", default=os.getenv("BITRIX_REQUISITE_BIN_FIELD", "RQ_BIN"))
     parser.add_argument("--source-label", default=DEFAULT_COMMENT_SOURCE)
+    parser.add_argument("--skip-director-comments", action="store_true", help="Do not write Excel contacts to linked director/contact COMMENTS")
+    parser.add_argument(
+        "--strict-director-match",
+        action="store_true",
+        help="If company has multiple contacts, update only contacts whose POST looks like director/head. Default: update all linked contacts when director is unclear.",
+    )
     parser.add_argument("--out", default="exports/update_company_phones_log.json")
     parser.add_argument("--csv-out", default="exports/update_company_phones_log.csv")
     args = parser.parse_args(argv)
@@ -434,26 +778,48 @@ def main(argv: list[str] | None = None) -> int:
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
     webhook_url = os.getenv("BITRIX_WEBHOOK_URL", "")
+    if not webhook_url:
+        raise RuntimeError("BITRIX_WEBHOOK_URL is empty")
+
     timeout = int(os.getenv("REQUEST_TIMEOUT", "60"))
     client = BitrixClient(webhook_url=webhook_url, timeout=timeout)
+    rest = DirectBitrixRest(webhook_url=webhook_url, timeout=timeout)
 
     rows = load_phone_rows(input_path)
     results = process_rows(
         client,
+        rest,
         rows,
         bin_field=args.bin_field,
         dry_run=args.dry_run,
         force=args.force,
         source_label=args.source_label,
+        skip_director_comments=args.skip_director_comments,
+        strict_director_match=args.strict_director_match,
     )
     write_json(Path(args.out), results)
     write_csv(Path(args.csv_out), results)
 
     counts: dict[str, int] = {}
+    contact_counts: dict[str, int] = {}
     for result in results:
         counts[result.action] = counts.get(result.action, 0) + 1
+        contact_counts[result.contact_comment_action] = contact_counts.get(result.contact_comment_action, 0) + 1
+
     print("PHONE_IMPORT_SUMMARY")
-    print(json.dumps({"total_bins": len(results), "dry_run": args.dry_run, "force": args.force, "counts": counts}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "total_bins": len(results),
+                "dry_run": args.dry_run,
+                "force": args.force,
+                "counts": counts,
+                "contact_comment_counts": contact_counts,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
