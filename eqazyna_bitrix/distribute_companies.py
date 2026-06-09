@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
         default=30,
         help=(
             "Soft limit of e-Qazyna deals per manager in the configured load stages. "
-            "By default ALL counts every non-closed e-Qazyna deal. "
+            "Default: NEW,EXECUTING = Новая + В работе. "
             "New packages are assigned only to managers below this limit before assignment. "
             "0 = ignore the deal limit. If everyone is above the limit, the lowest-load manager is still selected."
         ),
@@ -80,7 +80,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS,
         help=(
             "Comma-separated STAGE_ID values that consume the active-deal limit. "
-            "Default: ALL = every non-closed deal. Use NEW,EXECUTING only for a narrower limit."
+            "Default: NEW,EXECUTING = Новая + В работе."
         ),
     )
     parser.add_argument(
@@ -634,14 +634,6 @@ def _choose_historical_owner_for_group(
     if eligible_deals:
         deal = min(eligible_deals, key=_historical_sort_key)
         return _deal_owner_id(deal), "historical_first_deal_owner"
-
-    eligible_companies = [
-        company for company in group_companies
-        if _company_owner_id(company) in ALLOWED_USER_IDS and _company_owner_id(company) not in source_responsible_ids
-    ]
-    if eligible_companies:
-        company = min(eligible_companies, key=_historical_sort_key)
-        return _company_owner_id(company), "historical_first_company_owner"
 
     return None, None
 

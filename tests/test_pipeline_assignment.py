@@ -30,12 +30,12 @@ def _app(bin_value="123456789012") -> Application:
     )
 
 
-def test_existing_company_owner_has_priority_over_source_fallback():
+def test_existing_company_owner_does_not_seed_new_director_package():
     pipe = _pipe("36")
     target, reason = pipe._resolve_target_responsible(_app(), CompanyEnrichment(bin="123456789012"), {"ASSIGNED_BY_ID": "70"})
 
-    assert target == 70
-    assert reason == "existing_company_owner_seeds_new_director_package"
+    assert target in set(ALLOWED_USER_IDS)
+    assert reason in {"lowest_active_deal_load_new_director", "lowest_active_deal_load_limit_expanded"}
 
 
 def test_source_owner_is_not_used_as_fallback_for_new_package():
@@ -54,19 +54,31 @@ def test_new_director_package_uses_load_balancing_for_any_bin():
     assert reason in {"lowest_active_deal_load_new_director", "lowest_active_deal_load_limit_expanded"}
 
 
-def test_director_package_owner_is_reused_for_new_bin():
+def test_deal_history_owner_is_reused_for_new_bin():
     companies = [
         {
             "ID": "1",
-            "ASSIGNED_BY_ID": "74",
+            "ASSIGNED_BY_ID": "92",
             "COMMENTS": "Руководитель: ИВАНОВ ИВАН ИВАНОВИЧ",
         }
     ]
-    pipe = _pipe("36", companies=companies)
+    deals = [
+        {
+            "ID": "10",
+            "DATE_CREATE": "2026-01-02T00:00:00+00:00",
+            "COMPANY_ID": "1",
+            "ASSIGNED_BY_ID": "74",
+            "COMMENTS": "",
+        }
+    ]
+    pipe = BitrixPipeline(
+        client=FakeClientWithDeals(companies, deals),  # type: ignore[arg-type]
+        config=BitrixPipelineConfig(assigned_by_id="36"),
+    )
     target, reason = pipe._resolve_target_responsible(_app(), CompanyEnrichment(bin="123456789012", director="ИВАНОВ ИВАН ИВАНОВИЧ"), None)
 
     assert target == 74
-    assert reason == "historical_first_company_owner"
+    assert reason == "historical_first_deal_owner"
 
 
 def test_deal_fields_use_explicit_responsible_id():
@@ -138,7 +150,7 @@ class FakeClientWithContactsAndDeals(FakeClientWithDeals):
         return self.contact
 
 
-def test_director_package_owner_overrides_existing_company_owner():
+def test_company_owner_does_not_override_missing_deal_history():
     companies = [
         {
             "ID": "1",
@@ -154,11 +166,11 @@ def test_director_package_owner_overrides_existing_company_owner():
         {"ASSIGNED_BY_ID": "92"},
     )
 
-    assert target == 74
-    assert reason == "historical_first_company_owner"
+    assert target in set(ALLOWED_USER_IDS)
+    assert reason in {"lowest_active_deal_load_new_director", "lowest_active_deal_load_limit_expanded"}
 
 
-def test_director_contact_owner_is_canonical_for_new_deal():
+def test_director_contact_owner_is_not_automatic_history():
     contact = {
         "ID": "500",
         "LAST_NAME": "ИВАНОВ",
@@ -177,11 +189,11 @@ def test_director_contact_owner_is_canonical_for_new_deal():
         {"ASSIGNED_BY_ID": "74"},
     )
 
-    assert target == 92
-    assert reason == "existing_director_contact_owner"
+    assert target in set(ALLOWED_USER_IDS)
+    assert reason in {"lowest_active_deal_load_new_director", "lowest_active_deal_load_limit_expanded"}
 
 
-def test_split_director_package_uses_oldest_company_owner_when_no_deals_exist():
+def test_company_only_package_uses_load_when_no_deal_history_exists():
     companies = [
         {
             "ID": "1",
@@ -204,8 +216,8 @@ def test_split_director_package_uses_oldest_company_owner_when_no_deals_exist():
         None,
     )
 
-    assert target == 74
-    assert reason == "historical_first_company_owner"
+    assert target in set(ALLOWED_USER_IDS)
+    assert reason in {"lowest_active_deal_load_new_director", "lowest_active_deal_load_limit_expanded"}
 
 
 def test_oldest_deal_owner_wins_over_newer_deals_and_contact_owner():
@@ -275,7 +287,7 @@ def test_runtime_cache_rejects_two_managers_for_one_director():
         raise AssertionError("runtime cache must reject split director assignment")
 
 
-def test_bin_cannot_split_existing_director_package():
+def test_bin_does_not_use_company_only_history_as_director_anchor():
     companies = [
         {
             "ID": "1",
@@ -291,8 +303,8 @@ def test_bin_cannot_split_existing_director_package():
         None,
     )
 
-    assert target == 74
-    assert reason == "historical_first_company_owner"
+    assert target in set(ALLOWED_USER_IDS)
+    assert reason in {"lowest_active_deal_load_new_director", "lowest_active_deal_load_limit_expanded"}
 
 
 class FakeClientExistingDeal(FakeClient):
@@ -436,7 +448,7 @@ def test_failed_deal_inheritance_matches_prefixed_failed_stage_id_without_semant
     assert inheritance.source_deal_id == "102"
 
 
-def test_default_assignment_load_counts_every_non_closed_deal():
+def test_default_assignment_load_counts_only_new_and_in_work():
     deals = [
         {"ID": "1", "ASSIGNED_BY_ID": "70", "STAGE_ID": "NEW", "CLOSED": "N"},
         {"ID": "2", "ASSIGNED_BY_ID": "70", "STAGE_ID": "C2:EXECUTING", "CLOSED": "N"},
@@ -448,7 +460,7 @@ def test_default_assignment_load_counts_every_non_closed_deal():
         config=BitrixPipelineConfig(assigned_by_id="36"),
     )
 
-    assert pipe._manager_load(70) == 3
+    assert pipe._manager_load(70) == 2
 
 
 def test_lowest_loaded_owner_is_deterministic_and_prefers_real_minimum():

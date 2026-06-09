@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--active-deal-load-stage-ids",
         default=DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS,
-        help="Comma-separated STAGE_ID values that consume the active-deal limit. Default: ALL = every non-closed deal.",
+        help="Comma-separated STAGE_ID values that consume the active-deal limit. Default: NEW,EXECUTING = Новая + В работе.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Optional seed for tie-breaks")
     return parser.parse_args()
@@ -475,10 +475,10 @@ def choose_target(
 ) -> tuple[int | None, str, dict[str, Any]]:
     """Choose package owner using the production business rule.
 
-    1. Historical owner of the oldest existing deal in the package.
-    2. If no deal owner exists, historical owner of the oldest existing company.
-    3. If the package has no valid history, assign to the lowest-load active manager.
+    1. Historical owner of the oldest existing e-Qazyna deal in the package.
+    2. If the package has no valid deal history, assign to the lowest-load active manager.
 
+    Company/contact owners and manual legacy lists are not automatic history.
     Technical/source users such as 36/44 are never treated as historical owners.
     Soft limits are used only for new packages without history.
     """
@@ -492,23 +492,6 @@ def choose_target(
         target = _eligible_historical_owner(oldest, source_ids)
         return target, "historical_first_deal_owner", {
             "historical_entity_type": "deal",
-            "historical_entity_id": safe_str(oldest.get("entity_id")),
-            "historical_owner_id": target,
-            "historical_owner_name": user_name(target),
-            "historical_date_create": safe_str((oldest.get("entity") or {}).get("DATE_CREATE")) if isinstance(oldest.get("entity"), dict) else "",
-            "limits_applied": False,
-        }
-
-    companies = [record for record in group_records if record.get("entity_type") == "company"]
-    historical_companies = [
-        record for record in companies
-        if _eligible_historical_owner(record, source_ids) is not None
-    ]
-    if historical_companies:
-        oldest = min(historical_companies, key=_record_sort_key)
-        target = _eligible_historical_owner(oldest, source_ids)
-        return target, "historical_first_company_owner", {
-            "historical_entity_type": "company",
             "historical_entity_id": safe_str(oldest.get("entity_id")),
             "historical_owner_id": target,
             "historical_owner_name": user_name(target),

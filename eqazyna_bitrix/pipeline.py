@@ -55,7 +55,6 @@ class BitrixPipeline:
         self.client = client
         self.config = config
         self._director_contact_cache: dict[str, str] = {}
-        self._director_contact_owner_cache: dict[str, tuple[int | None, str | None]] = {}
         self._eqazyna_companies_cache: list[dict[str, Any]] | None = None
         self._eqazyna_deals_cache: list[dict[str, Any]] | None = None
         self._failed_deal_by_director_cache: dict[str, FailedDealInheritance | None] = {}
@@ -386,36 +385,6 @@ class BitrixPipeline:
                 self._eqazyna_deals_cache = self.client.list_eqazyna_deals()
         return self._eqazyna_deals_cache
 
-    def _contact_owner_by_director(self, director: str | None) -> tuple[int | None, str | None]:
-        keys = director_identity_keys(director)
-        if not keys:
-            return None, None
-
-        for key in keys:
-            if key in self._director_contact_owner_cache:
-                return self._director_contact_owner_cache[key]
-
-        result: tuple[int | None, str | None] = (None, None)
-        fio = split_director_fio(director)
-        if fio:
-            try:
-                find_exact = getattr(self.client, "find_contact_by_fio", None)
-                contact = find_exact(fio.last_name, fio.name, fio.second_name) if callable(find_exact) else None
-                if not contact:
-                    find_alias = getattr(self.client, "find_contact_by_director_alias", None)
-                    contact = find_alias(fio.raw) if callable(find_alias) else None
-                owner_id = self._record_assigned_by_id(contact)
-                if self._is_allowed_manager(owner_id) and not self._is_source_responsible(owner_id):
-                    result = (owner_id, "existing_director_contact_owner")
-            except Exception:
-                # Contact lookup is an additional read-only signal. A temporary
-                # lookup failure must not stop the whole parser.
-                result = (None, None)
-
-        for key in keys:
-            self._director_contact_owner_cache[key] = result
-        return result
-
     def _historical_sort_key(self, record: dict[str, Any]) -> tuple[datetime, int]:
         """Sort oldest CRM entities first, with ID as deterministic fallback."""
         raw_date = str(record.get("DATE_CREATE") or "").strip()
@@ -434,24 +403,25 @@ class BitrixPipeline:
         return parsed, record_id
 
     def _package_owner_by_director(self, director: str | None) -> tuple[int | None, str | None]:
-        """Return the historical owner of an existing director package.
+        """Return the historical owner of an existing e-Qazyna deal package.
 
-        Historical owner means the manager on the oldest existing non-technical
-        deal of this director. Newer accidentally assigned deals cannot outvote
-        that anchor. If the package has no usable deal yet, the oldest usable
-        company owner is used as a fallback.
+        Production rule: only e-Qazyna deals create historical ownership for a
+        director. Company owners, contact owners and legacy manual lists are not
+        owner history for automatic distribution.
+
+        A deal can be matched either by director text in its own comments or by
+        a linked e-Qazyna company whose comments contain the same director. The
+        owner anchor is still the deal owner, not the company owner.
         """
         director_keys = set(director_identity_keys(director))
         if not director_keys:
             return None, None
 
         matching_company_ids: set[str] = set()
-        matching_companies: list[dict[str, Any]] = []
         for company in self._list_eqazyna_companies_cached():
             company_director = _extract_director_from_comments(str(company.get("COMMENTS") or ""))
             if not director_keys.intersection(director_identity_keys(company_director)):
                 continue
-            matching_companies.append(company)
             company_id = str(company.get("ID") or "")
             if company_id:
                 matching_company_ids.add(company_id)
@@ -462,11 +432,8 @@ class BitrixPipeline:
             deal_director = _extract_director_from_comments(str(deal.get("COMMENTS") or ""))
             matches_by_company = bool(deal_company_id and deal_company_id in matching_company_ids)
             matches_by_comment = bool(director_keys.intersection(director_identity_keys(deal_director)))
-            if not (matches_by_company or matches_by_comment):
-                continue
-            matching_deals.append(deal)
-            if deal_company_id:
-                matching_company_ids.add(deal_company_id)
+            if matches_by_company or matches_by_comment:
+                matching_deals.append(deal)
 
         eligible_deals = [
             deal for deal in matching_deals
@@ -477,16 +444,6 @@ class BitrixPipeline:
             oldest_deal = min(eligible_deals, key=self._historical_sort_key)
             owner_id = self._record_assigned_by_id(oldest_deal)
             return owner_id, "historical_first_deal_owner"
-
-        eligible_companies = [
-            company for company in matching_companies
-            if self._is_allowed_manager(self._record_assigned_by_id(company))
-            and not self._is_source_responsible(self._record_assigned_by_id(company))
-        ]
-        if eligible_companies:
-            oldest_company = min(eligible_companies, key=self._historical_sort_key)
-            owner_id = self._record_assigned_by_id(oldest_company)
-            return owner_id, "historical_first_company_owner"
 
         return None, None
 
@@ -546,18 +503,10 @@ class BitrixPipeline:
         pipeline, because they can split one director package across managers.
         Manual movement is handled only by the admin reassignment workflow.
         """
-        current_owner_id = self._record_assigned_by_id(company)
         director = enr.director
 
         cached_owner_id, cached_reason = self._cached_assignment(app.bin, director)
-        package_owner_id, package_reason = self._package_owner_by_director(director)
-        contact_owner_id: int | None = None
-        contact_reason: str | None = None
-        if not package_owner_id:
-            contact_owner_id, contact_reason = self._contact_owner_by_director(director)
-
-        director_owner_id = package_owner_id or contact_owner_id
-        director_reason = package_reason or contact_reason
+        director_owner_id, director_reason = self._package_owner_by_director(director)
 
         if cached_owner_id:
             if director_owner_id and director_owner_id != cached_owner_id:
@@ -572,15 +521,9 @@ class BitrixPipeline:
             self._remember_assignment(app.bin, director, director_owner_id, director_reason)
             return director_owner_id, director_reason
 
-        # If there is no director history yet, an existing non-technical company
-        # owner can seed the package. This is only a fallback for genuinely new
-        # director packages; it never overrides director history above.
-        if self._is_allowed_manager(current_owner_id) and not self._is_source_responsible(current_owner_id):
-            reason = "existing_company_owner_seeds_new_director_package"
-            self._remember_assignment(app.bin, director, current_owner_id, reason)
-            return current_owner_id, reason
-
         # Fully new director/BIN: choose by the lowest e-Qazyna deal load in the configured limit stages.
+        # Existing company/contact owners are deliberately ignored here: only e-Qazyna deal history
+        # can anchor a director package. Manual movement belongs to Reassign CRM owner.
         # The limit is soft: if everyone is at/above it, choose the lowest load.
         owner_id, reason = self._lowest_loaded_owner_from_current_load()
         self._remember_assignment(app.bin, director, owner_id, reason)

@@ -44,7 +44,7 @@ BITRIX_DEAL_STAGE_ID
 BITRIX_REQUISITE_PRESET_ID
 BITRIX_REQUISITE_BIN_FIELD
 BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER    # по умолчанию 30 сделок
-BITRIX_ASSIGNMENT_LOAD_STAGE_IDS       # стадии, которые входят в лимит: ALL = все незакрытые активные заявки
+BITRIX_ASSIGNMENT_LOAD_STAGE_IDS       # стадии, которые входят в лимит: NEW,EXECUTING = Новая + В работе
 ```
 
 `BITRIX_ASSIGNED_BY_ID` больше не должен использоваться как способ массово назначать новые заявки одному человеку. Новые руководители распределяются по минимальной активной нагрузке, а исторические руководители идут своему историческому менеджеру.

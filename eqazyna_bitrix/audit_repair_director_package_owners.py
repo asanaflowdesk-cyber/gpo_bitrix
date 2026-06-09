@@ -263,7 +263,11 @@ def choose_historical_target(
     source_ids: Set[str],
     manual_index: Dict[str, str],  # kept for backward-compatible tests/calls; ignored
 ) -> Tuple[str, str, str, Dict[str, Any]]:
-    """Return target_id, reason, conflict_note, historical evidence."""
+    """Return target_id, reason, conflict_note, historical evidence.
+
+    Only e-Qazyna deals are historical ownership anchors. Companies, contacts
+    and legacy manual mappings are deliberately ignored by the automatic repair.
+    """
     eligible_deals = [deal for deal in package_deals if eligible_owner(s(deal.get("ASSIGNED_BY_ID")), source_ids)]
     if eligible_deals:
         oldest_deal = min(eligible_deals, key=entity_sort_key)
@@ -275,30 +279,7 @@ def choose_historical_target(
             "historical_owner_id": owner_id,
         }
 
-    eligible_companies = [company for company in companies.values() if eligible_owner(s(company.get("ASSIGNED_BY_ID")), source_ids)]
-    if eligible_companies:
-        oldest_company = min(eligible_companies, key=entity_sort_key)
-        owner_id = s(oldest_company.get("ASSIGNED_BY_ID"))
-        return owner_id, "historical_first_company_owner", "", {
-            "historical_entity_type": "company",
-            "historical_entity_id": s(oldest_company.get("ID")),
-            "historical_entity_date": s(oldest_company.get("DATE_CREATE")),
-            "historical_owner_id": owner_id,
-        }
-
-    contact_owners = sorted({s(contact.get("ASSIGNED_BY_ID")) for contact in contacts.values() if eligible_owner(s(contact.get("ASSIGNED_BY_ID")), source_ids)})
-    if len(contact_owners) == 1:
-        owner_id = contact_owners[0]
-        return owner_id, "director_contact_owner_fallback", "", {
-            "historical_entity_type": "contact_fallback",
-            "historical_entity_id": "",
-            "historical_entity_date": "",
-            "historical_owner_id": owner_id,
-        }
-    if len(contact_owners) > 1:
-        return "", "ambiguous_director_contacts", ",".join(contact_owners), {}
-
-    return "", "no_historical_target_owner", "", {}
+    return "", "no_historical_deal_owner", "", {}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
