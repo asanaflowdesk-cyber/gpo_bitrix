@@ -34,9 +34,9 @@ on:
         required: true
         default: "30"
       active_deal_load_stage_ids:
-        description: "STAGE_ID, которые входят в лимит. ALL = все незакрытые активные заявки; либо конкретно NEW,EXECUTING"
+        description: "STAGE_ID, которые входят в лимит. По рабочей логике: NEW,EXECUTING = Новая + В работе"
         required: true
-        default: "ALL"
+        default: "NEW,EXECUTING"
       seed:
         description: "Seed для повторяемого выбора при ничьей. Обычно пусто"
         required: false
