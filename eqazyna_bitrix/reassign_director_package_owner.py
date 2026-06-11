@@ -263,6 +263,25 @@ class Bitrix:
                 self._company_cache[cid] = {}
         return self._company_cache[cid]
 
+    def get_deal(self, deal_id: Any) -> Dict[str, Any]:
+        did = normalize_id(deal_id)
+        if not did:
+            return {}
+        try:
+            return self.call("crm.deal.get", {"id": did}) or {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def get_entity_owner(self, entity_type: str, entity_id: Any) -> str:
+        methods = {
+            "deal": "crm.deal.get",
+            "company": "crm.company.get",
+            "contact": "crm.contact.get",
+        }
+        method = methods[entity_type]
+        row = self.call(method, {"id": normalize_id(entity_id)}) or {}
+        return normalize_id(row.get("ASSIGNED_BY_ID"))
+
     def list_deals(self, *, category_id: str, only_eqazyna: bool, include_closed: bool, limit: int = 0) -> List[Dict[str, Any]]:
         flt: Dict[str, Any] = {}
         if category_id and category_id.lower() not in ALL_VALUES:
@@ -354,7 +373,7 @@ class Bitrix:
                         candidates[contact_id] = contact
         return [candidates[key] for key in sort_ids(candidates.keys())]
 
-    def update_owner(self, entity_type: str, entity_id: Any, target_user_id: str) -> None:
+    def update_owner(self, entity_type: str, entity_id: Any, target_user_id: str) -> str:
         methods = {
             "deal": "crm.deal.update",
             "company": "crm.company.update",
@@ -362,6 +381,13 @@ class Bitrix:
         }
         method = methods[entity_type]
         self.call(method, {"id": normalize_id(entity_id), "fields": {"ASSIGNED_BY_ID": target_user_id}, "params": {"REGISTER_SONET_EVENT": "N"}})
+        verified_owner_id = self.get_entity_owner(entity_type, entity_id)
+        if verified_owner_id != target_user_id:
+            raise BitrixError(
+                f"{method}: Bitrix accepted update, but ASSIGNED_BY_ID stayed {verified_owner_id!r}; "
+                f"expected {target_user_id!r}"
+            )
+        return verified_owner_id
 
 
 def deal_director_match(
@@ -525,6 +551,7 @@ def action_row(
         "originator_id": s(entity.get("ORIGINATOR_ID")),
         "origin_id": s(entity.get("ORIGIN_ID")),
         "url_hint": crm_url_hint(entity_type, entity_id, portal_base_url),
+        "verified_owner_id": "",
         "error": "",
     }
 
@@ -560,6 +587,13 @@ def run(args: argparse.Namespace) -> int:
     bx = Bitrix(BITRIX_WEBHOOK_URL, timeout=timeout)
     bx.validate_target_user_exists(target_user_id)
     target_user_name = bx.get_user_name(target_user_id)
+    print(json.dumps({
+        "mode": "dry_run" if dry_run else "write",
+        "director_name": director_name,
+        "target_user_id": target_user_id,
+        "target_user_name": target_user_name,
+        "only_eqazyna": only_eqazyna,
+    }, ensure_ascii=False))
 
     package = build_package_selection(
         bx=bx,
@@ -608,7 +642,7 @@ def run(args: argparse.Namespace) -> int:
                 rows.append(row)
                 continue
             try:
-                bx.update_owner(entity_type, entity_id, target_user_id)
+                row["verified_owner_id"] = bx.update_owner(entity_type, entity_id, target_user_id)
                 updated += 1
             except Exception as exc:  # noqa: BLE001
                 row["action"] = "update_error"
@@ -619,7 +653,7 @@ def run(args: argparse.Namespace) -> int:
     fields = [
         "action", "entity_type", "entity_id", "entity_title", "from_owner_id", "to_owner_id", "to_owner_name",
         "matched_director_name", "match_source", "company_id", "contact_id", "category_id", "stage_id", "closed",
-        "originator_id", "origin_id", "url_hint", "error",
+        "originator_id", "origin_id", "url_hint", "verified_owner_id", "error",
     ]
     write_csv(args.out, rows, fields)
     write_json(args.json_out, {
