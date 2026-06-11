@@ -181,6 +181,28 @@ class Bitrix:
             time.sleep(self.polite_delay_seconds)
         return data.get("result")
 
+    def call_form_full(self, method: str, params: Sequence[Tuple[str, Any]]) -> Dict[str, Any]:
+        """Call Bitrix using form-data syntax.
+
+        This mirrors the existing Reassign CRM owner admin tool in the repo.
+        It is deliberately used for owner writes because some Bitrix portals are
+        picky with nested JSON payloads while reliably accepting
+        fields[ASSIGNED_BY_ID].
+        """
+        response = self.session.post(self.base + method + ".json", data=list(params), timeout=self.timeout)
+        try:
+            data = response.json()
+        except Exception as exc:  # noqa: BLE001
+            raise BitrixError(f"{method}: HTTP {response.status_code}: {response.text[:500]}") from exc
+        if response.status_code >= 400 or "error" in data:
+            raise BitrixError(f"{method}: {json.dumps(data, ensure_ascii=False)[:1200]}")
+        if self.polite_delay_seconds:
+            time.sleep(self.polite_delay_seconds)
+        return data
+
+    def call_form(self, method: str, params: Sequence[Tuple[str, Any]]) -> Any:
+        return self.call_form_full(method, params).get("result")
+
     def list_all(self, method: str, payload: Optional[Dict[str, Any]] = None, limit: int = 0) -> List[Dict[str, Any]]:
         base_payload = dict(payload or {})
         output: List[Dict[str, Any]] = []
@@ -279,7 +301,7 @@ class Bitrix:
             "contact": "crm.contact.get",
         }
         method = methods[entity_type]
-        row = self.call(method, {"id": normalize_id(entity_id)}) or {}
+        row = self.call_form(method, [("id", normalize_id(entity_id))]) or {}
         return normalize_id(row.get("ASSIGNED_BY_ID"))
 
     def list_deals(self, *, category_id: str, only_eqazyna: bool, include_closed: bool, limit: int = 0) -> List[Dict[str, Any]]:
@@ -373,21 +395,35 @@ class Bitrix:
                         candidates[contact_id] = contact
         return [candidates[key] for key in sort_ids(candidates.keys())]
 
-    def update_owner(self, entity_type: str, entity_id: Any, target_user_id: str) -> str:
+    def update_owner(self, entity_type: str, entity_id: Any, target_user_id: str) -> Tuple[str, str, str]:
         methods = {
             "deal": "crm.deal.update",
             "company": "crm.company.update",
             "contact": "crm.contact.update",
         }
         method = methods[entity_type]
-        self.call(method, {"id": normalize_id(entity_id), "fields": {"ASSIGNED_BY_ID": target_user_id}, "params": {"REGISTER_SONET_EVENT": "N"}})
+        params = [
+            ("id", normalize_id(entity_id)),
+            ("fields[ASSIGNED_BY_ID]", normalize_id(target_user_id)),
+            ("params[REGISTER_SONET_EVENT]", "N"),
+        ]
+        payload = self.call_form_full(method, params)
+        update_result = json.dumps(payload.get("result"), ensure_ascii=False)[:300]
+
         verified_owner_id = self.get_entity_owner(entity_type, entity_id)
-        if verified_owner_id != target_user_id:
+        verified_after_delay = verified_owner_id
+        if verified_owner_id == target_user_id:
+            # Catch immediate Bitrix robots/business processes that roll the owner back.
+            time.sleep(3)
+            verified_after_delay = self.get_entity_owner(entity_type, entity_id)
+
+        if verified_owner_id != target_user_id or verified_after_delay != target_user_id:
             raise BitrixError(
-                f"{method}: Bitrix accepted update, but ASSIGNED_BY_ID stayed {verified_owner_id!r}; "
+                f"{method}: update_result={update_result}; "
+                f"ASSIGNED_BY_ID immediate={verified_owner_id!r}, after_3s={verified_after_delay!r}; "
                 f"expected {target_user_id!r}"
             )
-        return verified_owner_id
+        return update_result, verified_owner_id, verified_after_delay
 
 
 def deal_director_match(
@@ -551,7 +587,10 @@ def action_row(
         "originator_id": s(entity.get("ORIGINATOR_ID")),
         "origin_id": s(entity.get("ORIGIN_ID")),
         "url_hint": crm_url_hint(entity_type, entity_id, portal_base_url),
+        "update_transport": "form-data fields[ASSIGNED_BY_ID]",
+        "update_result": "",
         "verified_owner_id": "",
+        "verified_owner_id_after_3s": "",
         "error": "",
     }
 
@@ -642,7 +681,10 @@ def run(args: argparse.Namespace) -> int:
                 rows.append(row)
                 continue
             try:
-                row["verified_owner_id"] = bx.update_owner(entity_type, entity_id, target_user_id)
+                update_result, verified_owner_id, verified_after_delay = bx.update_owner(entity_type, entity_id, target_user_id)
+                row["update_result"] = update_result
+                row["verified_owner_id"] = verified_owner_id
+                row["verified_owner_id_after_3s"] = verified_after_delay
                 updated += 1
             except Exception as exc:  # noqa: BLE001
                 row["action"] = "update_error"
@@ -653,7 +695,8 @@ def run(args: argparse.Namespace) -> int:
     fields = [
         "action", "entity_type", "entity_id", "entity_title", "from_owner_id", "to_owner_id", "to_owner_name",
         "matched_director_name", "match_source", "company_id", "contact_id", "category_id", "stage_id", "closed",
-        "originator_id", "origin_id", "url_hint", "verified_owner_id", "error",
+        "originator_id", "origin_id", "url_hint", "update_transport", "update_result",
+        "verified_owner_id", "verified_owner_id_after_3s", "error",
     ]
     write_csv(args.out, rows, fields)
     write_json(args.json_out, {
