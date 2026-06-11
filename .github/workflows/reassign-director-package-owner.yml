@@ -70,6 +70,10 @@ on:
         description: "Лимит сканирования компаний. 0 = без лимита"
         required: true
         default: "0"
+      verify_delay_seconds:
+        description: "Через сколько секунд повторно проверить владельца после записи"
+        required: true
+        default: "5"
 
 permissions:
   contents: read
@@ -122,6 +126,7 @@ jobs:
             --fail-if-no-deals "${{ inputs.fail_if_no_deals }}"
             --max-deals "${{ inputs.max_deals }}"
             --max-companies "${{ inputs.max_companies }}"
+            --verify-delay-seconds "${{ inputs.verify_delay_seconds }}"
             --portal-base-url "$BITRIX_PORTAL_URL"
             --out "exports/reassign_director_package_owner_log.csv"
             --json-out "exports/reassign_director_package_owner_summary.json"
