@@ -18,6 +18,10 @@ on:
         description: "Тест без записи в Bitrix"
         required: true
         default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
       only_eqazyna:
         description: "Переносить только e-Qazyna сущности"
         required: true
@@ -127,8 +131,17 @@ jobs:
             ARGS+=(--dry-run)
           fi
 
+          echo "dry_run input: ${{ inputs.dry_run }}"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "MODE: DRY_RUN — Bitrix will not be changed"
+          else
+            echo "MODE: WRITE — Bitrix update methods will be called"
+          fi
+
           "${ARGS[@]}"
           ls -lah exports
+          echo "---- summary ----"
+          cat exports/reassign_director_package_owner_summary.json || true
 
       - name: Upload reassignment log
         if: always()
