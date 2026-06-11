@@ -1,7 +1,7 @@
-name: Reassign package by contact ID FAST
+name: Reassign package by contact ID BATCH
 
 run-name: >-
-  FAST reassign contact #${{ inputs.contact_id }} → user ${{ inputs.target_user_id }} / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }}
+  BATCH reassign contact #${{ inputs.contact_id }} → user ${{ inputs.target_user_id }} / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }}
 
 on:
   workflow_dispatch:
@@ -42,15 +42,23 @@ on:
           - "true"
           - "false"
         default: "true"
+      verify:
+        description: "Быстрая batch-проверка после записи без задержки"
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
 
 permissions:
   contents: read
   actions: read
 
 jobs:
-  reassign-by-contact-id-fast:
+  reassign-by-contact-id-batch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
 
     env:
       BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
@@ -73,36 +81,37 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests; fi
 
-      - name: Reassign package by contact ID FAST
+      - name: Reassign package by contact ID BATCH
         run: |
           mkdir -p exports
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             echo "MODE: DRY_RUN — Bitrix will not be changed"
           else
-            echo "MODE: WRITE — Bitrix update methods will be called"
+            echo "MODE: WRITE — Bitrix batch update will be called"
           fi
 
-          python -m eqazyna_bitrix.reassign_by_contact_id_fast \
+          python -m eqazyna_bitrix.reassign_by_contact_id_batch \
             --contact-id "${{ inputs.contact_id }}" \
             --target-user-id "${{ inputs.target_user_id }}" \
             --dry-run "${{ inputs.dry_run }}" \
             --deal-originator-id "${{ inputs.deal_originator_id }}" \
             --include-closed-deals "${{ inputs.include_closed_deals }}" \
             --reassign-source-contact "${{ inputs.reassign_source_contact }}" \
-            --out "exports/reassign_by_contact_id_fast_log.csv" \
-            --json-out "exports/reassign_by_contact_id_fast_summary.json"
+            --verify "${{ inputs.verify }}" \
+            --out "exports/reassign_by_contact_id_batch_log.csv" \
+            --json-out "exports/reassign_by_contact_id_batch_summary.json"
 
           ls -lah exports
           echo "---- summary ----"
-          cat exports/reassign_by_contact_id_fast_summary.json || true
+          cat exports/reassign_by_contact_id_batch_summary.json || true
 
-      - name: Upload FAST reassign log
+      - name: Upload BATCH reassign log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: reassign-by-contact-id-fast-log
+          name: reassign-by-contact-id-batch-log
           path: |
-            exports/reassign_by_contact_id_fast_log.csv
-            exports/reassign_by_contact_id_fast_summary.json
+            exports/reassign_by_contact_id_batch_log.csv
+            exports/reassign_by_contact_id_batch_summary.json
           if-no-files-found: ignore
           retention-days: 14
