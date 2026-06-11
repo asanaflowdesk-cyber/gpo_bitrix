@@ -1,13 +1,13 @@
-name: Reassign director package owner
+name: Reassign package by contact ID
 
 run-name: >-
-  Reassign director package / ${{ inputs.director_name }} → user ${{ inputs.target_user_id }} / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }}
+  Reassign by contact #${{ inputs.contact_id }} → user ${{ inputs.target_user_id }} / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }}
 
 on:
   workflow_dispatch:
     inputs:
-      director_name:
-        description: "ФИО учредителя/руководителя. Минимум фамилия + имя или инициалы"
+      contact_id:
+        description: "ID контакта учредителя/руководителя в Bitrix"
         required: true
         default: ""
       target_user_id:
@@ -17,59 +17,31 @@ on:
       dry_run:
         description: "Тест без записи в Bitrix"
         required: true
-        default: "true"
         type: choice
         options:
           - "true"
           - "false"
-      only_eqazyna:
-        description: "Переносить только e-Qazyna сущности"
-        required: true
         default: "true"
+      deal_originator_id:
+        description: "Фильтр сделок по ORIGINATOR_ID. Для e-Qazyna оставьте EQAZYNA. Пусто = все сделки."
+        required: false
+        default: "EQAZYNA"
       include_closed_deals:
-        description: "Переносить закрытые/проваленные сделки тоже"
+        description: "Переносить закрытые/проваленные сделки"
         required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
         default: "true"
-      deal_category_id:
-        description: "Воронка сделок. all = все"
+      include_related_contacts:
+        description: "Переносить также другие контакты, связанные с найденными компаниями/сделками"
         required: true
-        default: "all"
-      include_companies:
-        description: "Переносить компании"
-        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
         default: "true"
-      include_contacts:
-        description: "Переносить связанные контакты"
-        required: true
-        default: "true"
-      include_deals:
-        description: "Переносить сделки"
-        required: true
-        default: "true"
-      include_orphan_companies:
-        description: "Искать компании по ФИО в комментариях, даже если сделка первой не нашлась"
-        required: true
-        default: "true"
-      include_company_contacts:
-        description: "Переносить контакты, связанные с выбранными компаниями"
-        required: true
-        default: "true"
-      include_matching_director_contacts:
-        description: "Переносить контакты, у которых ФИО совпадает с учредителем/руководителем"
-        required: true
-        default: "true"
-      fail_if_no_deals:
-        description: "Падать, если по ФИО не найдены сделки"
-        required: true
-        default: "false"
-      max_deals:
-        description: "Лимит сканирования сделок. 0 = без лимита"
-        required: true
-        default: "0"
-      max_companies:
-        description: "Лимит сканирования компаний. 0 = без лимита"
-        required: true
-        default: "0"
       verify_delay_seconds:
         description: "Через сколько секунд повторно проверить владельца после записи"
         required: true
@@ -80,13 +52,12 @@ permissions:
   actions: read
 
 jobs:
-  reassign-director-package-owner:
+  reassign-by-contact-id:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 45
 
     env:
       BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
-      BITRIX_PORTAL_URL: ${{ vars.BITRIX_PORTAL_URL || 'https://b24-izmquv.bitrix24.kz' }}
       REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
 
     steps:
@@ -104,57 +75,39 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests; fi
 
-      - name: Reassign director package owner
+      - name: Reassign package by contact ID
         run: |
           mkdir -p exports
-
-          ARGS=(
-            python -m eqazyna_bitrix.reassign_director_package_owner
-            --director-name "${{ inputs.director_name }}"
-            --target-user-id "${{ inputs.target_user_id }}"
-            --only-eqazyna "${{ inputs.only_eqazyna }}"
-            --include-closed-deals "${{ inputs.include_closed_deals }}"
-            --deal-category-id "${{ inputs.deal_category_id }}"
-            --include-companies "${{ inputs.include_companies }}"
-            --include-contacts "${{ inputs.include_contacts }}"
-            --include-deals "${{ inputs.include_deals }}"
-            --include-orphan-companies "${{ inputs.include_orphan_companies }}"
-            --include-company-contacts "${{ inputs.include_company_contacts }}"
-            --include-matching-director-contacts "${{ inputs.include_matching_director_contacts }}"
-            --fail-if-no-deals "${{ inputs.fail_if_no_deals }}"
-            --max-deals "${{ inputs.max_deals }}"
-            --max-companies "${{ inputs.max_companies }}"
-            --verify-delay-seconds "${{ inputs.verify_delay_seconds }}"
-            --portal-base-url "$BITRIX_PORTAL_URL"
-            --out "exports/reassign_director_package_owner_log.csv"
-            --json-out "exports/reassign_director_package_owner_summary.json"
-          )
-
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            ARGS+=(--dry-run)
-          fi
-
-          echo "dry_run input: ${{ inputs.dry_run }}"
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             echo "MODE: DRY_RUN — Bitrix will not be changed"
           else
             echo "MODE: WRITE — Bitrix update methods will be called"
           fi
 
-          "${ARGS[@]}"
+          python -m eqazyna_bitrix.reassign_by_contact_id \
+            --contact-id "${{ inputs.contact_id }}" \
+            --target-user-id "${{ inputs.target_user_id }}" \
+            --dry-run "${{ inputs.dry_run }}" \
+            --deal-originator-id "${{ inputs.deal_originator_id }}" \
+            --include-closed-deals "${{ inputs.include_closed_deals }}" \
+            --include-related-contacts "${{ inputs.include_related_contacts }}" \
+            --verify-delay-seconds "${{ inputs.verify_delay_seconds }}" \
+            --out "exports/reassign_by_contact_id_log.csv" \
+            --json-out "exports/reassign_by_contact_id_summary.json"
+
           ls -lah exports
           echo "---- summary ----"
-          cat exports/reassign_director_package_owner_summary.json || true
+          cat exports/reassign_by_contact_id_summary.json || true
 
-      - name: Upload reassignment log
+      - name: Upload reassign by contact ID log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: reassign-director-package-owner-log
+          name: reassign-by-contact-id-log
           path: |
-            exports/reassign_director_package_owner_log.csv
-            exports/reassign_director_package_owner_summary.json
+            exports/reassign_by_contact_id_log.csv
+            exports/reassign_by_contact_id_summary.json
           if-no-files-found: ignore
           retention-days: 14
