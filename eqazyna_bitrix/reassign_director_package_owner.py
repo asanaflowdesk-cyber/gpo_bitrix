@@ -29,6 +29,11 @@ EQAZYNA_ORIGINATOR_ID = "EQAZYNA"
 TRUE_VALUES = {"1", "true", "yes", "y", "да", "д", "on"}
 FALSE_VALUES = {"0", "false", "no", "n", "нет", "н", "off"}
 ALL_VALUES = {"", "all", "*", "все", "любой", "любая"}
+ENTITY_METHODS = {
+    "deal": {"get": "crm.deal.get", "update": "crm.deal.update"},
+    "company": {"get": "crm.company.get", "update": "crm.company.update"},
+    "contact": {"get": "crm.contact.get", "update": "crm.contact.update"},
+}
 
 
 class BitrixError(RuntimeError):
@@ -169,17 +174,20 @@ class Bitrix:
         self._contact_cache: Dict[str, Dict[str, Any]] = {}
         self._company_cache: Dict[str, Dict[str, Any]] = {}
 
-    def call(self, method: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+    def call_json_full(self, method: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         response = self.session.post(self.base + method + ".json", json=payload or {}, timeout=self.timeout)
         try:
             data = response.json()
         except Exception as exc:  # noqa: BLE001
-            raise BitrixError(f"{method}: HTTP {response.status_code}: {response.text[:500]}") from exc
+            raise BitrixError(f"{method}: HTTP {response.status_code}: {response.text[:800]}") from exc
         if response.status_code >= 400 or "error" in data:
-            raise BitrixError(f"{method}: {json.dumps(data, ensure_ascii=False)[:1200]}")
+            raise BitrixError(f"{method}: {json.dumps(data, ensure_ascii=False)[:2000]}")
         if self.polite_delay_seconds:
             time.sleep(self.polite_delay_seconds)
-        return data.get("result")
+        return data
+
+    def call(self, method: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+        return self.call_json_full(method, payload).get("result")
 
     def call_form_full(self, method: str, params: Sequence[Tuple[str, Any]]) -> Dict[str, Any]:
         """Call Bitrix using form-data syntax.
@@ -294,15 +302,15 @@ class Bitrix:
         except Exception:  # noqa: BLE001
             return {}
 
+    def get_entity(self, entity_type: str, entity_id: Any) -> Dict[str, Any]:
+        entity_type = s(entity_type).lower()
+        if entity_type not in ENTITY_METHODS:
+            raise ValueError(f"Unsupported entity_type={entity_type!r}")
+        result = self.call(ENTITY_METHODS[entity_type]["get"], {"id": normalize_id(entity_id)})
+        return dict(result or {})
+
     def get_entity_owner(self, entity_type: str, entity_id: Any) -> str:
-        methods = {
-            "deal": "crm.deal.get",
-            "company": "crm.company.get",
-            "contact": "crm.contact.get",
-        }
-        method = methods[entity_type]
-        row = self.call_form(method, [("id", normalize_id(entity_id))]) or {}
-        return normalize_id(row.get("ASSIGNED_BY_ID"))
+        return normalize_id(self.get_entity(entity_type, entity_id).get("ASSIGNED_BY_ID"))
 
     def list_deals(self, *, category_id: str, only_eqazyna: bool, include_closed: bool, limit: int = 0) -> List[Dict[str, Any]]:
         flt: Dict[str, Any] = {}
@@ -395,35 +403,63 @@ class Bitrix:
                         candidates[contact_id] = contact
         return [candidates[key] for key in sort_ids(candidates.keys())]
 
-    def update_owner(self, entity_type: str, entity_id: Any, target_user_id: str) -> Tuple[str, str, str]:
-        methods = {
-            "deal": "crm.deal.update",
-            "company": "crm.company.update",
-            "contact": "crm.contact.update",
-        }
-        method = methods[entity_type]
-        params = [
+    def update_owner_form(self, entity_type: str, entity_id: Any, target_user_id: str) -> Dict[str, Any]:
+        method = ENTITY_METHODS[entity_type]["update"]
+        return self.call_form_full(method, [
             ("id", normalize_id(entity_id)),
             ("fields[ASSIGNED_BY_ID]", normalize_id(target_user_id)),
             ("params[REGISTER_SONET_EVENT]", "N"),
-        ]
-        payload = self.call_form_full(method, params)
-        update_result = json.dumps(payload.get("result"), ensure_ascii=False)[:300]
+        ])
 
-        verified_owner_id = self.get_entity_owner(entity_type, entity_id)
-        verified_after_delay = verified_owner_id
-        if verified_owner_id == target_user_id:
-            # Catch immediate Bitrix robots/business processes that roll the owner back.
-            time.sleep(3)
-            verified_after_delay = self.get_entity_owner(entity_type, entity_id)
+    def update_owner_json(self, entity_type: str, entity_id: Any, target_user_id: str) -> Dict[str, Any]:
+        method = ENTITY_METHODS[entity_type]["update"]
+        return self.call_json_full(method, {
+            "id": normalize_id(entity_id),
+            "fields": {"ASSIGNED_BY_ID": normalize_id(target_user_id)},
+            "params": {"REGISTER_SONET_EVENT": "N"},
+        })
 
-        if verified_owner_id != target_user_id or verified_after_delay != target_user_id:
+    def force_update_owner(self, entity_type: str, entity_id: Any, target_user_id: str, *, verify_delay_seconds: int = 5) -> Tuple[str, str, str, str, str]:
+        """Use the proven one-entity diagnostic write path for package reassignment.
+
+        First tries form-data fields[ASSIGNED_BY_ID], then falls back to JSON only
+        if form-data did not actually change the owner. Returns:
+        form_result, json_result, owner_after_form, owner_after_json, owner_after_delay.
+        """
+        entity_type = s(entity_type).lower()
+        if entity_type not in ENTITY_METHODS:
+            raise ValueError(f"Unsupported entity_type={entity_type!r}")
+        target_user_id = normalize_id(target_user_id)
+        form_payload = self.update_owner_form(entity_type, entity_id, target_user_id)
+        form_result = json.dumps(form_payload.get("result"), ensure_ascii=False)[:500]
+        time.sleep(1)
+        after_form = self.get_entity_owner(entity_type, entity_id)
+
+        json_result = ""
+        after_json = after_form
+        if after_form != target_user_id:
+            json_payload = self.update_owner_json(entity_type, entity_id, target_user_id)
+            json_result = json.dumps(json_payload.get("result"), ensure_ascii=False)[:500]
+            time.sleep(1)
+            after_json = self.get_entity_owner(entity_type, entity_id)
+
+        if verify_delay_seconds > 0:
+            time.sleep(verify_delay_seconds)
+        after_delay = self.get_entity_owner(entity_type, entity_id)
+
+        if after_delay != target_user_id:
+            if after_form == target_user_id or after_json == target_user_id:
+                status = "changed_then_rolled_back"
+            else:
+                status = "update_accepted_but_owner_not_changed"
+            method = ENTITY_METHODS[entity_type]["update"]
             raise BitrixError(
-                f"{method}: update_result={update_result}; "
-                f"ASSIGNED_BY_ID immediate={verified_owner_id!r}, after_3s={verified_after_delay!r}; "
-                f"expected {target_user_id!r}"
+                f"{method}: {status}; form_result={form_result}; json_result={json_result}; "
+                f"after_form={after_form!r}; after_json={after_json!r}; after_delay={after_delay!r}; "
+                f"expected={target_user_id!r}"
             )
-        return update_result, verified_owner_id, verified_after_delay
+        return form_result, json_result, after_form, after_json, after_delay
+
 
 
 def deal_director_match(
@@ -575,6 +611,7 @@ def action_row(
         "entity_id": entity_id,
         "entity_title": entity_title(entity_type, entity),
         "from_owner_id": current_owner_id,
+        "from_owner_id_live": "",
         "to_owner_id": target_user_id,
         "to_owner_name": target_user_name,
         "matched_director_name": evidence.matched_name,
@@ -589,8 +626,10 @@ def action_row(
         "url_hint": crm_url_hint(entity_type, entity_id, portal_base_url),
         "update_transport": "form-data fields[ASSIGNED_BY_ID]",
         "update_result": "",
+        "json_update_result": "",
         "verified_owner_id": "",
-        "verified_owner_id_after_3s": "",
+        "verified_owner_id_after_json": "",
+        "verified_owner_id_after_delay": "",
         "error": "",
     }
 
@@ -620,6 +659,7 @@ def run(args: argparse.Namespace) -> int:
     fail_if_no_deals = parse_bool(args.fail_if_no_deals, default=False)
     max_deals = parse_int(args.max_deals, "max_deals", default=0)
     max_companies = parse_int(args.max_companies, "max_companies", default=0)
+    verify_delay_seconds = max(0, parse_int(args.verify_delay_seconds, "verify_delay_seconds", default=5))
     timeout = parse_int(os.getenv("REQUEST_TIMEOUT", "60"), "REQUEST_TIMEOUT", default=60)
     portal_base_url = s(args.portal_base_url or os.getenv("BITRIX_PORTAL_URL", ""))
 
@@ -632,6 +672,7 @@ def run(args: argparse.Namespace) -> int:
         "target_user_id": target_user_id,
         "target_user_name": target_user_name,
         "only_eqazyna": only_eqazyna,
+        "verify_delay_seconds": verify_delay_seconds,
     }, ensure_ascii=False))
 
     package = build_package_selection(
@@ -677,14 +718,33 @@ def run(args: argparse.Namespace) -> int:
                 evidence=evidence,
                 portal_base_url=portal_base_url,
             )
-            if row["action"] in {"skip_already_target_owner", "dry_run_update"}:
-                rows.append(row)
-                continue
             try:
-                update_result, verified_owner_id, verified_after_delay = bx.update_owner(entity_type, entity_id, target_user_id)
-                row["update_result"] = update_result
-                row["verified_owner_id"] = verified_owner_id
-                row["verified_owner_id_after_3s"] = verified_after_delay
+                live_owner_id = bx.get_entity_owner(entity_type, entity_id)
+                row["from_owner_id_live"] = live_owner_id
+                if live_owner_id == target_user_id:
+                    row["action"] = "skip_already_target_owner"
+                    row["verified_owner_id"] = live_owner_id
+                    row["verified_owner_id_after_json"] = live_owner_id
+                    row["verified_owner_id_after_delay"] = live_owner_id
+                    rows.append(row)
+                    continue
+                if dry_run:
+                    row["action"] = "dry_run_update"
+                    rows.append(row)
+                    continue
+
+                row["action"] = "updated"
+                form_result, json_result, after_form, after_json, after_delay = bx.force_update_owner(
+                    entity_type,
+                    entity_id,
+                    target_user_id,
+                    verify_delay_seconds=verify_delay_seconds,
+                )
+                row["update_result"] = form_result
+                row["json_update_result"] = json_result
+                row["verified_owner_id"] = after_form
+                row["verified_owner_id_after_json"] = after_json
+                row["verified_owner_id_after_delay"] = after_delay
                 updated += 1
             except Exception as exc:  # noqa: BLE001
                 row["action"] = "update_error"
@@ -693,10 +753,11 @@ def run(args: argparse.Namespace) -> int:
             rows.append(row)
 
     fields = [
-        "action", "entity_type", "entity_id", "entity_title", "from_owner_id", "to_owner_id", "to_owner_name",
-        "matched_director_name", "match_source", "company_id", "contact_id", "category_id", "stage_id", "closed",
-        "originator_id", "origin_id", "url_hint", "update_transport", "update_result",
-        "verified_owner_id", "verified_owner_id_after_3s", "error",
+        "action", "entity_type", "entity_id", "entity_title", "from_owner_id", "from_owner_id_live",
+        "to_owner_id", "to_owner_name", "matched_director_name", "match_source", "company_id", "contact_id",
+        "category_id", "stage_id", "closed", "originator_id", "origin_id", "url_hint", "update_transport",
+        "update_result", "json_update_result", "verified_owner_id", "verified_owner_id_after_json",
+        "verified_owner_id_after_delay", "error",
     ]
     write_csv(args.out, rows, fields)
     write_json(args.json_out, {
@@ -714,6 +775,7 @@ def run(args: argparse.Namespace) -> int:
         "action_rows": len(rows),
         "updated": updated,
         "errors": errors,
+        "verify_delay_seconds": verify_delay_seconds,
         "out": args.out,
         "json_out": args.json_out,
     })
@@ -732,6 +794,7 @@ def run(args: argparse.Namespace) -> int:
         "action_rows": len(rows),
         "updated": updated,
         "errors": errors,
+        "verify_delay_seconds": verify_delay_seconds,
         "out": args.out,
         "json_out": args.json_out,
     }, ensure_ascii=False, indent=2))
@@ -757,6 +820,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fail-if-no-deals", default="false", help="true = fail when only company/contact matched but no deal was found")
     parser.add_argument("--max-deals", default="0", help="Safety scan limit for deals. 0 = no limit")
     parser.add_argument("--max-companies", default="0", help="Safety scan limit for companies. 0 = no limit")
+    parser.add_argument("--verify-delay-seconds", default="5", help="Seconds to wait before final owner verification after write")
     parser.add_argument("--portal-base-url", default="https://b24-izmquv.bitrix24.kz")
     parser.add_argument("--out", default="exports/reassign_director_package_owner_log.csv")
     parser.add_argument("--json-out", default="exports/reassign_director_package_owner_summary.json")
