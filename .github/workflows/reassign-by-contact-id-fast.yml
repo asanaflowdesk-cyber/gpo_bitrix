@@ -1,0 +1,108 @@
+name: Reassign package by contact ID FAST
+
+run-name: >-
+  FAST reassign contact #${{ inputs.contact_id }} → user ${{ inputs.target_user_id }} / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      contact_id:
+        description: "ID контакта учредителя/руководителя в Bitrix"
+        required: true
+        default: ""
+      target_user_id:
+        description: "ID нового ответственного пользователя Bitrix"
+        required: true
+        default: ""
+      dry_run:
+        description: "Тест без записи в Bitrix"
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+      deal_originator_id:
+        description: "Фильтр сделок по ORIGINATOR_ID. Для e-Qazyna оставьте EQAZYNA. Пусто = все сделки."
+        required: false
+        default: "EQAZYNA"
+      include_closed_deals:
+        description: "Переносить закрытые/проваленные сделки"
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+      reassign_source_contact:
+        description: "Переносить сам контакт-источник"
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  reassign-by-contact-id-fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+      REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests; fi
+
+      - name: Reassign package by contact ID FAST
+        run: |
+          mkdir -p exports
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "MODE: DRY_RUN — Bitrix will not be changed"
+          else
+            echo "MODE: WRITE — Bitrix update methods will be called"
+          fi
+
+          python -m eqazyna_bitrix.reassign_by_contact_id_fast \
+            --contact-id "${{ inputs.contact_id }}" \
+            --target-user-id "${{ inputs.target_user_id }}" \
+            --dry-run "${{ inputs.dry_run }}" \
+            --deal-originator-id "${{ inputs.deal_originator_id }}" \
+            --include-closed-deals "${{ inputs.include_closed_deals }}" \
+            --reassign-source-contact "${{ inputs.reassign_source_contact }}" \
+            --out "exports/reassign_by_contact_id_fast_log.csv" \
+            --json-out "exports/reassign_by_contact_id_fast_summary.json"
+
+          ls -lah exports
+          echo "---- summary ----"
+          cat exports/reassign_by_contact_id_fast_summary.json || true
+
+      - name: Upload FAST reassign log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reassign-by-contact-id-fast-log
+          path: |
+            exports/reassign_by_contact_id_fast_log.csv
+            exports/reassign_by_contact_id_fast_summary.json
+          if-no-files-found: ignore
+          retention-days: 14
