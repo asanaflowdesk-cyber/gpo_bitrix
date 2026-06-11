@@ -86,7 +86,7 @@ jobs:
             echo "MODE: WRITE — Bitrix update methods will be called"
           fi
 
-          python -m eqazyna_bitrix.reassign_by_contact_id \
+          python -m eqazyna_bitrix.reassign_director_package_owner \
             --contact-id "${{ inputs.contact_id }}" \
             --target-user-id "${{ inputs.target_user_id }}" \
             --dry-run "${{ inputs.dry_run }}" \
