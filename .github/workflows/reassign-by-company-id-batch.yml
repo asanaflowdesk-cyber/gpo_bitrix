@@ -1,0 +1,145 @@
+name: Reassign company package by company ID
+
+run-name: >-
+  Company #${{ inputs.company_id }} → user ${{ inputs.target_user_id }} / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      company_id:
+        description: "ID компании в Bitrix"
+        required: true
+        default: ""
+      founder_contact_id:
+        description: "ID контакта учредителя, в таймлайн которого добавить служебный комментарий"
+        required: true
+        default: ""
+      target_user_id:
+        description: "ID нового ответственного пользователя Bitrix"
+        required: true
+        default: ""
+      dry_run:
+        description: "Тест без записи в Bitrix"
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+      exclude_company_ids:
+        description: "ID компаний-исключений через запятую. Обычно пусто; можно указать исходную компанию, чтобы не менять её."
+        required: false
+        default: ""
+      exclude_deal_ids:
+        description: "ID сделок-исключений через запятую"
+        required: false
+        default: ""
+      exclude_contact_ids:
+        description: "ID контактов-исключений через запятую"
+        required: false
+        default: ""
+      deal_originator_id:
+        description: "Фильтр сделок ORIGINATOR_ID. Пусто = все сделки компании; EQAZYNA = только e-Qazyna."
+        required: false
+        default: ""
+      include_closed_deals:
+        description: "Переносить закрытые и проваленные сделки"
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+      include_deal_contacts:
+        description: "Переносить контакты, связанные со сделками компании"
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+      verify:
+        description: "Проверить ответственных одним batch-запросом после записи"
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+      add_timeline_comment:
+        description: "Добавить служебный комментарий в таймлайн карточки учредителя"
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  reassign-company-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+      REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Reassign company package
+        run: |
+          set -euo pipefail
+          mkdir -p exports
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "MODE: DRY_RUN — Bitrix will not be changed"
+          else
+            echo "MODE: WRITE — Bitrix batch update will be called"
+          fi
+
+          python -m eqazyna_bitrix.reassign_by_company_id_batch \
+            --company-id "${{ inputs.company_id }}" \
+            --founder-contact-id "${{ inputs.founder_contact_id }}" \
+            --target-user-id "${{ inputs.target_user_id }}" \
+            --dry-run "${{ inputs.dry_run }}" \
+            --exclude-company-ids "${{ inputs.exclude_company_ids }}" \
+            --exclude-deal-ids "${{ inputs.exclude_deal_ids }}" \
+            --exclude-contact-ids "${{ inputs.exclude_contact_ids }}" \
+            --deal-originator-id "${{ inputs.deal_originator_id }}" \
+            --include-closed-deals "${{ inputs.include_closed_deals }}" \
+            --include-deal-contacts "${{ inputs.include_deal_contacts }}" \
+            --verify "${{ inputs.verify }}" \
+            --add-timeline-comment "${{ inputs.add_timeline_comment }}" \
+            --out "exports/reassign_by_company_id_batch_log.csv" \
+            --json-out "exports/reassign_by_company_id_batch_summary.json"
+
+          cat exports/reassign_by_company_id_batch_summary.json
+
+      - name: Upload reassignment log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reassign-by-company-id-batch-log
+          path: |
+            exports/reassign_by_company_id_batch_log.csv
+            exports/reassign_by_company_id_batch_summary.json
+          if-no-files-found: ignore
+          retention-days: 14

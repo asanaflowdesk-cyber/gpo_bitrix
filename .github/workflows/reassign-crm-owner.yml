@@ -1,0 +1,165 @@
+name: Reassign CRM owner
+
+run-name: >-
+  Reassign CRM owner / ${{ inputs.source_user_id }} → ${{ inputs.target_user_id }} / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_user_id:
+        description: "ID старого ответственного"
+        required: true
+        default: "36"
+      target_user_id:
+        description: "ID нового ответственного"
+        required: true
+        default: ""
+      dry_run:
+        description: "Тест без записи в Bitrix"
+        required: true
+        default: "true"
+      include_companies:
+        description: "Переносить компании / клиентов"
+        required: true
+        default: "true"
+      include_contacts:
+        description: "Переносить контакты"
+        required: true
+        default: "true"
+      include_leads:
+        description: "Переносить лиды"
+        required: true
+        default: "false"
+      include_deals:
+        description: "Переносить сделки / заявки"
+        required: true
+        default: "true"
+      include_closed_deals:
+        description: "Если include_deals=true, переносить закрытые сделки тоже"
+        required: true
+        default: "false"
+      deal_category_id:
+        description: "Воронка сделок. all = все"
+        required: true
+        default: "all"
+      deal_stage_ids:
+        description: "Исходные стадии сделок через запятую. all = все. Например NEW,EXECUTING"
+        required: true
+        default: "NEW"
+      lead_status_ids:
+        description: "Статусы лидов через запятую. all = все"
+        required: true
+        default: "all"
+      target_deal_stage_id:
+        description: "Новая стадия для выбранных сделок. Пусто = не менять. Например LOSE"
+        required: false
+        default: ""
+      failure_reason_field:
+        description: "Поле причины неудачи. Пусто = UF_CRM_1779448756033 при выборе failure_reason_id"
+        required: false
+        default: ""
+      failure_reason_id:
+        description: "CloseReasonID: 400 дубль, 394 отказ, 402 неактивна, 386 не дозвонились, 396 не подходит, 392 нет данных, 398 ошибка, 404 проиграли, 390 Евразия, 388 конкурент"
+        required: true
+        type: choice
+        default: "none"
+        options:
+          - "none"
+          - "400"
+          - "394"
+          - "402"
+          - "386"
+          - "396"
+          - "392"
+          - "398"
+          - "404"
+          - "390"
+          - "388"
+      failure_reason_text:
+        description: "Редкое ручное значение вместо failure_reason_id. Обычно оставить пустым"
+        required: false
+        default: ""
+      filter_company_contact_by_deal_stage:
+        description: "Для компаний/контактов брать только связанные со сделками в выбранной стадии"
+        required: true
+        default: "true"
+      limit:
+        description: "Лимит на каждый тип сущности. 0 = без лимита"
+        required: true
+        default: "0"
+      max_total:
+        description: "Лимит. Если include_deals=true — это лимит сделок; связанные клиенты/контакты не считаются. 0 = без лимита"
+        required: true
+        default: "20"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  reassign-crm-owner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+      REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Reassign CRM owner
+        run: |
+          mkdir -p exports
+
+          ARGS=(
+            python -m eqazyna_bitrix.reassign_crm_owner
+            --source-user-id "${{ inputs.source_user_id }}"
+            --target-user-id "${{ inputs.target_user_id }}"
+            --include-companies "${{ inputs.include_companies }}"
+            --include-contacts "${{ inputs.include_contacts }}"
+            --include-leads "${{ inputs.include_leads }}"
+            --include-deals "${{ inputs.include_deals }}"
+            --include-closed-deals "${{ inputs.include_closed_deals }}"
+            --deal-category-id "${{ inputs.deal_category_id }}"
+            --deal-stage-ids "${{ inputs.deal_stage_ids }}"
+            --lead-status-ids "${{ inputs.lead_status_ids }}"
+            --target-deal-stage-id "${{ inputs.target_deal_stage_id }}"
+            --failure-reason-field "${{ inputs.failure_reason_field }}"
+            --failure-reason-id "${{ inputs.failure_reason_id }}"
+            --failure-reason-text "${{ inputs.failure_reason_text }}"
+            --filter-company-contact-by-deal-stage "${{ inputs.filter_company_contact_by_deal_stage }}"
+            --limit "${{ inputs.limit }}"
+            --max-total "${{ inputs.max_total }}"
+            --out "exports/reassign_crm_owner_log.csv"
+          )
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+
+          "${ARGS[@]}"
+          ls -lah exports
+
+      - name: Upload reassignment log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reassign-crm-owner-log
+          path: exports/*.csv
+          if-no-files-found: ignore
+          retention-days: 14
