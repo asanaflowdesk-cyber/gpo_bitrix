@@ -1,6 +1,0 @@
-Удалить из репозитория два устаревших файла:
-
-docs/REASSIGN_DIRECTOR_PACKAGE_OWNER_RUNBOOK.md
-tests/test_reassign_director_package_owner.py
-
-Они относятся к уже отсутствующему модулю reassign_director_package_owner.py.
