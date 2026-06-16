@@ -25,12 +25,8 @@ managers:
     branch: Усть-Каменогорский филиал и отделение УК
     active: true
 
-  # Актауский филиал
-  - id: 116
-    name: Zhanadil Nyssanov
-    branch_id: 34
-    branch: Актауский филиал
-    active: true
+  # Актауский филиал   
+  #- id: 116    name: Zhanadil Nyssanov    branch_id: 34    branch: Актауский филиал    active: true
 
   # Павлодарский филиал
   - id: 110
@@ -39,36 +35,16 @@ managers:
     branch: Павлодарский филиал
     active: true
 
-  # Центральный Столичный филиал
-  - id: 92
-    name: Владислав Тян
-    branch_id: 22
-    branch: Центральный Столичный филиал
-    active: true
-  - id: 108
-    name: Юлия Боровая
-    branch_id: 22
-    branch: Центральный Столичный филиал
-    active: true
+  # Центральный Столичный филиал  
+  #- id: 92    name: Владислав Тян    branch_id: 22    branch: Центральный Столичный филиал    active: true  
+  #- id: 108    name: Юлия Боровая    branch_id: 22    branch: Центральный Столичный филиал    active: true
 
   # Астанинский филиал
-  - id: 104
-    name: Асемгуль Салыкова
-    branch_id: 24
-    branch: Астанинский филиал
-    active: true
+  #- id: 104     name: Асемгуль Салыкова    branch_id: 24    branch: Астанинский филиал    active: true
 
   # Астанинский филиал 2
-  - id: 94     
-    name: Марат Шалбаев    
-    branch_id: 26    
-    branch: Астанинский филиал 2    
-    active: true
-  - id: 114
-    name: ASSANOVA AISULU
-    branch_id: 26
-    branch: Астанинский филиал 2
-    active: true
+  #- id: 94     name: Марат Шалбаев      branch_id: 26    branch: Астанинский филиал 2    active: true
+  #- id: 114    name: ASSANOVA AISULU    branch_id: 26    branch: Астанинский филиал 2    active: true
 
   # Атырауский филиал
   #- id: 90     name: Асхат Шамар    branch_id: 28    branch: Атырауский филиал    active: true
