@@ -19,12 +19,12 @@ managers:
   # Усть-Каменогорский филиал и отделение УК
   #- id: 70    name: Ольга Скребцова    branch_id: 20    branch: Усть-Каменогорский филиал и отделение УК    active: true
 
-  # Актауский филиал   
-  #- id: 116    name: Zhanadil Nyssanov    branch_id: 34    branch: Актауский филиал    active: true
-
   # Павлодарский филиал
   #- id: 110    name: Казрахметова Алия    branch_id: 32    branch: Павлодарский филиал    active: true
 
+  # Актауский филиал   
+  #- id: 116    name: Zhanadil Nyssanov    branch_id: 34    branch: Актауский филиал    active: true
+  
   # Центральный Столичный филиал  
   #- id: 92    name: Владислав Тян    branch_id: 22    branch: Центральный Столичный филиал    active: true  
   #- id: 108    name: Юлия Боровая    branch_id: 22    branch: Центральный Столичный филиал    active: true
