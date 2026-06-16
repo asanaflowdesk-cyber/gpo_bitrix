@@ -50,6 +50,14 @@ on:
           - "true"
           - "false"
         default: "true"
+      add_timeline_comment:
+        description: "Добавить служебный комментарий в таймлайн карточки учредителя"
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
 
 permissions:
   contents: read
@@ -98,6 +106,7 @@ jobs:
             --include-closed-deals "${{ inputs.include_closed_deals }}" \
             --reassign-source-contact "${{ inputs.reassign_source_contact }}" \
             --verify "${{ inputs.verify }}" \
+            --add-timeline-comment "${{ inputs.add_timeline_comment }}" \
             --out "exports/reassign_by_contact_id_batch_log.csv" \
             --json-out "exports/reassign_by_contact_id_batch_summary.json"
 
