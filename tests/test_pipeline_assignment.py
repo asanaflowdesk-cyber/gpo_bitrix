@@ -464,9 +464,10 @@ def test_default_assignment_load_counts_only_new_and_in_work():
 
 
 def test_lowest_loaded_owner_is_deterministic_and_prefers_real_minimum():
+    expected_target = ALLOWED_USER_IDS[-1]
     deals = []
     for user_id in ALLOWED_USER_IDS:
-        if user_id == 116:
+        if user_id == expected_target:
             continue
         deals.append({"ID": str(user_id), "ASSIGNED_BY_ID": str(user_id), "STAGE_ID": "NEW", "CLOSED": "N"})
     pipe = BitrixPipeline(
@@ -476,5 +477,5 @@ def test_lowest_loaded_owner_is_deterministic_and_prefers_real_minimum():
 
     target, reason = pipe._lowest_loaded_owner_from_current_load()
 
-    assert target == 116
+    assert target == expected_target
     assert reason == "lowest_active_deal_load_new_director"

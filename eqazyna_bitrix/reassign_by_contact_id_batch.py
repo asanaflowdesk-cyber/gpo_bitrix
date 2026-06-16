@@ -140,7 +140,43 @@ class Bitrix:
         active = text(user.get("ACTIVE")).lower()
         if active in {"false", "n", "0", "нет"}:
             raise ValueError(f"target_user_id={user_id} is inactive")
-        return " ".join(text(x) for x in [user.get("LAST_NAME"), user.get("NAME"), user.get("SECOND_NAME")] if text(x)).strip() or text(user.get("EMAIL")) or f"ID {user_id}"
+        return self._user_label(user_id, user)
+
+    @staticmethod
+    def _user_label(user_id: str, user: Dict[str, Any]) -> str:
+        name = " ".join(
+            text(value)
+            for value in [user.get("LAST_NAME"), user.get("NAME"), user.get("SECOND_NAME")]
+            if text(value)
+        ).strip()
+        return name or text(user.get("EMAIL")) or f"ID {user_id}"
+
+    def get_user_labels(self, user_ids: Iterable[str]) -> Dict[str, str]:
+        labels: Dict[str, str] = {}
+        for user_id in sorted({norm_id(value) for value in user_ids if norm_id(value)}, key=lambda value: int(value)):
+            try:
+                result = self.call_json("user.get", {"ID": user_id})
+                user = dict(result[0]) if isinstance(result, list) and result else {}
+                labels[user_id] = self._user_label(user_id, user) if user else f"ID {user_id}"
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARN: user.get failed for user #{user_id}: {exc}")
+                labels[user_id] = f"ID {user_id}"
+        return labels
+
+    def add_contact_timeline_comment(self, contact_id: str, comment: str) -> str:
+        result = self.call_json(
+            "crm.timeline.comment.add",
+            {
+                "fields": {
+                    "ENTITY_ID": int(contact_id),
+                    "ENTITY_TYPE": "contact",
+                    "COMMENT": comment,
+                }
+            },
+        )
+        if result in (None, "", False):
+            raise BitrixError(f"crm.timeline.comment.add returned empty result for contact #{contact_id}")
+        return str(result)
 
     def get_contact(self, contact_id: str) -> Dict[str, Any]:
         result = self.call_json("crm.contact.get", {"id": contact_id})
@@ -333,6 +369,47 @@ def make_row(entity_type: str, entity: Dict[str, Any], relation: str, target_use
     }
 
 
+def build_reassignment_comment(
+    rows: List[Dict[str, Any]],
+    contact_id: str,
+    source_contact_owner_id: str,
+    target_user_id: str,
+    target_user_name: str,
+    user_labels: Dict[str, str],
+) -> str:
+    moved_statuses = {"owner_changed_and_verified", "update_sent_not_verified"}
+    moved_rows = [row for row in rows if text(row.get("action_status")) in moved_statuses]
+
+    counts = {"company": 0, "deal": 0, "contact": 0}
+    for row in moved_rows:
+        entity_type = text(row.get("entity_type"))
+        if entity_type in counts:
+            counts[entity_type] += 1
+
+    previous_owner_ids = sorted(
+        {norm_id(row.get("before_owner_id")) for row in moved_rows if norm_id(row.get("before_owner_id"))},
+        key=lambda value: int(value),
+    )
+
+    def label(user_id: str) -> str:
+        if not user_id:
+            return "не указан"
+        return f"{user_labels.get(user_id, f'ID {user_id}')} (ID {user_id})"
+
+    previous_owners = ", ".join(label(user_id) for user_id in previous_owner_ids) or "не указаны"
+    source_owner = label(source_contact_owner_id)
+
+    return (
+        "Служебная отметка о перераспределении.\n\n"
+        "Пакет учредителя переназначен вручную с другого ответственного.\n"
+        f"Ответственный карточки учредителя до запуска: {source_owner}.\n"
+        f"Предыдущие ответственные связанных элементов: {previous_owners}.\n"
+        f"Новый ответственный: {target_user_name} (ID {target_user_id}).\n\n"
+        f"Перенесено: компаний — {counts['company']}, сделок — {counts['deal']}, контактов — {counts['contact']}.\n"
+        f"Основание: административное перераспределение по контакту #{contact_id}."
+    )
+
+
 def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     fields = [
@@ -347,7 +424,14 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
             writer.writerow({k: row.get(k, "") for k in fields})
 
 
-def make_summary(rows: List[Dict[str, Any]], contact_id: str, target_user_id: str, target_user_name: str, dry_run: bool) -> Dict[str, Any]:
+def make_summary(
+    rows: List[Dict[str, Any]],
+    contact_id: str,
+    target_user_id: str,
+    target_user_name: str,
+    dry_run: bool,
+    timeline_comment: Dict[str, Any],
+) -> Dict[str, Any]:
     by_type: Dict[str, int] = {}
     by_status: Dict[str, int] = {}
     for row in rows:
@@ -365,6 +449,7 @@ def make_summary(rows: List[Dict[str, Any]], contact_id: str, target_user_id: st
         "total_rows": len(rows),
         "by_type": by_type,
         "by_status": by_status,
+        "timeline_comment": timeline_comment,
         "errors": errors[:100],
     }
 
@@ -378,6 +463,7 @@ def main() -> int:
     parser.add_argument("--include-closed-deals", default="true")
     parser.add_argument("--reassign-source-contact", default="true")
     parser.add_argument("--verify", default="true", help="Quick batch verification after write. No delay.")
+    parser.add_argument("--add-timeline-comment", default="true")
     parser.add_argument("--max-list-pages", default="20")
     parser.add_argument("--out", default="exports/reassign_by_contact_id_batch_log.csv")
     parser.add_argument("--json-out", default="exports/reassign_by_contact_id_batch_summary.json")
@@ -389,6 +475,7 @@ def main() -> int:
     include_closed_deals = parse_bool(args.include_closed_deals, default=True)
     reassign_source_contact = parse_bool(args.reassign_source_contact, default=True)
     verify = parse_bool(args.verify, default=True)
+    add_timeline_comment = parse_bool(args.add_timeline_comment, default=True)
     deal_originator_id = text(args.deal_originator_id)
     max_list_pages = int(args.max_list_pages)
 
@@ -434,19 +521,64 @@ def main() -> int:
 
     print(f"DISCOVERED: contacts={sum(1 for r in rows if r.get('entity_type') == 'contact')}, companies={sum(1 for r in rows if r.get('entity_type') == 'company')}, deals={sum(1 for r in rows if r.get('entity_type') == 'deal')}, total={len(rows)}")
 
+    timeline_comment: Dict[str, Any] = {
+        "contact_id": contact_id,
+        "enabled": add_timeline_comment,
+        "status": "dry_run_not_added" if dry_run else "not_attempted",
+        "comment_id": "",
+        "error": "",
+    }
+
     if dry_run:
         for row in rows:
             row["action_status"] = "dry_run_planned"
             row["final_owner_id"] = row.get("before_owner_id", "")
     else:
         bx.batch_update_owners(rows, target_user_id, verify=verify)
+        moved_statuses = {"owner_changed_and_verified", "update_sent_not_verified"}
+        moved_rows = [row for row in rows if text(row.get("action_status")) in moved_statuses]
+        if not add_timeline_comment:
+            timeline_comment["status"] = "disabled"
+        elif not moved_rows:
+            timeline_comment["status"] = "skipped_no_owner_changes"
+        else:
+            previous_owner_ids = {
+                norm_id(row.get("before_owner_id"))
+                for row in moved_rows
+                if norm_id(row.get("before_owner_id"))
+            }
+            source_contact_owner_id = norm_id(contact.get("ASSIGNED_BY_ID"))
+            if source_contact_owner_id:
+                previous_owner_ids.add(source_contact_owner_id)
+            user_labels = bx.get_user_labels(previous_owner_ids)
+            comment_text = build_reassignment_comment(
+                rows=rows,
+                contact_id=contact_id,
+                source_contact_owner_id=source_contact_owner_id,
+                target_user_id=target_user_id,
+                target_user_name=target_user_name,
+                user_labels=user_labels,
+            )
+            try:
+                timeline_comment["comment_id"] = bx.add_contact_timeline_comment(contact_id, comment_text)
+                timeline_comment["status"] = "added"
+            except Exception as exc:  # noqa: BLE001
+                timeline_comment["status"] = "failed"
+                timeline_comment["error"] = str(exc)[:2000]
 
     write_csv(args.out, rows)
-    payload = make_summary(rows, contact_id, target_user_id, target_user_name, dry_run)
+    payload = make_summary(
+        rows,
+        contact_id,
+        target_user_id,
+        target_user_name,
+        dry_run,
+        timeline_comment,
+    )
     Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.json_out).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 1 if payload.get("errors") else 0
+    return 1 if payload.get("errors") or timeline_comment.get("error") else 0
 
 
 if __name__ == "__main__":

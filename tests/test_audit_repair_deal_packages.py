@@ -1,22 +1,21 @@
-from eqazyna_bitrix.audit_repair_deal_packages import initial_active_deal_load
+from eqazyna_bitrix.audit_repair_deal_packages import choose_target, initial_active_deal_load
 from eqazyna_bitrix.config.assignment import parse_stage_ids
+from eqazyna_bitrix.distribute_companies import ALLOWED_USER_IDS
 
 
 def test_audit_active_deal_load_uses_configured_stages_only():
+    manager_id = ALLOWED_USER_IDS[0]
     records = [
-        {"entity_type": "deal", "owner_id": 70, "stage_id": "NEW", "closed": False},
-        {"entity_type": "deal", "owner_id": 70, "stage_id": "C2:EXECUTING", "closed": False},
-        {"entity_type": "deal", "owner_id": 70, "stage_id": "PREPARATION", "closed": False},
-        {"entity_type": "deal", "owner_id": 70, "stage_id": "LOSE", "closed": True},
-        {"entity_type": "company", "owner_id": 70, "stage_id": "NEW", "closed": False},
+        {"entity_type": "deal", "owner_id": manager_id, "stage_id": "NEW", "closed": False},
+        {"entity_type": "deal", "owner_id": manager_id, "stage_id": "C2:EXECUTING", "closed": False},
+        {"entity_type": "deal", "owner_id": manager_id, "stage_id": "PREPARATION", "closed": False},
+        {"entity_type": "deal", "owner_id": manager_id, "stage_id": "LOSE", "closed": True},
+        {"entity_type": "company", "owner_id": manager_id, "stage_id": "NEW", "closed": False},
     ]
 
     load = initial_active_deal_load(records, parse_stage_ids("NEW,EXECUTING"))
 
-    assert load[70] == 2
-
-from eqazyna_bitrix.audit_repair_deal_packages import choose_target
-from eqazyna_bitrix.distribute_companies import ALLOWED_USER_IDS
+    assert load[manager_id] == 2
 
 
 def test_audit_choose_target_uses_deal_history_over_limits():
@@ -55,7 +54,7 @@ def test_audit_choose_target_ignores_company_owner_without_deal_history():
     ]
     client_load = {user_id: 0 for user_id in ALLOWED_USER_IDS}
     active_deal_load = {user_id: 0 for user_id in ALLOWED_USER_IDS}
-    active_deal_load[70] = 5
+    active_deal_load[74] = 5
 
     target, reason, debug = choose_target(records, client_load, active_deal_load, {36, 44}, 0, 30)
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -44,6 +46,7 @@ def check_workflows() -> None:
     if not workflow_files:
         fail("no workflow yaml files found")
 
+    workflow_modules: set[str] = set()
     for path in workflow_files:
         data = read_yaml(path)
         if not isinstance(data, dict):
@@ -52,6 +55,14 @@ def check_workflows() -> None:
         has_on = "on" in data or True in data
         if "name" not in data or not has_on or "jobs" not in data:
             fail(f"workflow misses name/on/jobs: {path.relative_to(ROOT)}")
+        raw = path.read_text(encoding="utf-8")
+        workflow_modules.update(re.findall(r"python(?:3)?\s+-m\s+(eqazyna_bitrix(?:\.[A-Za-z_][A-Za-z0-9_]*)+)", raw))
+
+    for module_name in sorted(workflow_modules):
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001
+            fail(f"workflow references broken Python module {module_name}: {exc}")
 
 
 def check_configs() -> None:
