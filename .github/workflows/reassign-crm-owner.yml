@@ -18,7 +18,7 @@ on:
         description: "Режим: сначала true, после проверки false"
         required: true
         type: choice
-        default: "true"
+        default: "False"
         options:
           - "true"
           - "false"
