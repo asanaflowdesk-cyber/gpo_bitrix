@@ -50,11 +50,7 @@ managers:
     branch: Талдыкорган
     active: true
 
-  - id: 80
-    name: Чернышов Роман
-    branch_id: 18
-    branch: Талдыкорган
-    active: true
+  #- id: 80    name: Чернышов Роман    branch_id: 18    branch: Талдыкорган    active: true
 
   # Временно исключены из автоматического распределения
 
