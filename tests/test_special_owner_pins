@@ -1,0 +1,85 @@
+from eqazyna_bitrix.config.special_owner_pins import load_special_owner_pin_config
+from eqazyna_bitrix.models import Application, CompanyEnrichment
+from eqazyna_bitrix.pipeline import BitrixPipeline, BitrixPipelineConfig
+
+
+class FakeClient:
+    def __init__(self, contact=None):
+        self.contact = contact
+
+    def list_all(self, method, payload):
+        return []
+
+    def list_eqazyna_deals(self, *args, **kwargs):
+        return []
+
+    def find_contact_by_fio(self, last_name, name, second_name=""):
+        return self.contact
+
+    def find_contact_by_director_alias(self, director_raw):
+        return self.contact
+
+
+def _app() -> Application:
+    return Application(
+        created_at_raw="2026-05-26",
+        doc_number="123",
+        bin="123456789012",
+        applicant_name="Тестовая компания",
+        doc_type="Заявка на разведку ТПИ",
+        status="Принято",
+        source_url="https://example.test",
+    )
+
+
+def test_special_owner_pins_loaded_for_director_contacts():
+    config = load_special_owner_pin_config()
+
+    assert config.owner_by_contact_id[42] == 54
+    assert config.owner_by_contact_id[178] == 54
+
+
+def test_special_contact_pin_wins_over_load_and_active_manager_list():
+    contact = {
+        "ID": "178",
+        "LAST_NAME": "ТАУШАНОВ",
+        "NAME": "ЕЛДОС",
+        "SECOND_NAME": "КОНИЛЖАЕВИЧ",
+        "ASSIGNED_BY_ID": "54",
+    }
+    pipe = BitrixPipeline(
+        client=FakeClient(contact=contact),  # type: ignore[arg-type]
+        config=BitrixPipelineConfig(assigned_by_id="36"),
+    )
+
+    target, reason = pipe._resolve_target_responsible(
+        _app(),
+        CompanyEnrichment(bin="123456789012", director="ТАУШАНОВ ЕЛДОС КОНИЛЖАЕВИЧ"),
+        None,
+    )
+
+    assert target == 54
+    assert reason == "special_director_contact_pin_178"
+
+
+def test_unpinned_contact_still_uses_regular_distribution():
+    contact = {
+        "ID": "999",
+        "LAST_NAME": "ИВАНОВ",
+        "NAME": "ИВАН",
+        "SECOND_NAME": "ИВАНОВИЧ",
+        "ASSIGNED_BY_ID": "54",
+    }
+    pipe = BitrixPipeline(
+        client=FakeClient(contact=contact),  # type: ignore[arg-type]
+        config=BitrixPipelineConfig(assigned_by_id="36"),
+    )
+
+    target, reason = pipe._resolve_target_responsible(
+        _app(),
+        CompanyEnrichment(bin="123456789012", director="ИВАНОВ ИВАН ИВАНОВИЧ"),
+        None,
+    )
+
+    assert target != 54
+    assert reason in {"lowest_active_deal_load_new_director", "lowest_active_deal_load_limit_expanded"}
