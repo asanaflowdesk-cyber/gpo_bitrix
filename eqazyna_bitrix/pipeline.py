@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from typing import Any, Iterable
 from collections import Counter
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ from .formatter import build_company_summary, build_deal_comment, build_deal_tit
 from .models import Application, CompanyEnrichment, ProcessResult
 from .director import director_identity_key, director_identity_keys, director_keys_match, split_director_fio
 from .config.assignment import DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS, is_assignment_load_deal, parse_stage_ids, stage_id_matches
+from .config.special_owner_pins import load_special_owner_pin_config
 from .distribute_companies import (
     ALLOWED_USER_IDS,
     SOURCE_RESPONSIBLE_IDS,
@@ -19,6 +21,9 @@ from .distribute_companies import (
     _normalize_text,
 )
 
+
+_SPECIAL_OWNER_PIN_CONFIG = load_special_owner_pin_config()
+SPECIAL_OWNER_BY_CONTACT_ID = _SPECIAL_OWNER_PIN_CONFIG.owner_by_contact_id
 
 
 @dataclass(slots=True)
@@ -55,6 +60,7 @@ class BitrixPipeline:
         self.client = client
         self.config = config
         self._director_contact_cache: dict[str, str] = {}
+        self._director_pin_lookup_cache: dict[str, tuple[int | None, str | None, str | None]] = {}
         self._eqazyna_companies_cache: list[dict[str, Any]] | None = None
         self._eqazyna_deals_cache: list[dict[str, Any]] | None = None
         self._failed_deal_by_director_cache: dict[str, FailedDealInheritance | None] = {}
@@ -62,26 +68,34 @@ class BitrixPipeline:
         # while a single parser call processes several e-Qazyna applications.
         self._assignment_cache: dict[str, tuple[int, str]] = {}
         self._projected_load_delta: Counter[int] = Counter()
+        self._manager_load_cache: dict[int, int] | None = None
 
-    def process(self, app: Application, enrichment: CompanyEnrichment) -> ProcessResult:
+    def process(
+        self,
+        app: Application,
+        enrichment: CompanyEnrichment,
+        *,
+        existing_deal_prechecked: bool = False,
+    ) -> ProcessResult:
         if (self.config.crm_mode or "deal").lower() == "lead":
             return self.process_lead(app, enrichment)
         try:
             # Deal origin is the immutable application key. If the application was
             # already loaded earlier, the row is intentionally skipped: no company
             # update, no owner rewrite, no stage rewrite, no contact/requisite work.
-            existing_deal = self.client.find_deal_by_origin(app.application_key)
-            if existing_deal:
-                return ProcessResult(
-                    app,
-                    enrichment,
-                    action="existing_deal_skipped",
-                    company_id=str(existing_deal.get("COMPANY_ID") or "") or None,
-                    deal_id=str(existing_deal.get("ID") or "") or None,
-                    assigned_by_id=self._record_assigned_by_id(existing_deal),
-                    assigned_by_name=self._user_name(self._record_assigned_by_id(existing_deal)),
-                    assignment_reason="existing_deal_no_update",
-                )
+            if not existing_deal_prechecked:
+                existing_deal = self.client.find_deal_by_origin(app.application_key)
+                if existing_deal:
+                    return ProcessResult(
+                        app,
+                        enrichment,
+                        action="existing_deal_skipped",
+                        company_id=str(existing_deal.get("COMPANY_ID") or "") or None,
+                        deal_id=str(existing_deal.get("ID") or "") or None,
+                        assigned_by_id=self._record_assigned_by_id(existing_deal),
+                        assigned_by_name=self._user_name(self._record_assigned_by_id(existing_deal)),
+                        assignment_reason="existing_deal_no_update",
+                    )
 
             company = self.client.find_company_by_origin(app.bin)
             if not company:
@@ -382,7 +396,13 @@ class BitrixPipeline:
             if not self.client:
                 self._eqazyna_deals_cache = []
             else:
-                self._eqazyna_deals_cache = self.client.list_eqazyna_deals()
+                list_method = self.client.list_eqazyna_deals
+                if "reason_fields" in inspect.signature(list_method).parameters:
+                    self._eqazyna_deals_cache = list_method(
+                        reason_fields=self._failed_reason_fields(),
+                    )
+                else:
+                    self._eqazyna_deals_cache = list_method()
         return self._eqazyna_deals_cache
 
     def _historical_sort_key(self, record: dict[str, Any]) -> tuple[datetime, int]:
@@ -450,18 +470,20 @@ class BitrixPipeline:
     def _manager_load(self, user_id: int) -> int:
         """Current e-Qazyna load for soft assignment balancing.
 
-        The 30-deal capacity counts only configured working stages. It does not
-        count agreement, document collection, failed or any other stage outside
-        assignment_load_stage_ids.
+        The load table is built once per parser run. Previously every new
+        director rescanned every e-Qazyna deal once for every active manager.
+        That became needlessly expensive as the CRM history grew.
         """
-        count = 0
-        for deal in self._list_eqazyna_deals_cached():
-            if self._record_assigned_by_id(deal) != user_id:
-                continue
-            if not self._deal_counts_for_assignment_limit(deal):
-                continue
-            count += 1
-        return count
+        if self._manager_load_cache is None:
+            counts: dict[int, int] = {}
+            for deal in self._list_eqazyna_deals_cached():
+                owner_id = self._record_assigned_by_id(deal)
+                if owner_id is None:
+                    continue
+                if self._deal_counts_for_assignment_limit(deal):
+                    counts[owner_id] = counts.get(owner_id, 0) + 1
+            self._manager_load_cache = counts
+        return int(self._manager_load_cache.get(user_id, 0))
 
     def _effective_manager_load(self, user_id: int) -> int:
         return self._manager_load(user_id) + int(self._projected_load_delta.get(user_id, 0))
@@ -490,6 +512,64 @@ class BitrixPipeline:
     def _random_owner_from_current_load(self) -> tuple[int | None, str | None]:
         return self._lowest_loaded_owner_from_current_load()
 
+    def _special_owner_by_director_contact(self, director: str | None) -> tuple[int | None, str | None, str | None]:
+        """Return a manually pinned owner for exceptional director contacts.
+
+        This is an explicit exception layer for cases where a director/founder
+        package must stay with a specific Bitrix user even when that user is not
+        an active distribution manager in managers.yml. It deliberately runs
+        before historical deal ownership and before load balancing.
+        """
+        if not SPECIAL_OWNER_BY_CONTACT_ID:
+            return None, None, None
+
+        fio = split_director_fio(director)
+        if not fio:
+            return None, None, None
+
+        cache_key = fio.normalized
+        if cache_key in self._director_pin_lookup_cache:
+            return self._director_pin_lookup_cache[cache_key]
+
+        result: tuple[int | None, str | None, str | None] = (None, None, None)
+        if not self.client:
+            self._director_pin_lookup_cache[cache_key] = result
+            return result
+
+        contact = None
+        try:
+            contact = self.client.find_contact_by_fio(fio.last_name, fio.name, fio.second_name)
+            if not contact:
+                find_alias = getattr(self.client, "find_contact_by_director_alias", None)
+                if callable(find_alias):
+                    contact = find_alias(fio.raw)
+        except Exception:
+            contact = None
+
+        contact_id = self._record_id(contact)
+        if contact_id is not None:
+            target_owner_id = SPECIAL_OWNER_BY_CONTACT_ID.get(contact_id)
+            if target_owner_id:
+                result = (
+                    target_owner_id,
+                    f"special_director_contact_pin_{contact_id}",
+                    str(contact_id),
+                )
+
+        self._director_pin_lookup_cache[cache_key] = result
+        return result
+
+    def _record_id(self, record: dict | None) -> int | None:
+        if not record:
+            return None
+        try:
+            value = record.get("ID")
+            if value in (None, ""):
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     def _resolve_target_responsible(
         self,
         app: Application,
@@ -504,6 +584,11 @@ class BitrixPipeline:
         Manual movement is handled only by the admin reassignment workflow.
         """
         director = enr.director
+
+        special_owner_id, special_reason, special_contact_id = self._special_owner_by_director_contact(director)
+        if special_owner_id:
+            self._remember_assignment(app.bin, director, special_owner_id, special_reason)
+            return special_owner_id, special_reason
 
         cached_owner_id, cached_reason = self._cached_assignment(app.bin, director)
         director_owner_id, director_reason = self._package_owner_by_director(director)
