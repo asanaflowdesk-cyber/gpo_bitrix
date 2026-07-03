@@ -7,70 +7,86 @@ on:
         description: "Сколько свежих страниц e-Qazyna проверить"
         required: true
         default: "3"
+
       page_start:
         description: "С какой страницы начать"
         required: true
         default: "1"
+
       page_list:
         description: "Конкретные страницы, например 16,22,31-35. Обычно пусто."
         required: false
         default: ""
+
       doc_type:
         description: "Тип документа"
         required: true
         default: "Заявка на разведку ТПИ"
+
       statuses:
         description: "Статусы через запятую"
         required: true
         default: "Отправлено на рассмотрение,Принято"
+
       min_created_date:
         description: "Минимальная дата создания, YYYY-MM-DD. Обычно пусто."
         required: false
         default: ""
+
       push_bitrix:
         description: "true = записывать результат в Bitrix"
         required: true
         default: "true"
+
       dry_run:
         description: "true = тест без записи, false = запись в Bitrix"
         required: true
         default: "false"
+
       no_egov:
         description: "true = отключить eGov-обогащение"
         required: true
         default: "false"
+
       deal_category_id:
         description: "ID воронки сделки"
         required: true
         default: "0"
+
       deal_stage_id:
         description: "Стадия сделки"
         required: true
         default: "NEW"
+
       assignment_limit_per_manager:
         description: "Мягкий лимит сделок на менеджера для новых руководителей"
         required: true
         default: "30"
+
       assignment_load_stage_ids:
         description: "STAGE_ID, которые входят в лимит. По рабочей логике: NEW,EXECUTING = Новая + В работе"
         required: true
         default: "NEW,EXECUTING"
+
       inherit_failed_deals_by_director:
         description: "true = новая сделка наследует провальную финальную стадию и причину по тому же руководителю"
         required: true
         default: "true"
+
       failed_deal_stage_ids:
         description: "STAGE_ID провальных стадий через запятую. Обычно LOSE"
         required: true
         default: "LOSE"
+
       failed_deal_reason_fields:
         description: "Поля причины провала через запятую. Для текущей воронки: UF_CRM_1779448756033"
         required: true
         default: "UF_CRM_1779448756033"
+
       max_consecutive_page_errors:
         description: "Сколько подряд ошибок страниц допускаем перед остановкой"
         required: true
-        default: "5"
+        default: "1"
 
 concurrency:
   group: eqazyna-to-bitrix
@@ -86,18 +102,30 @@ jobs:
   eqazyna-to-bitrix:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+
     env:
       EGOV_API_KEY: ${{ secrets.EGOV_API_KEY }}
       BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+
       BITRIX_ASSIGNED_BY_ID: ${{ vars.BITRIX_ASSIGNED_BY_ID }}
       BITRIX_REQUISITE_PRESET_ID: ${{ vars.BITRIX_REQUISITE_PRESET_ID }}
       BITRIX_REQUISITE_BIN_FIELD: ${{ vars.BITRIX_REQUISITE_BIN_FIELD || 'RQ_BIN' }}
+
       EGOV_ALLOWED_OKED_PREFIXES: ${{ vars.EGOV_ALLOWED_OKED_PREFIXES || '05,07,08,09' }}
       EGOV_MIN_NAME_MATCH: ${{ vars.EGOV_MIN_NAME_MATCH || '75' }}
       EGOV_RESULT_SIZE: ${{ vars.EGOV_RESULT_SIZE || '20' }}
+
       REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
+
+      # Отдельный timeout только для e-Qazyna.
+      # 30 секунд оставляем как компромисс: сайт может тормозить с GitHub runner.
+      EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '30' }}
+
       EQAZYNA_POLITE_DELAY_SECONDS: ${{ vars.EQAZYNA_POLITE_DELAY_SECONDS || '1.2' }}
-      EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS: ${{ vars.EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS || '5' }}
+
+      # Важно: было 5, из-за этого после падения первой страницы он шел на 2 и 3.
+      EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS: ${{ vars.EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS || '1' }}
+
       BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER: ${{ vars.BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER || '30' }}
       BITRIX_ASSIGNMENT_LOAD_STAGE_IDS: ${{ vars.BITRIX_ASSIGNMENT_LOAD_STAGE_IDS || 'NEW,EXECUTING' }}
       BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR: ${{ vars.BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR || 'true' }}
@@ -123,6 +151,17 @@ jobs:
           python scripts/validate_repo.py
           python -m eqazyna_bitrix.main --help >/dev/null
 
+      - name: Diagnose e-Qazyna access
+        run: |
+          echo "== e-Qazyna host =="
+          curl -I -L --connect-timeout 10 --max-time 30 https://minerals.e-qazyna.kz || true
+
+          echo "== e-Qazyna registry =="
+          curl -I -L --connect-timeout 10 --max-time 30 "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list" || true
+
+          echo "== e-Qazyna filtered registry =="
+          curl -I -L --connect-timeout 10 --max-time 30 "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list?oq=&flMineralUserXin=&flDocNum=&flDocType=%D0%A2%D0%BF%D0%B8%D0%97%D0%B0%D1%8F%D0%B2%D0%BA%D0%B0%D0%9D%D0%B0%D0%A0%D0%B0%D0%B7%D0%B2%D0%B5%D0%B4%D0%BA%D1%83" || true
+
       - name: Run parser, enrichment and Bitrix distribution
         run: |
           set -euo pipefail
@@ -146,6 +185,10 @@ jobs:
           FAILED_DEAL_REASON_FIELDS="${{ inputs.failed_deal_reason_fields }}"
           MAX_CONSECUTIVE_PAGE_ERRORS="${{ inputs.max_consecutive_page_errors }}"
 
+          if [ -z "$MAX_CONSECUTIVE_PAGE_ERRORS" ]; then
+            MAX_CONSECUTIVE_PAGE_ERRORS="${EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS:-1}"
+          fi
+
           if [ "$PUSH_BITRIX" = "true" ] && [ "$DRY_RUN" != "true" ] && [ -z "${BITRIX_WEBHOOK_URL:-}" ]; then
             echo "ERROR: BITRIX_WEBHOOK_URL secret is empty. Cannot write to Bitrix." >&2
             exit 1
@@ -160,6 +203,8 @@ jobs:
           echo "INHERIT_FAILED_DEALS_BY_DIRECTOR=$INHERIT_FAILED_DEALS_BY_DIRECTOR"
           echo "FAILED_DEAL_STAGE_IDS=$FAILED_DEAL_STAGE_IDS"
           echo "FAILED_DEAL_REASON_FIELDS=$FAILED_DEAL_REASON_FIELDS"
+          echo "EQAZYNA_REQUEST_TIMEOUT=${EQAZYNA_REQUEST_TIMEOUT:-30}"
+          echo "MAX_CONSECUTIVE_PAGE_ERRORS=$MAX_CONSECUTIVE_PAGE_ERRORS"
 
           ARGS=(
             python -m eqazyna_bitrix.main
@@ -180,26 +225,48 @@ jobs:
             --json-out "exports/eqazyna_bitrix_log.json"
           )
 
-          if [ -n "$PAGE_LIST" ]; then ARGS+=(--page-list "$PAGE_LIST"); fi
-          if [ -n "$MIN_CREATED_DATE" ]; then ARGS+=(--min-created-date "$MIN_CREATED_DATE"); fi
-          if [ "$PUSH_BITRIX" = "true" ]; then ARGS+=(--push-bitrix); fi
-          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
-          if [ "$NO_EGOV" = "true" ]; then ARGS+=(--no-egov); fi
+          if [ -n "$PAGE_LIST" ]; then
+            ARGS+=(--page-list "$PAGE_LIST")
+          fi
+
+          if [ -n "$MIN_CREATED_DATE" ]; then
+            ARGS+=(--min-created-date "$MIN_CREATED_DATE")
+          fi
+
+          if [ "$PUSH_BITRIX" = "true" ]; then
+            ARGS+=(--push-bitrix)
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+
+          if [ "$NO_EGOV" = "true" ]; then
+            ARGS+=(--no-egov)
+          fi
 
           "${ARGS[@]}"
 
           python - <<'PY'
           import json
           from pathlib import Path
-          p = Path('exports/eqazyna_bitrix_log.json')
+
+          p = Path("exports/eqazyna_bitrix_log.json")
+
           if p.exists():
-              data = json.loads(p.read_text(encoding='utf-8'))
-              rows = data if isinstance(data, list) else data.get('results', [])
-              errors = [r for r in rows if r.get('error') or str(r.get('action', '')).lower() == 'error']
+              data = json.loads(p.read_text(encoding="utf-8"))
+              rows = data if isinstance(data, list) else data.get("results", [])
+              errors = [
+                  r for r in rows
+                  if r.get("error") or str(r.get("action", "")).lower() == "error"
+              ]
+
               print(f"JSON_SUMMARY rows={len(rows)} errors={len(errors)}")
+
               for row in errors[:10]:
-                  print('ERROR_ROW', row)
+                  print("ERROR_ROW", row)
           PY
+
           ls -lah exports
 
       - name: Upload run logs
