@@ -107,6 +107,9 @@ jobs:
       EGOV_API_KEY: ${{ secrets.EGOV_API_KEY }}
       BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
 
+      EQAZYNA_PROXY_URL: ${{ secrets.EQAZYNA_PROXY_URL }}
+      EQAZYNA_PROXY_TOKEN: ${{ secrets.EQAZYNA_PROXY_TOKEN }}
+
       BITRIX_ASSIGNED_BY_ID: ${{ vars.BITRIX_ASSIGNED_BY_ID }}
       BITRIX_REQUISITE_PRESET_ID: ${{ vars.BITRIX_REQUISITE_PRESET_ID }}
       BITRIX_REQUISITE_BIN_FIELD: ${{ vars.BITRIX_REQUISITE_BIN_FIELD || 'RQ_BIN' }}
@@ -205,6 +208,8 @@ jobs:
           echo "FAILED_DEAL_REASON_FIELDS=$FAILED_DEAL_REASON_FIELDS"
           echo "EQAZYNA_REQUEST_TIMEOUT=${EQAZYNA_REQUEST_TIMEOUT:-30}"
           echo "MAX_CONSECUTIVE_PAGE_ERRORS=$MAX_CONSECUTIVE_PAGE_ERRORS"
+          echo "EQAZYNA_PROXY_URL_SET=$([ -n "${EQAZYNA_PROXY_URL:-}" ] && echo yes || echo no)"
+          echo "EQAZYNA_PROXY_TOKEN_SET=$([ -n "${EQAZYNA_PROXY_TOKEN:-}" ] && echo yes || echo no)"
 
           ARGS=(
             python -m eqazyna_bitrix.main
