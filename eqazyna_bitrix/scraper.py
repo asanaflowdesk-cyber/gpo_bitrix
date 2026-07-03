@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import os
-import random
 import re
 import socket
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Iterable
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode
 
 import requests
 from bs4 import BeautifulSoup, FeatureNotFound
@@ -19,6 +16,11 @@ from .models import Application
 
 
 def _force_ipv4() -> None:
+    """
+    GitHub Actions иногда не может подключиться к minerals.e-qazyna.kz
+    по маршруту, который выбирает requests/urllib3 автоматически.
+    Принудительно используем IPv4.
+    """
     urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
 
 
@@ -26,14 +28,7 @@ _force_ipv4()
 
 
 BASE_URL = "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list"
-
-PROXY_LIST_URLS = [
-    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/kz/http/data.txt",
-    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/ru/http/data.txt",
-    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/tr/http/data.txt",
-    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/https/data.txt",
-    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/http/data.txt",
-]
+JINA_READER_PREFIX = "https://r.jina.ai/"
 
 DOC_TYPE_FILTER_VALUES = {
     "Заявка на разведку ТПИ": "ТпиЗаявкаНаРазведку",
@@ -124,7 +119,7 @@ class PageLog:
     rows: int = 0
     accepted: int = 0
     total_after_page: int = 0
-    status: str = "ok"
+    status: str = "ok"  # ok | empty | failed | stopped_by_date
     error: str | None = None
 
     def as_dict(self) -> dict[str, object]:
@@ -141,46 +136,33 @@ class PageLog:
 
 @dataclass(slots=True)
 class EqazynaScraper:
-    timeout: int = 20
+    timeout: int = 30
     polite_delay_seconds: float = 0.5
-    max_retries: int = 1
+    max_retries: int = 2
     retry_base_sleep_seconds: float = 1.0
     continue_on_page_error: bool = True
     max_consecutive_page_errors: int = 1
     session: requests.Session | None = None
     page_logs: list[PageLog] = field(default_factory=list)
     failed_pages: list[int] = field(default_factory=list)
-    working_proxy: str | None = None
 
     def __post_init__(self) -> None:
         if self.session is None:
             self.session = requests.Session()
 
-        self.session.trust_env = False
         self.session.headers.update(
             {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/143.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
                 "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Connection": "close",
             }
         )
 
-    def build_url(self, page: int, doc_type: str | None = None, statuses: Iterable[str] | None = None) -> str:
-        mode = (os.getenv("EQAZYNA_FETCH_MODE") or "filtered").strip().lower()
-
-        if mode == "base":
-            params: list[tuple[str, str]] = []
-            if page > 1:
-                params.append(("p", str(page)))
-            return f"{BASE_URL}?{urlencode(params, doseq=True)}" if params else BASE_URL
-
+    def build_url(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> str:
+        # Порядок параметров сделан как в рабочей ссылке из браузера:
+        # oq → flMineralUserXin → flStatus → flDocNum → flDocType → p
         params: list[tuple[str, str]] = [
             ("oq", ""),
             ("flMineralUserXin", ""),
@@ -208,53 +190,32 @@ class EqazynaScraper:
     def fetch_page(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> tuple[str, str]:
         url = self.build_url(page, doc_type, statuses)
 
-        if self.working_proxy:
-            try:
-                html = self._request(url, proxy=self.working_proxy, timeout=self.timeout)
-                return html, url
-            except Exception as exc:
-                print(f"    WARN: saved proxy failed, will search again: {exc}")
-                self.working_proxy = None
+        try:
+            return self._fetch_direct(url, page)
+        except Exception as direct_exc:
+            print(f"    WARN: direct e-Qazyna failed for page {page}; trying Jina fallback: {direct_exc}")
 
-        manual_raw_proxy = os.getenv("EQAZYNA_HTTPS_PROXY") or ""
-        manual_proxy = self._normalize_proxy(manual_raw_proxy)
+        jina_url = f"{JINA_READER_PREFIX}{url}"
 
-        if manual_raw_proxy.strip() and not manual_proxy:
-            print("    WARN: EQAZYNA_HTTPS_PROXY is set but invalid; skipped")
-
-        if manual_proxy:
-            try:
-                html = self._request(url, proxy=manual_proxy, timeout=self.timeout)
-                self.working_proxy = manual_proxy
-                print("    MANUAL_PROXY_OK")
-                return html, url
-            except Exception as exc:
-                print(f"    WARN: manual proxy failed: {exc}")
-
-        auto_enabled = (os.getenv("EQAZYNA_AUTO_PROXY") or "true").strip().lower() not in {"0", "false", "no"}
-
-        if auto_enabled:
-            try:
-                html, proxy = self._fetch_with_auto_proxy(url)
-                self.working_proxy = proxy
-                print("    AUTO_PROXY_OK")
-                return html, url
-            except Exception as exc:
-                print(f"    WARN: auto proxy failed: {exc}")
-
-        return self._fetch_direct(url, page)
+        try:
+            return self._fetch_jina(jina_url, page)
+        except Exception as jina_exc:
+            raise jina_exc
 
     def _fetch_direct(self, url: str, page: int) -> tuple[str, str]:
         last_error: Exception | None = None
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                html = self._request(url, proxy=None, timeout=self.timeout)
-                return html, url
-            except Exception as exc:
+                response = self.session.get(url, timeout=self.timeout)
+                response.raise_for_status()
+                return response.text, url
+
+            except requests.RequestException as exc:
                 last_error = exc
+
                 print(
-                    f"    WARN: e-Qazyna direct page {page} failed on attempt "
+                    f"    WARN: e-Qazyna page {page} failed on attempt "
                     f"{attempt}/{self.max_retries}: {exc}"
                 )
 
@@ -265,152 +226,44 @@ class EqazynaScraper:
 
         raise last_error or RuntimeError(f"e-Qazyna page {page} failed")
 
-    def _fetch_with_auto_proxy(self, url: str) -> tuple[str, str]:
-        candidates = self._load_candidate_proxies()
+    def _fetch_jina(self, jina_url: str, page: int) -> tuple[str, str]:
+        last_error: Exception | None = None
 
-        if not candidates:
-            raise RuntimeError("no proxy candidates loaded")
-
-        limit = int(os.getenv("EQAZYNA_PROXY_TEST_LIMIT") or "100")
-        workers = int(os.getenv("EQAZYNA_PROXY_TEST_WORKERS") or "25")
-        proxy_timeout = int(os.getenv("EQAZYNA_PROXY_TEST_TIMEOUT") or "8")
-
-        candidates = candidates[: max(1, limit)]
-        print(f"    AUTO_PROXY_TEST candidates={len(candidates)} workers={workers} timeout={proxy_timeout}")
-
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-            futures = {
-                executor.submit(self._try_proxy_once, url, proxy, proxy_timeout): proxy
-                for proxy in candidates
-            }
-
-            for future in as_completed(futures):
-                proxy = futures[future]
-                try:
-                    html = future.result()
-                    print(f"    AUTO_PROXY_SELECTED={self._mask_proxy(proxy)}")
-                    return html, proxy
-                except Exception:
-                    continue
-
-        raise RuntimeError("no working proxy found")
-
-    def _load_candidate_proxies(self) -> list[str]:
-        proxies: list[str] = []
-        seen: set[str] = set()
-
-        for source_url in PROXY_LIST_URLS:
+        for attempt in range(1, self.max_retries + 1):
             try:
-                response = requests.get(
-                    source_url,
-                    timeout=12,
-                    headers={"User-Agent": "Mozilla/5.0"},
+                response = self.session.get(
+                    jina_url,
+                    timeout=max(self.timeout, 30),
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor)",
+                        "Accept": "text/plain,text/markdown,*/*",
+                    },
                 )
-
-                if response.status_code == 404:
-                    continue
-
                 response.raise_for_status()
 
-                for raw in response.text.splitlines():
-                    proxy = self._normalize_proxy(raw)
-                    if proxy and proxy not in seen:
-                        seen.add(proxy)
-                        proxies.append(proxy)
+                text = response.text or ""
+                markers = ("Реестр заявок", "Дата создания", "Номер документа", "ИИН/БИН заявителя")
+
+                if not any(marker in text for marker in markers):
+                    raise RuntimeError("Jina fallback returned page without registry markers")
+
+                print(f"    JINA_FALLBACK_OK page={page}")
+                return text, jina_url
 
             except Exception as exc:
-                print(f"    WARN: proxy source failed: {source_url} :: {exc}")
+                last_error = exc
 
-        random.shuffle(proxies)
-        print(f"    AUTO_PROXY_LOADED={len(proxies)}")
-        return proxies
+                print(
+                    f"    WARN: Jina fallback page {page} failed on attempt "
+                    f"{attempt}/{self.max_retries}: {exc}"
+                )
 
-    def _try_proxy_once(self, url: str, proxy: str, timeout: int) -> str:
-        return self._request(url, proxy=proxy, timeout=timeout)
+                if attempt < self.max_retries:
+                    sleep_for = self.retry_base_sleep_seconds
+                    print(f"    sleep {sleep_for:.1f}s")
+                    time.sleep(sleep_for)
 
-    def _request(self, url: str, proxy: str | None, timeout: int) -> str:
-        session = requests.Session()
-        session.trust_env = False
-        session.headers.update(self.session.headers if self.session else {})
-
-        if proxy:
-            session.proxies.update({"http": proxy, "https": proxy})
-
-        response = session.get(
-            url,
-            timeout=timeout,
-            allow_redirects=True,
-        )
-        response.raise_for_status()
-
-        if not response.encoding:
-            response.encoding = "utf-8"
-
-        html = response.text or ""
-
-        if not _looks_like_registry_page(html):
-            preview = clean_text(make_soup(html).get_text(" "))[:500]
-            raise RuntimeError(f"page does not look like registry; preview={preview!r}")
-
-        return html
-
-    @staticmethod
-    def _normalize_proxy(value: str) -> str | None:
-        value = (value or "").strip()
-
-        if not value:
-            return None
-
-        lower_value = value.lower()
-
-        invalid_placeholders = {
-            "http://ip:port",
-            "https://ip:port",
-            "ip:port",
-            "http://host:port",
-            "https://host:port",
-            "host:port",
-            "http://login:password@host:port",
-            "https://login:password@host:port",
-            "login:password@host:port",
-        }
-
-        if lower_value in invalid_placeholders:
-            return None
-
-        if value.startswith("#"):
-            return None
-
-        if value.startswith("socks4://") or value.startswith("socks5://") or value.startswith("socks5h://"):
-            return None
-
-        if value.startswith("https://"):
-            value = "http://" + value[len("https://") :]
-
-        if not value.startswith("http://"):
-            value = "http://" + value
-
-        try:
-            parsed = urlparse(value)
-            hostname = parsed.hostname
-            port = parsed.port
-        except ValueError:
-            return None
-
-        if not hostname or not port:
-            return None
-
-        return value
-
-    @staticmethod
-    def _mask_proxy(proxy: str) -> str:
-        try:
-            parsed = urlparse(proxy)
-            if not parsed.hostname or not parsed.port:
-                return "***"
-            return f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
-        except Exception:
-            return "***"
+        raise last_error or RuntimeError(f"Jina fallback page {page} failed")
 
     @staticmethod
     def parse_page_list(value: str | None) -> list[int] | None:
@@ -459,7 +312,6 @@ class EqazynaScraper:
 
         explicit_pages = self.parse_page_list(page_list)
         page_numbers = explicit_pages if explicit_pages else list(range(max(1, page_start), max(1, page_start) + pages))
-
         sequential_mode = explicit_pages is None
         consecutive_failed_pages = 0
 
@@ -468,6 +320,7 @@ class EqazynaScraper:
 
             try:
                 html, url = self.fetch_page(page, doc_type, wanted_statuses_list)
+
             except Exception as exc:
                 error = str(exc)
 
@@ -567,10 +420,7 @@ class EqazynaScraper:
                 )
             )
 
-            print(
-                f"    page {page}: rows={len(rows)} "
-                f"accepted={accepted_on_page} total={len(results)} url={url}"
-            )
+            print(f"    page {page}: rows={len(rows)} accepted={accepted_on_page} total={len(results)} url={url}")
 
             if stop_by_date and sequential_mode:
                 print(f"    stop: reached min_created_date={min_created_date.isoformat() if min_created_date else None}")
@@ -579,22 +429,6 @@ class EqazynaScraper:
             time.sleep(self.polite_delay_seconds)
 
         return results
-
-
-def _looks_like_registry_page(value: str) -> bool:
-    text = value or ""
-
-    markers = (
-        "Реестр заявок",
-        "Дата создания",
-        "Номер документа",
-        "ИИН/БИН заявителя",
-        "Наименование заявителя",
-        "Тип документа",
-        "Статус заявки",
-    )
-
-    return any(marker in text for marker in markers)
 
 
 def make_soup(html: str) -> BeautifulSoup:
@@ -622,6 +456,10 @@ def parse_created_date(value: str) -> date | None:
 
 
 def parse_applications(html: str, source_url: str, doc_types: list[str | None] | None = None) -> list[Application]:
+    parsed_markdown = _parse_markdown_tables(html, source_url)
+    if parsed_markdown:
+        return parsed_markdown
+
     soup = make_soup(html)
 
     parsed_html = _parse_html_tables(soup, source_url)
@@ -630,15 +468,11 @@ def parse_applications(html: str, source_url: str, doc_types: list[str | None] |
 
     text = soup.get_text("\n")
 
-    parsed_text = _parse_text_fallback(text, source_url, doc_types=doc_types)
-    if parsed_text:
-        return parsed_text
+    parsed_markdown_from_text = _parse_markdown_tables(text, source_url)
+    if parsed_markdown_from_text:
+        return parsed_markdown_from_text
 
-    parsed_markdown = _parse_markdown_tables(html, source_url)
-    if parsed_markdown:
-        return parsed_markdown
-
-    return []
+    return _parse_text_fallback(text, source_url, doc_types=doc_types)
 
 
 def _parse_html_tables(soup: BeautifulSoup, source_url: str) -> list[Application]:
@@ -660,7 +494,7 @@ def _parse_html_tables(soup: BeautifulSoup, source_url: str) -> list[Application
         ]:
             continue
 
-        date_raw, doc_number, bin_number, applicant_name, doc_type, status = cells[:6]
+        date_raw, doc, bin_number, name, doc_type, status = cells[:6]
 
         if not re.match(r"\d{2}\.\d{2}\.\d{4}", date_raw):
             continue
@@ -671,9 +505,9 @@ def _parse_html_tables(soup: BeautifulSoup, source_url: str) -> list[Application
         rows.append(
             Application(
                 created_at_raw=date_raw,
-                doc_number=doc_number,
+                doc_number=doc,
                 bin=bin_number,
-                applicant_name=applicant_name,
+                applicant_name=name,
                 doc_type=doc_type,
                 status=status,
                 source_url=source_url,
@@ -710,7 +544,7 @@ def _parse_markdown_tables(text: str, source_url: str) -> list[Application]:
         ]:
             continue
 
-        date_raw, doc_number, bin_number, applicant_name, doc_type, status = cells[:6]
+        date_raw, doc, bin_number, name, doc_type, status = cells[:6]
 
         if not re.match(r"\d{2}\.\d{2}\.\d{4}", date_raw):
             continue
@@ -721,9 +555,9 @@ def _parse_markdown_tables(text: str, source_url: str) -> list[Application]:
         rows.append(
             Application(
                 created_at_raw=date_raw,
-                doc_number=doc_number,
+                doc_number=doc,
                 bin=bin_number,
-                applicant_name=applicant_name,
+                applicant_name=name,
                 doc_type=doc_type,
                 status=status,
                 source_url=source_url,
@@ -739,12 +573,7 @@ def _parse_text_fallback(text: str, source_url: str, doc_types: list[str | None]
     candidates = [d for d in (doc_types or []) if d] + KNOWN_DOC_TYPES
     candidates = sorted(set(candidates), key=len, reverse=True)
 
-    row_re = re.compile(
-        r"(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2})\s+"
-        r"([A-ZА-Я0-9\-\/]+)\s+"
-        r"(\d{12})\s+"
-        r"(.+)"
-    )
+    row_re = re.compile(r"(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2})\s+([A-Z0-9\-]+)\s+(\d{12})\s+(.+)")
 
     for raw_line in text.splitlines():
         line = clean_text(raw_line)
@@ -757,10 +586,10 @@ def _parse_text_fallback(text: str, source_url: str, doc_types: list[str | None]
 
         status = None
 
-        for known_status in KNOWN_STATUSES:
-            if tail.endswith(known_status):
-                status = known_status
-                tail = tail[: -len(known_status)].strip()
+        for s in KNOWN_STATUSES:
+            if tail.endswith(s):
+                status = s
+                tail = tail[: -len(s)].strip()
                 break
 
         if not status:
