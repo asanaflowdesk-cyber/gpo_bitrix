@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import re
-import time
 import socket
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Iterable
@@ -28,6 +28,7 @@ _force_ipv4()
 
 
 BASE_URL = "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list"
+JINA_READER_PREFIX = "https://r.jina.ai/"
 
 DOC_TYPE_FILTER_VALUES = {
     "Заявка на разведку ТПИ": "ТпиЗаявкаНаРазведку",
@@ -135,10 +136,7 @@ class PageLog:
 
 @dataclass(slots=True)
 class EqazynaScraper:
-    # Быстрые настройки для падения e-Qazyna:
-    # было timeout 30/60, max_retries 5, sleep 3/6/9/12/15;
-    # теперь максимум около 20–25 секунд на первую недоступную страницу.
-    timeout: int = 10
+    timeout: int = 30
     polite_delay_seconds: float = 0.5
     max_retries: int = 2
     retry_base_sleep_seconds: float = 1.0
@@ -154,32 +152,35 @@ class EqazynaScraper:
 
         self.session.headers.update(
             {
-                "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor; +https://github.com/)",
-                "Accept-Language": "ru,en;q=0.8",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Connection": "close",
             }
         )
 
     def build_url(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> str:
+        # Порядок параметров сделан как в рабочей ссылке из браузера:
+        # oq → flMineralUserXin → flStatus → flDocNum → flDocType → p
         params: list[tuple[str, str]] = [
             ("oq", ""),
             ("flMineralUserXin", ""),
-            ("flDocNum", ""),
         ]
-
-        doc_type = doc_type.strip() if doc_type else None
-
-        if doc_type:
-            filter_doc_type = DOC_TYPE_FILTER_VALUES.get(doc_type)
-            if filter_doc_type:
-                params.append(("flDocType", filter_doc_type))
 
         for status in statuses or []:
             status = status.strip()
             filter_status = STATUS_FILTER_VALUES.get(status)
             if filter_status:
                 params.append(("flStatus", filter_status))
+
+        params.append(("flDocNum", ""))
+
+        doc_type = doc_type.strip() if doc_type else None
+        if doc_type:
+            filter_doc_type = DOC_TYPE_FILTER_VALUES.get(doc_type)
+            if filter_doc_type:
+                params.append(("flDocType", filter_doc_type))
 
         if page > 1:
             params.append(("p", str(page)))
@@ -188,6 +189,20 @@ class EqazynaScraper:
 
     def fetch_page(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> tuple[str, str]:
         url = self.build_url(page, doc_type, statuses)
+
+        try:
+            return self._fetch_direct(url, page)
+        except Exception as direct_exc:
+            print(f"    WARN: direct e-Qazyna failed for page {page}; trying Jina fallback: {direct_exc}")
+
+        jina_url = f"{JINA_READER_PREFIX}{url}"
+
+        try:
+            return self._fetch_jina(jina_url, page)
+        except Exception as jina_exc:
+            raise jina_exc
+
+    def _fetch_direct(self, url: str, page: int) -> tuple[str, str]:
         last_error: Exception | None = None
 
         for attempt in range(1, self.max_retries + 1):
@@ -210,6 +225,45 @@ class EqazynaScraper:
                     time.sleep(sleep_for)
 
         raise last_error or RuntimeError(f"e-Qazyna page {page} failed")
+
+    def _fetch_jina(self, jina_url: str, page: int) -> tuple[str, str]:
+        last_error: Exception | None = None
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self.session.get(
+                    jina_url,
+                    timeout=max(self.timeout, 30),
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor)",
+                        "Accept": "text/plain,text/markdown,*/*",
+                    },
+                )
+                response.raise_for_status()
+
+                text = response.text or ""
+                markers = ("Реестр заявок", "Дата создания", "Номер документа", "ИИН/БИН заявителя")
+
+                if not any(marker in text for marker in markers):
+                    raise RuntimeError("Jina fallback returned page without registry markers")
+
+                print(f"    JINA_FALLBACK_OK page={page}")
+                return text, jina_url
+
+            except Exception as exc:
+                last_error = exc
+
+                print(
+                    f"    WARN: Jina fallback page {page} failed on attempt "
+                    f"{attempt}/{self.max_retries}: {exc}"
+                )
+
+                if attempt < self.max_retries:
+                    sleep_for = self.retry_base_sleep_seconds
+                    print(f"    sleep {sleep_for:.1f}s")
+                    time.sleep(sleep_for)
+
+        raise last_error or RuntimeError(f"Jina fallback page {page} failed")
 
     @staticmethod
     def parse_page_list(value: str | None) -> list[int] | None:
@@ -246,7 +300,8 @@ class EqazynaScraper:
         page_start: int = 1,
         page_list: str | None = None,
     ) -> list[Application]:
-        wanted_statuses = {s.strip() for s in statuses if s and s.strip()}
+        wanted_statuses_list = [s.strip() for s in statuses if s and s.strip()]
+        wanted_statuses = set(wanted_statuses_list)
         doc_type = doc_type.strip() if doc_type else None
 
         results: list[Application] = []
@@ -261,10 +316,10 @@ class EqazynaScraper:
         consecutive_failed_pages = 0
 
         for page in page_numbers:
-            url = self.build_url(page, doc_type, wanted_statuses)
+            url = self.build_url(page, doc_type, wanted_statuses_list)
 
             try:
-                html, url = self.fetch_page(page, doc_type, wanted_statuses)
+                html, url = self.fetch_page(page, doc_type, wanted_statuses_list)
 
             except Exception as exc:
                 error = str(exc)
@@ -401,13 +456,22 @@ def parse_created_date(value: str) -> date | None:
 
 
 def parse_applications(html: str, source_url: str, doc_types: list[str | None] | None = None) -> list[Application]:
+    parsed_markdown = _parse_markdown_tables(html, source_url)
+    if parsed_markdown:
+        return parsed_markdown
+
     soup = make_soup(html)
 
-    parsed = _parse_html_tables(soup, source_url)
-    if parsed:
-        return parsed
+    parsed_html = _parse_html_tables(soup, source_url)
+    if parsed_html:
+        return parsed_html
 
     text = soup.get_text("\n")
+
+    parsed_markdown_from_text = _parse_markdown_tables(text, source_url)
+    if parsed_markdown_from_text:
+        return parsed_markdown_from_text
+
     return _parse_text_fallback(text, source_url, doc_types=doc_types)
 
 
@@ -418,6 +482,56 @@ def _parse_html_tables(soup: BeautifulSoup, source_url: str) -> list[Application
         cells = [clean_text(td.get_text(" ")) for td in tr.find_all(["td", "th"])]
 
         if len(cells) < 6:
+            continue
+
+        if cells[:6] == [
+            "Дата создания",
+            "Номер документа",
+            "ИИН/БИН заявителя",
+            "Наименование заявителя",
+            "Тип документа",
+            "Статус заявки",
+        ]:
+            continue
+
+        date_raw, doc, bin_number, name, doc_type, status = cells[:6]
+
+        if not re.match(r"\d{2}\.\d{2}\.\d{4}", date_raw):
+            continue
+
+        if not re.fullmatch(r"\d{12}", bin_number):
+            continue
+
+        rows.append(
+            Application(
+                created_at_raw=date_raw,
+                doc_number=doc,
+                bin=bin_number,
+                applicant_name=name,
+                doc_type=doc_type,
+                status=status,
+                source_url=source_url,
+            )
+        )
+
+    return rows
+
+
+def _parse_markdown_tables(text: str, source_url: str) -> list[Application]:
+    rows: list[Application] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+
+        if not line.startswith("|") or not line.endswith("|"):
+            continue
+
+        cells = [clean_text(cell) for cell in line.strip("|").split("|")]
+
+        if len(cells) < 6:
+            continue
+
+        if all(re.fullmatch(r"[-:\s]+", cell or "") for cell in cells):
             continue
 
         if cells[:6] == [
