@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import time
+import socket
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Iterable
@@ -9,8 +10,22 @@ from urllib.parse import urlencode
 
 import requests
 from bs4 import BeautifulSoup, FeatureNotFound
+from urllib3.util import connection as urllib3_connection
 
 from .models import Application
+
+
+def _force_ipv4() -> None:
+    """
+    GitHub Actions иногда не может подключиться к minerals.e-qazyna.kz
+    по маршруту, который выбирает requests/urllib3 автоматически.
+    Принудительно используем IPv4.
+    """
+    urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
+
+
+_force_ipv4()
+
 
 BASE_URL = "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list"
 
