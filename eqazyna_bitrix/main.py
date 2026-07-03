@@ -19,21 +19,21 @@ from .settings import Settings
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="e-Qazyna → eGov → Bitrix24 companies/deals")
 
-    parser.add_argument("--pages", type=int, default=int(os.getenv("EQAZYNA_PAGES", "3")))
-    parser.add_argument("--page-start", type=int, default=int(os.getenv("EQAZYNA_PAGE_START", "1")))
-    parser.add_argument("--page-list", default=os.getenv("EQAZYNA_PAGE_LIST") or None)
+    parser.add_argument("--pages", type=int, default=int(os.getenv("EQAZYNA_PAGES", "3")), help="How many pages to process in this run")
+    parser.add_argument("--page-start", type=int, default=int(os.getenv("EQAZYNA_PAGE_START", "1")), help="First e-Qazyna page for this run")
+    parser.add_argument("--page-list", default=os.getenv("EQAZYNA_PAGE_LIST") or None, help="Optional explicit pages/ranges, e.g. 16,22,30-35. Overrides page-start/pages.")
     parser.add_argument("--doc-type", default=os.getenv("EQAZYNA_DOC_TYPE", "Заявка на разведку ТПИ"))
     parser.add_argument("--statuses", default=os.getenv("EQAZYNA_STATUSES", "Отправлено на рассмотрение,Принято"))
-    parser.add_argument("--min-created-date", default=os.getenv("EQAZYNA_MIN_CREATED_DATE") or None)
+    parser.add_argument("--min-created-date", default=os.getenv("EQAZYNA_MIN_CREATED_DATE") or None, help="Only process applications created on/after YYYY-MM-DD")
 
-    parser.add_argument("--out", default=None)
-    parser.add_argument("--json-out", default=None)
+    parser.add_argument("--out", default=None, help="Output XLSX path")
+    parser.add_argument("--json-out", default=None, help="Optional JSON log path")
 
-    parser.add_argument("--no-egov", action="store_true")
-    parser.add_argument("--push-bitrix", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-egov", action="store_true", help="Do not call data.egov.kz")
+    parser.add_argument("--push-bitrix", action="store_true", help="Create/update Bitrix companies and deals")
+    parser.add_argument("--dry-run", action="store_true", help="Do everything except Bitrix writes")
 
-    parser.add_argument("--crm-mode", choices=["deal", "lead"], default=os.getenv("BITRIX_CRM_MODE", "deal"))
+    parser.add_argument("--crm-mode", choices=["deal", "lead"], default=os.getenv("BITRIX_CRM_MODE", "deal"), help="deal = company+deal flow; lead = create/update Bitrix leads only")
     parser.add_argument("--deal-category-id", default=os.getenv("BITRIX_DEAL_CATEGORY_ID", "0"))
     parser.add_argument("--deal-stage-id", default=os.getenv("BITRIX_DEAL_STAGE_ID", "NEW"))
     parser.add_argument("--lead-status-id", default=os.getenv("BITRIX_LEAD_STATUS_ID", "NEW"))
@@ -43,33 +43,42 @@ def parse_args() -> argparse.Namespace:
         "--assignment-limit-per-manager",
         type=int,
         default=int(os.getenv("BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER", "30")),
+        help="Soft deal limit for brand-new director packages. Historical director packages ignore the limit.",
     )
     parser.add_argument(
         "--assignment-load-stage-ids",
         default=os.getenv("BITRIX_ASSIGNMENT_LOAD_STAGE_IDS", DEFAULT_ASSIGNMENT_LOAD_STAGE_IDS),
+        help="Comma-separated STAGE_ID values that consume the assignment limit.",
     )
 
     parser.add_argument(
         "--inherit-failed-deals-by-director",
         default=os.getenv("BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR", "true"),
+        help="true = new deals inherit failed final stage/reason from old deals for the same director",
     )
-    parser.add_argument("--failed-deal-stage-ids", default=os.getenv("BITRIX_FAILED_DEAL_STAGE_IDS", "LOSE"))
+    parser.add_argument(
+        "--failed-deal-stage-ids",
+        default=os.getenv("BITRIX_FAILED_DEAL_STAGE_IDS", "LOSE"),
+        help="Comma-separated failed deal STAGE_ID values.",
+    )
     parser.add_argument(
         "--failed-deal-reason-fields",
         default=os.getenv("BITRIX_FAILED_DEAL_REASON_FIELDS", "UF_CRM_1779448756033"),
+        help="Comma-separated deal fields to copy/read as failure reason",
     )
 
     parser.add_argument("--requisite-preset-id", default=os.getenv("BITRIX_REQUISITE_PRESET_ID") or None)
     parser.add_argument("--requisite-bin-field", default=os.getenv("BITRIX_REQUISITE_BIN_FIELD", "RQ_BIN"))
 
-    parser.add_argument("--strict-page-errors", action="store_true")
+    parser.add_argument("--strict-page-errors", action="store_true", help="Fail the whole run if any e-Qazyna page fails")
 
-    # ВАЖНО: было 5. Из-за этого при падении e-Qazyna скрипт мучил страницы 1, 2, 3.
-    # Теперь после первой подряд упавшей страницы парсинг останавливается.
+    # Было 5. Из-за этого при падении e-Qazyna скрипт пытался мучить 1, 2, 3 страницы.
+    # Теперь в последовательном режиме после первой подряд упавшей страницы парсинг останавливается.
     parser.add_argument(
         "--max-consecutive-page-errors",
         type=int,
         default=int(os.getenv("EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS", "1")),
+        help="Stop scraping after N consecutive failed pages and process already collected rows. Use 0 to never stop early.",
     )
 
     return parser.parse_args()
@@ -112,7 +121,7 @@ def main() -> int:
         min_created_date = datetime.strptime(args.min_created_date, "%Y-%m-%d").date()
 
     # Отдельный быстрый timeout только для e-Qazyna.
-    # Bitrix и eGov не трогаем.
+    # Bitrix и eGov остаются на общем settings.request_timeout.
     eqazyna_timeout = int(os.getenv("EQAZYNA_REQUEST_TIMEOUT", "10"))
 
     print(
