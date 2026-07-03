@@ -3,6 +3,15 @@ name: e-Qazyna to Bitrix CRM AUTO
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: "GitHub runner. Если Ubuntu не видит e-Qazyna, используем macOS"
+        required: true
+        type: choice
+        default: "macos-latest"
+        options:
+          - "macos-latest"
+          - "ubuntu-latest"
+
       pages:
         description: "Сколько свежих страниц e-Qazyna проверить"
         required: true
@@ -100,15 +109,12 @@ env:
 
 jobs:
   eqazyna-to-bitrix:
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
 
     env:
       EGOV_API_KEY: ${{ secrets.EGOV_API_KEY }}
       BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
-
-      EQAZYNA_PROXY_URL: ${{ secrets.EQAZYNA_PROXY_URL }}
-      EQAZYNA_PROXY_TOKEN: ${{ secrets.EQAZYNA_PROXY_TOKEN }}
 
       BITRIX_ASSIGNED_BY_ID: ${{ vars.BITRIX_ASSIGNED_BY_ID }}
       BITRIX_REQUISITE_PRESET_ID: ${{ vars.BITRIX_REQUISITE_PRESET_ID }}
@@ -119,14 +125,8 @@ jobs:
       EGOV_RESULT_SIZE: ${{ vars.EGOV_RESULT_SIZE || '20' }}
 
       REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
-
-      # Отдельный timeout только для e-Qazyna.
-      # 30 секунд оставляем как компромисс: сайт может тормозить с GitHub runner.
-      EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '30' }}
-
+      EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '20' }}
       EQAZYNA_POLITE_DELAY_SECONDS: ${{ vars.EQAZYNA_POLITE_DELAY_SECONDS || '1.2' }}
-
-      # Важно: было 5, из-за этого после падения первой страницы он шел на 2 и 3.
       EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS: ${{ vars.EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS || '1' }}
 
       BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER: ${{ vars.BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER || '30' }}
@@ -153,17 +153,6 @@ jobs:
         run: |
           python scripts/validate_repo.py
           python -m eqazyna_bitrix.main --help >/dev/null
-
-      - name: Diagnose e-Qazyna access
-        run: |
-          echo "== e-Qazyna host =="
-          curl -I -L --connect-timeout 10 --max-time 30 https://minerals.e-qazyna.kz || true
-
-          echo "== e-Qazyna registry =="
-          curl -I -L --connect-timeout 10 --max-time 30 "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list" || true
-
-          echo "== e-Qazyna filtered registry =="
-          curl -I -L --connect-timeout 10 --max-time 30 "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list?oq=&flMineralUserXin=&flDocNum=&flDocType=%D0%A2%D0%BF%D0%B8%D0%97%D0%B0%D1%8F%D0%B2%D0%BA%D0%B0%D0%9D%D0%B0%D0%A0%D0%B0%D0%B7%D0%B2%D0%B5%D0%B4%D0%BA%D1%83" || true
 
       - name: Run parser, enrichment and Bitrix distribution
         run: |
@@ -197,6 +186,7 @@ jobs:
             exit 1
           fi
 
+          echo "RUNNER=${{ inputs.runner }}"
           echo "PAGES=$PAGES PAGE_START=$PAGE_START PAGE_LIST=$PAGE_LIST"
           echo "PUSH_BITRIX=$PUSH_BITRIX DRY_RUN=$DRY_RUN NO_EGOV=$NO_EGOV"
           echo "CRM_MODE=deal"
@@ -206,10 +196,8 @@ jobs:
           echo "INHERIT_FAILED_DEALS_BY_DIRECTOR=$INHERIT_FAILED_DEALS_BY_DIRECTOR"
           echo "FAILED_DEAL_STAGE_IDS=$FAILED_DEAL_STAGE_IDS"
           echo "FAILED_DEAL_REASON_FIELDS=$FAILED_DEAL_REASON_FIELDS"
-          echo "EQAZYNA_REQUEST_TIMEOUT=${EQAZYNA_REQUEST_TIMEOUT:-30}"
+          echo "EQAZYNA_REQUEST_TIMEOUT=${EQAZYNA_REQUEST_TIMEOUT:-20}"
           echo "MAX_CONSECUTIVE_PAGE_ERRORS=$MAX_CONSECUTIVE_PAGE_ERRORS"
-          echo "EQAZYNA_PROXY_URL_SET=$([ -n "${EQAZYNA_PROXY_URL:-}" ] && echo yes || echo no)"
-          echo "EQAZYNA_PROXY_TOKEN_SET=$([ -n "${EQAZYNA_PROXY_TOKEN:-}" ] && echo yes || echo no)"
 
           ARGS=(
             python -m eqazyna_bitrix.main
