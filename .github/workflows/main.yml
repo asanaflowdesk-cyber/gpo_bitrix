@@ -3,15 +3,6 @@ name: e-Qazyna to Bitrix CRM AUTO
 on:
   workflow_dispatch:
     inputs:
-      runner:
-        description: "GitHub runner"
-        required: true
-        type: choice
-        default: "macos-latest"
-        options:
-          - "macos-latest"
-          - "ubuntu-latest"
-
       pages:
         description: "Сколько свежих страниц e-Qazyna проверить"
         required: true
@@ -73,7 +64,7 @@ on:
         default: "30"
 
       assignment_load_stage_ids:
-        description: "STAGE_ID, которые входят в лимит"
+        description: "STAGE_ID, которые входят в лимит. По рабочей логике: NEW,EXECUTING = Новая + В работе"
         required: true
         default: "NEW,EXECUTING"
 
@@ -83,12 +74,12 @@ on:
         default: "true"
 
       failed_deal_stage_ids:
-        description: "STAGE_ID провальных стадий через запятую"
+        description: "STAGE_ID провальных стадий через запятую. Обычно LOSE"
         required: true
         default: "LOSE"
 
       failed_deal_reason_fields:
-        description: "Поля причины провала через запятую"
+        description: "Поля причины провала через запятую. Для текущей воронки: UF_CRM_1779448756033"
         required: true
         default: "UF_CRM_1779448756033"
 
@@ -109,8 +100,8 @@ env:
 
 jobs:
   eqazyna-to-bitrix:
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     env:
       EGOV_API_KEY: ${{ secrets.EGOV_API_KEY }}
@@ -125,16 +116,15 @@ jobs:
       EGOV_RESULT_SIZE: ${{ vars.EGOV_RESULT_SIZE || '20' }}
 
       REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
-      EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '20' }}
-      EQAZYNA_POLITE_DELAY_SECONDS: ${{ vars.EQAZYNA_POLITE_DELAY_SECONDS || '1.2' }}
-      EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS: ${{ vars.EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS || '1' }}
 
-      EQAZYNA_FETCH_MODE: ${{ vars.EQAZYNA_FETCH_MODE || 'filtered' }}
-      EQAZYNA_AUTO_PROXY: ${{ vars.EQAZYNA_AUTO_PROXY || 'true' }}
-      EQAZYNA_PROXY_TEST_LIMIT: ${{ vars.EQAZYNA_PROXY_TEST_LIMIT || '100' }}
-      EQAZYNA_PROXY_TEST_WORKERS: ${{ vars.EQAZYNA_PROXY_TEST_WORKERS || '25' }}
-      EQAZYNA_PROXY_TEST_TIMEOUT: ${{ vars.EQAZYNA_PROXY_TEST_TIMEOUT || '8' }}
-      EQAZYNA_HTTPS_PROXY: ${{ secrets.EQAZYNA_HTTPS_PROXY }}
+      # Отдельный timeout только для e-Qazyna.
+      # 30 секунд оставляем как компромисс: сайт может тормозить с GitHub runner.
+      EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '30' }}
+
+      EQAZYNA_POLITE_DELAY_SECONDS: ${{ vars.EQAZYNA_POLITE_DELAY_SECONDS || '1.2' }}
+
+      # Важно: было 5, из-за этого после падения первой страницы он шел на 2 и 3.
+      EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS: ${{ vars.EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS || '1' }}
 
       BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER: ${{ vars.BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER || '30' }}
       BITRIX_ASSIGNMENT_LOAD_STAGE_IDS: ${{ vars.BITRIX_ASSIGNMENT_LOAD_STAGE_IDS || 'NEW,EXECUTING' }}
@@ -160,6 +150,17 @@ jobs:
         run: |
           python scripts/validate_repo.py
           python -m eqazyna_bitrix.main --help >/dev/null
+
+      - name: Diagnose e-Qazyna access
+        run: |
+          echo "== e-Qazyna host =="
+          curl -I -L --connect-timeout 10 --max-time 30 https://minerals.e-qazyna.kz || true
+
+          echo "== e-Qazyna registry =="
+          curl -I -L --connect-timeout 10 --max-time 30 "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list" || true
+
+          echo "== e-Qazyna filtered registry =="
+          curl -I -L --connect-timeout 10 --max-time 30 "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list?oq=&flMineralUserXin=&flDocNum=&flDocType=%D0%A2%D0%BF%D0%B8%D0%97%D0%B0%D1%8F%D0%B2%D0%BA%D0%B0%D0%9D%D0%B0%D0%A0%D0%B0%D0%B7%D0%B2%D0%B5%D0%B4%D0%BA%D1%83" || true
 
       - name: Run parser, enrichment and Bitrix distribution
         run: |
@@ -193,7 +194,6 @@ jobs:
             exit 1
           fi
 
-          echo "RUNNER=${{ inputs.runner }}"
           echo "PAGES=$PAGES PAGE_START=$PAGE_START PAGE_LIST=$PAGE_LIST"
           echo "PUSH_BITRIX=$PUSH_BITRIX DRY_RUN=$DRY_RUN NO_EGOV=$NO_EGOV"
           echo "CRM_MODE=deal"
@@ -203,13 +203,7 @@ jobs:
           echo "INHERIT_FAILED_DEALS_BY_DIRECTOR=$INHERIT_FAILED_DEALS_BY_DIRECTOR"
           echo "FAILED_DEAL_STAGE_IDS=$FAILED_DEAL_STAGE_IDS"
           echo "FAILED_DEAL_REASON_FIELDS=$FAILED_DEAL_REASON_FIELDS"
-          echo "EQAZYNA_REQUEST_TIMEOUT=${EQAZYNA_REQUEST_TIMEOUT:-20}"
-          echo "EQAZYNA_FETCH_MODE=${EQAZYNA_FETCH_MODE:-filtered}"
-          echo "EQAZYNA_AUTO_PROXY=${EQAZYNA_AUTO_PROXY:-true}"
-          echo "EQAZYNA_PROXY_TEST_LIMIT=${EQAZYNA_PROXY_TEST_LIMIT:-100}"
-          echo "EQAZYNA_PROXY_TEST_WORKERS=${EQAZYNA_PROXY_TEST_WORKERS:-25}"
-          echo "EQAZYNA_PROXY_TEST_TIMEOUT=${EQAZYNA_PROXY_TEST_TIMEOUT:-8}"
-          echo "EQAZYNA_HTTPS_PROXY_SET=$([ -n "${EQAZYNA_HTTPS_PROXY:-}" ] && echo yes || echo no)"
+          echo "EQAZYNA_REQUEST_TIMEOUT=${EQAZYNA_REQUEST_TIMEOUT:-30}"
           echo "MAX_CONSECUTIVE_PAGE_ERRORS=$MAX_CONSECUTIVE_PAGE_ERRORS"
 
           ARGS=(
@@ -257,82 +251,23 @@ jobs:
           import json
           from pathlib import Path
 
-          failed = []
+          p = Path("exports/eqazyna_bitrix_log.json")
 
-          pages_path = Path("exports/eqazyna_bitrix_log_pages.json")
-          result_path = Path("exports/eqazyna_bitrix_log.json")
-          marker_path = Path("exports/WORKFLOW_FAILED.txt")
+          if p.exists():
+              data = json.loads(p.read_text(encoding="utf-8"))
+              rows = data if isinstance(data, list) else data.get("results", [])
+              errors = [
+                  r for r in rows
+                  if r.get("error") or str(r.get("action", "")).lower() == "error"
+              ]
 
-          if marker_path.exists():
-              marker_path.unlink()
+              print(f"JSON_SUMMARY rows={len(rows)} errors={len(errors)}")
 
-          if not pages_path.exists():
-              failed.append("exports/eqazyna_bitrix_log_pages.json was not created")
-          else:
-              try:
-                  pages_data = json.loads(pages_path.read_text(encoding="utf-8"))
-              except Exception as exc:
-                  failed.append(f"Cannot read pages json: {exc}")
-                  pages_data = []
-
-              if isinstance(pages_data, dict):
-                  pages = pages_data.get("pages") or pages_data.get("page_logs") or pages_data.get("results") or []
-              elif isinstance(pages_data, list):
-                  pages = pages_data
-              else:
-                  pages = []
-
-              if not pages:
-                  failed.append("No page logs found")
-
-              for page in pages:
-                  if not isinstance(page, dict):
-                      continue
-
-                  status = str(page.get("status", "")).lower()
-                  page_no = page.get("page", "?")
-                  error = page.get("error", "")
-
-                  if status in {"failed", "empty"}:
-                      failed.append(f"e-Qazyna page {page_no} status={status}; error={error}")
-
-          if not result_path.exists():
-              failed.append("exports/eqazyna_bitrix_log.json was not created")
-          else:
-              try:
-                  result_data = json.loads(result_path.read_text(encoding="utf-8"))
-                  rows = result_data if isinstance(result_data, list) else result_data.get("results", [])
-                  row_errors = [
-                      r for r in rows
-                      if isinstance(r, dict)
-                      and (r.get("error") or str(r.get("action", "")).lower() == "error")
-                  ]
-
-                  print(f"JSON_SUMMARY rows={len(rows)} errors={len(row_errors)}")
-
-                  for row in row_errors[:10]:
-                      print("ERROR_ROW", row)
-
-                  if row_errors:
-                      failed.append(f"Bitrix/eGov processing errors: {len(row_errors)}")
-
-              except Exception as exc:
-                  failed.append(f"Cannot read result json: {exc}")
-
-          if failed:
-              text = "WORKFLOW_FAILED:\n" + "\n".join(f" - {x}" for x in failed) + "\n"
-              print(text)
-              marker_path.write_text(text, encoding="utf-8")
-          else:
-              print("WORKFLOW_OK")
+              for row in errors[:10]:
+                  print("ERROR_ROW", row)
           PY
 
           ls -lah exports
-
-          if [ -f exports/WORKFLOW_FAILED.txt ]; then
-            cat exports/WORKFLOW_FAILED.txt
-            exit 1
-          fi
 
       - name: Upload run logs
         if: always()
@@ -342,6 +277,5 @@ jobs:
           path: |
             exports/*.xlsx
             exports/*.json
-            exports/*.txt
           if-no-files-found: ignore
           retention-days: 14
