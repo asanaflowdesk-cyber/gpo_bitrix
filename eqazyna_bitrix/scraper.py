@@ -120,12 +120,15 @@ class PageLog:
 
 @dataclass(slots=True)
 class EqazynaScraper:
-    timeout: int = 30
+    # Быстрые настройки для падения e-Qazyna:
+    # было timeout 30/60, max_retries 5, sleep 3/6/9/12/15;
+    # теперь максимум около 20–25 секунд на первую недоступную страницу.
+    timeout: int = 10
     polite_delay_seconds: float = 0.5
-    max_retries: int = 5
-    retry_base_sleep_seconds: float = 3.0
+    max_retries: int = 2
+    retry_base_sleep_seconds: float = 1.0
     continue_on_page_error: bool = True
-    max_consecutive_page_errors: int = 5
+    max_consecutive_page_errors: int = 1
     session: requests.Session | None = None
     page_logs: list[PageLog] = field(default_factory=list)
     failed_pages: list[int] = field(default_factory=list)
@@ -133,6 +136,7 @@ class EqazynaScraper:
     def __post_init__(self) -> None:
         if self.session is None:
             self.session = requests.Session()
+
         self.session.headers.update(
             {
                 "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor; +https://github.com/)",
@@ -150,6 +154,7 @@ class EqazynaScraper:
         ]
 
         doc_type = doc_type.strip() if doc_type else None
+
         if doc_type:
             filter_doc_type = DOC_TYPE_FILTER_VALUES.get(doc_type)
             if filter_doc_type:
@@ -169,38 +174,51 @@ class EqazynaScraper:
     def fetch_page(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> tuple[str, str]:
         url = self.build_url(page, doc_type, statuses)
         last_error: Exception | None = None
+
         for attempt in range(1, self.max_retries + 1):
             try:
                 response = self.session.get(url, timeout=self.timeout)
                 response.raise_for_status()
                 return response.text, url
+
             except requests.RequestException as exc:
                 last_error = exc
-                sleep_for = min(self.retry_base_sleep_seconds * attempt, 30)
+
                 print(
                     f"    WARN: e-Qazyna page {page} failed on attempt "
-                    f"{attempt}/{self.max_retries}: {exc}; sleep {sleep_for:.1f}s"
+                    f"{attempt}/{self.max_retries}: {exc}"
                 )
-                time.sleep(sleep_for)
+
+                if attempt < self.max_retries:
+                    sleep_for = self.retry_base_sleep_seconds
+                    print(f"    sleep {sleep_for:.1f}s")
+                    time.sleep(sleep_for)
+
         raise last_error or RuntimeError(f"e-Qazyna page {page} failed")
 
     @staticmethod
     def parse_page_list(value: str | None) -> list[int] | None:
         if not value or not value.strip():
             return None
+
         pages: set[int] = set()
+
         for part in value.split(","):
             part = part.strip()
             if not part:
                 continue
+
             if "-" in part:
                 left, right = [p.strip() for p in part.split("-", 1)]
                 start, end = int(left), int(right)
+
                 if end < start:
                     start, end = end, start
+
                 pages.update(range(start, end + 1))
             else:
                 pages.add(int(part))
+
         return sorted(p for p in pages if p > 0)
 
     def scrape(
@@ -215,8 +233,10 @@ class EqazynaScraper:
     ) -> list[Application]:
         wanted_statuses = {s.strip() for s in statuses if s and s.strip()}
         doc_type = doc_type.strip() if doc_type else None
+
         results: list[Application] = []
         seen_keys: set[str] = set()
+
         self.page_logs.clear()
         self.failed_pages.clear()
 
@@ -227,64 +247,98 @@ class EqazynaScraper:
 
         for page in page_numbers:
             url = self.build_url(page, doc_type, wanted_statuses)
+
             try:
                 html, url = self.fetch_page(page, doc_type, wanted_statuses)
-            except Exception as exc:  # noqa: BLE001 - keep backfill alive
+
+            except Exception as exc:
                 error = str(exc)
+
                 self.failed_pages.append(page)
-                self.page_logs.append(PageLog(page=page, url=url, status="failed", error=error, total_after_page=len(results)))
-                print(f"    ERROR: page {page} failed after retries; continue_on_page_error={self.continue_on_page_error}: {error}")
+                self.page_logs.append(
+                    PageLog(
+                        page=page,
+                        url=url,
+                        status="failed",
+                        error=error,
+                        total_after_page=len(results),
+                    )
+                )
+
+                print(
+                    f"    ERROR: page {page} failed after retries; "
+                    f"continue_on_page_error={self.continue_on_page_error}: {error}"
+                )
+
                 if not self.continue_on_page_error:
                     raise
+
                 consecutive_failed_pages += 1
+
                 if (
                     sequential_mode
                     and self.max_consecutive_page_errors > 0
                     and consecutive_failed_pages >= self.max_consecutive_page_errors
                 ):
                     print(
-                        f"    stop: {consecutive_failed_pages} consecutive failed pages; "
-                        "processing already collected applications"
+                        f"    stop: {consecutive_failed_pages} consecutive failed page(s); "
+                        "e-Qazyna unavailable, processing already collected applications"
                     )
                     break
+
                 time.sleep(self.polite_delay_seconds)
                 continue
 
             consecutive_failed_pages = 0
-            rows = parse_applications(html, url, doc_types=[doc_type] if doc_type else None)
 
-            # Important: do not fetch the unfiltered registry when filters are active.
-            # It can mix rows from another part of the e-Qazyna list into the current
-            # run. The local filters below are still kept as a second safety layer,
-            # but the source page itself must remain filtered.
+            rows = parse_applications(html, url, doc_types=[doc_type] if doc_type else None)
 
             if not rows:
                 text_preview = clean_text(make_soup(html).get_text(" "))[:500]
+
                 print(f"    page {page}: no rows; html_chars={len(html)} text_preview={text_preview!r}")
-                self.page_logs.append(PageLog(page=page, url=url, status="empty", total_after_page=len(results), error=f"no_rows html_chars={len(html)} preview={text_preview}"))
+
+                self.page_logs.append(
+                    PageLog(
+                        page=page,
+                        url=url,
+                        status="empty",
+                        total_after_page=len(results),
+                        error=f"no_rows html_chars={len(html)} preview={text_preview}",
+                    )
+                )
+
                 if stop_on_empty_page and sequential_mode:
                     break
+
                 time.sleep(self.polite_delay_seconds)
                 continue
 
             accepted_on_page = 0
             stop_by_date = False
+
             for app in rows:
                 created_date = parse_created_date(app.created_at_raw)
+
                 if min_created_date and created_date and created_date < min_created_date:
                     stop_by_date = True
                     continue
+
                 if doc_type and app.doc_type.strip() != doc_type:
                     continue
+
                 if wanted_statuses and app.status.strip() not in wanted_statuses:
                     continue
+
                 if app.application_key in seen_keys:
                     continue
+
                 seen_keys.add(app.application_key)
                 results.append(app)
                 accepted_on_page += 1
 
             status = "stopped_by_date" if stop_by_date else "ok"
+
             self.page_logs.append(
                 PageLog(
                     page=page,
@@ -295,16 +349,19 @@ class EqazynaScraper:
                     status=status,
                 )
             )
+
             print(f"    page {page}: rows={len(rows)} accepted={accepted_on_page} total={len(results)} url={url}")
+
             if stop_by_date and sequential_mode:
                 print(f"    stop: reached min_created_date={min_created_date.isoformat() if min_created_date else None}")
                 break
+
             time.sleep(self.polite_delay_seconds)
+
         return results
 
 
 def make_soup(html: str) -> BeautifulSoup:
-    """Parse HTML robustly. Prefer lxml when installed, fall back to stdlib parser."""
     try:
         return BeautifulSoup(html, "lxml")
     except FeatureNotFound:
@@ -318,36 +375,54 @@ def clean_text(value: str) -> str:
 
 def parse_created_date(value: str) -> date | None:
     value = clean_text(value)
+
     for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y"):
         try:
             return datetime.strptime(value[:19] if "%H" in fmt else value[:10], fmt).date()
         except ValueError:
             pass
+
     return None
 
 
 def parse_applications(html: str, source_url: str, doc_types: list[str | None] | None = None) -> list[Application]:
     soup = make_soup(html)
+
     parsed = _parse_html_tables(soup, source_url)
     if parsed:
         return parsed
+
     text = soup.get_text("\n")
     return _parse_text_fallback(text, source_url, doc_types=doc_types)
 
 
 def _parse_html_tables(soup: BeautifulSoup, source_url: str) -> list[Application]:
     rows: list[Application] = []
+
     for tr in soup.find_all("tr"):
         cells = [clean_text(td.get_text(" ")) for td in tr.find_all(["td", "th"])]
+
         if len(cells) < 6:
             continue
-        if cells[:6] == ["Дата создания", "Номер документа", "ИИН/БИН заявителя", "Наименование заявителя", "Тип документа", "Статус заявки"]:
+
+        if cells[:6] == [
+            "Дата создания",
+            "Номер документа",
+            "ИИН/БИН заявителя",
+            "Наименование заявителя",
+            "Тип документа",
+            "Статус заявки",
+        ]:
             continue
+
         date_raw, doc, bin_number, name, doc_type, status = cells[:6]
+
         if not re.match(r"\d{2}\.\d{2}\.\d{4}", date_raw):
             continue
+
         if not re.fullmatch(r"\d{12}", bin_number):
             continue
+
         rows.append(
             Application(
                 created_at_raw=date_raw,
@@ -359,39 +434,51 @@ def _parse_html_tables(soup: BeautifulSoup, source_url: str) -> list[Application
                 source_url=source_url,
             )
         )
+
     return rows
 
 
 def _parse_text_fallback(text: str, source_url: str, doc_types: list[str | None] | None = None) -> list[Application]:
     rows: list[Application] = []
+
     candidates = [d for d in (doc_types or []) if d] + KNOWN_DOC_TYPES
     candidates = sorted(set(candidates), key=len, reverse=True)
 
     row_re = re.compile(r"(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2})\s+([A-Z0-9\-]+)\s+(\d{12})\s+(.+)")
+
     for raw_line in text.splitlines():
         line = clean_text(raw_line)
         match = row_re.match(line)
+
         if not match:
             continue
+
         created_at, doc_number, bin_number, tail = match.groups()
+
         status = None
+
         for s in KNOWN_STATUSES:
             if tail.endswith(s):
                 status = s
                 tail = tail[: -len(s)].strip()
                 break
+
         if not status:
             continue
+
         doc_type = None
         applicant_name = ""
+
         for candidate in candidates:
             if candidate and candidate in tail:
                 idx = tail.rfind(candidate)
                 doc_type = candidate
                 applicant_name = clean_text(tail[:idx])
                 break
+
         if not doc_type:
             continue
+
         rows.append(
             Application(
                 created_at_raw=created_at,
@@ -403,4 +490,5 @@ def _parse_text_fallback(text: str, source_url: str, doc_types: list[str | None]
                 source_url=source_url,
             )
         )
+
     return rows
