@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import os
 import re
 import socket
 import time
@@ -29,9 +29,11 @@ _force_ipv4()
 
 BASE_URL = "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list"
 
+
 DOC_TYPE_FILTER_VALUES = {
     "Заявка на разведку ТПИ": "ТпиЗаявкаНаРазведку",
 }
+
 
 STATUS_FILTER_VALUES = {
     "Отправлено на рассмотрение": "НаРассмотрении",
@@ -42,6 +44,7 @@ STATUS_FILTER_VALUES = {
     "Аннулировано": "Аннулировано",
     "Завершено": "Завершено",
 }
+
 
 KNOWN_DOC_TYPES = [
     "Оцифровка контракта",
@@ -99,6 +102,7 @@ KNOWN_DOC_TYPES = [
     "Подписание Протоколов",
     "Гео отчетность",
 ]
+
 
 KNOWN_STATUSES = [
     "Отправлено на рассмотрение",
@@ -191,17 +195,27 @@ class EqazynaScraper:
         url = self.build_url(page, doc_type, statuses)
         errors: list[str] = []
 
-        fetchers = [
-            ("direct", lambda: self._fetch_direct(url, page)),
-            ("allorigins_raw", lambda: self._fetch_allorigins_raw(url, page)),
-            ("allorigins_get", lambda: self._fetch_allorigins_get(url, page)),
-            ("corsproxy", lambda: self._fetch_corsproxy(url, page)),
-            ("jina", lambda: self._fetch_jina(url, page)),
-        ]
+        fetchers: list[tuple[str, object]] = []
+
+        # Если задан свой proxy, используем его первым.
+        # Иначе GitHub будет зря ждать прямой timeout до e-Qazyna.
+        if os.getenv("EQAZYNA_PROXY_URL"):
+            fetchers.append(("custom_proxy", lambda: self._fetch_custom_proxy(url, page)))
+
+        fetchers.extend(
+            [
+                ("direct", lambda: self._fetch_direct(url, page)),
+                ("allorigins_raw", lambda: self._fetch_allorigins_raw(url, page)),
+                ("allorigins_get", lambda: self._fetch_allorigins_get(url, page)),
+                ("corsproxy", lambda: self._fetch_corsproxy(url, page)),
+                ("jina", lambda: self._fetch_jina(url, page)),
+            ]
+        )
 
         for name, fetcher in fetchers:
             try:
                 html, source_url = fetcher()
+
                 if _looks_like_registry_page(html):
                     if name != "direct":
                         print(f"    FALLBACK_OK source={name} page={page}")
@@ -215,6 +229,43 @@ class EqazynaScraper:
                 print(f"    WARN: {message}")
 
         raise RuntimeError("All e-Qazyna fetch methods failed: " + " | ".join(errors))
+
+    def _fetch_custom_proxy(self, url: str, page: int) -> tuple[str, str]:
+        proxy_url = os.getenv("EQAZYNA_PROXY_URL")
+        token = os.getenv("EQAZYNA_PROXY_TOKEN")
+
+        if not proxy_url:
+            raise RuntimeError("EQAZYNA_PROXY_URL is not set")
+
+        response = self.session.get(
+            proxy_url,
+            params={
+                "token": token or "",
+                "url": url,
+            },
+            timeout=max(self.timeout, 60),
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor)",
+                "Accept": "text/plain,text/html,*/*",
+            },
+        )
+        response.raise_for_status()
+
+        text = response.text or ""
+
+        if text.startswith("FORBIDDEN"):
+            raise RuntimeError("custom proxy returned FORBIDDEN")
+
+        if text.startswith("BAD_URL"):
+            raise RuntimeError("custom proxy returned BAD_URL")
+
+        if text.startswith("FETCH_ERROR"):
+            raise RuntimeError(text[:700])
+
+        if text.startswith("EMPTY_RESPONSE_CODE"):
+            raise RuntimeError(text[:300])
+
+        return text, url
 
     def _fetch_direct(self, url: str, page: int) -> tuple[str, str]:
         last_error: Exception | None = None
@@ -463,6 +514,7 @@ class EqazynaScraper:
 
 def _looks_like_registry_page(value: str) -> bool:
     text = value or ""
+
     markers = (
         "Реестр заявок",
         "Дата создания",
@@ -471,6 +523,7 @@ def _looks_like_registry_page(value: str) -> bool:
         "Тип документа",
         "Статус заявки",
     )
+
     return any(marker in text for marker in markers)
 
 
