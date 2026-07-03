@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
+import random
 import re
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Iterable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import requests
 from bs4 import BeautifulSoup, FeatureNotFound
@@ -25,11 +27,17 @@ _force_ipv4()
 
 BASE_URL = "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list"
 
+PROXY_LIST_URLS = [
+    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/kz/http/data.txt",
+    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/ru/http/data.txt",
+    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/tr/http/data.txt",
+    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/https/data.txt",
+    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/http/data.txt",
+]
 
 DOC_TYPE_FILTER_VALUES = {
     "Заявка на разведку ТПИ": "ТпиЗаявкаНаРазведку",
 }
-
 
 STATUS_FILTER_VALUES = {
     "Отправлено на рассмотрение": "НаРассмотрении",
@@ -40,7 +48,6 @@ STATUS_FILTER_VALUES = {
     "Аннулировано": "Аннулировано",
     "Завершено": "Завершено",
 }
-
 
 KNOWN_DOC_TYPES = [
     "Оцифровка контракта",
@@ -99,7 +106,6 @@ KNOWN_DOC_TYPES = [
     "Гео отчетность",
 ]
 
-
 KNOWN_STATUSES = [
     "Отправлено на рассмотрение",
     "Принято",
@@ -137,18 +143,20 @@ class PageLog:
 class EqazynaScraper:
     timeout: int = 20
     polite_delay_seconds: float = 0.5
-    max_retries: int = 2
+    max_retries: int = 1
     retry_base_sleep_seconds: float = 1.0
     continue_on_page_error: bool = True
     max_consecutive_page_errors: int = 1
     session: requests.Session | None = None
     page_logs: list[PageLog] = field(default_factory=list)
     failed_pages: list[int] = field(default_factory=list)
+    working_proxy: str | None = None
 
     def __post_init__(self) -> None:
         if self.session is None:
             self.session = requests.Session()
 
+        self.session.trust_env = False
         self.session.headers.update(
             {
                 "User-Agent": (
@@ -164,20 +172,6 @@ class EqazynaScraper:
             }
         )
 
-        proxy = (os.getenv("EQAZYNA_HTTPS_PROXY") or "").strip()
-
-        if proxy:
-            self.session.trust_env = False
-            self.session.proxies.update(
-                {
-                    "http": proxy,
-                    "https": proxy,
-                }
-            )
-            print("    EQAZYNA_HTTPS_PROXY_ENABLED=yes")
-        else:
-            print("    EQAZYNA_HTTPS_PROXY_ENABLED=no")
-
     def build_url(self, page: int, doc_type: str | None = None, statuses: Iterable[str] | None = None) -> str:
         mode = (os.getenv("EQAZYNA_FETCH_MODE") or "filtered").strip().lower()
 
@@ -187,7 +181,7 @@ class EqazynaScraper:
                 params.append(("p", str(page)))
             return f"{BASE_URL}?{urlencode(params, doseq=True)}" if params else BASE_URL
 
-        params = [
+        params: list[tuple[str, str]] = [
             ("oq", ""),
             ("flMineralUserXin", ""),
         ]
@@ -213,29 +207,49 @@ class EqazynaScraper:
 
     def fetch_page(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> tuple[str, str]:
         url = self.build_url(page, doc_type, statuses)
+
+        if self.working_proxy:
+            try:
+                html = self._request(url, proxy=self.working_proxy, timeout=self.timeout)
+                return html, url
+            except Exception as exc:
+                print(f"    WARN: saved proxy failed, will search again: {exc}")
+                self.working_proxy = None
+
+        manual_proxy = self._normalize_proxy(os.getenv("EQAZYNA_HTTPS_PROXY") or "")
+        if manual_proxy:
+            try:
+                html = self._request(url, proxy=manual_proxy, timeout=self.timeout)
+                self.working_proxy = manual_proxy
+                print("    MANUAL_PROXY_OK")
+                return html, url
+            except Exception as exc:
+                print(f"    WARN: manual proxy failed: {exc}")
+
+        auto_enabled = (os.getenv("EQAZYNA_AUTO_PROXY") or "true").strip().lower() not in {"0", "false", "no"}
+        if auto_enabled:
+            try:
+                html, proxy = self._fetch_with_auto_proxy(url)
+                self.working_proxy = proxy
+                print("    AUTO_PROXY_OK")
+                return html, url
+            except Exception as exc:
+                print(f"    WARN: auto proxy failed: {exc}")
+
+        return self._fetch_direct(url, page)
+
+    def _fetch_direct(self, url: str, page: int) -> tuple[str, str]:
         last_error: Exception | None = None
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = self.session.get(
-                    url,
-                    timeout=self.timeout,
-                    allow_redirects=True,
-                )
-                response.raise_for_status()
-
-                html = response.text or ""
-
-                if not _looks_like_registry_page(html):
-                    preview = clean_text(make_soup(html).get_text(" "))[:500]
-                    raise RuntimeError(f"page does not look like registry; preview={preview!r}")
-
+                html = self._request(url, proxy=None, timeout=self.timeout)
                 return html, url
 
             except Exception as exc:
                 last_error = exc
                 print(
-                    f"    WARN: e-Qazyna page {page} failed on attempt "
+                    f"    WARN: e-Qazyna direct page {page} failed on attempt "
                     f"{attempt}/{self.max_retries}: {exc}"
                 )
 
@@ -245,6 +259,125 @@ class EqazynaScraper:
                     time.sleep(sleep_for)
 
         raise last_error or RuntimeError(f"e-Qazyna page {page} failed")
+
+    def _fetch_with_auto_proxy(self, url: str) -> tuple[str, str]:
+        candidates = self._load_candidate_proxies()
+
+        if not candidates:
+            raise RuntimeError("no proxy candidates loaded")
+
+        limit = int(os.getenv("EQAZYNA_PROXY_TEST_LIMIT") or "80")
+        workers = int(os.getenv("EQAZYNA_PROXY_TEST_WORKERS") or "20")
+        proxy_timeout = int(os.getenv("EQAZYNA_PROXY_TEST_TIMEOUT") or "7")
+
+        candidates = candidates[: max(1, limit)]
+        print(f"    AUTO_PROXY_TEST candidates={len(candidates)} workers={workers} timeout={proxy_timeout}")
+
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+            futures = {
+                executor.submit(self._try_proxy_once, url, proxy, proxy_timeout): proxy
+                for proxy in candidates
+            }
+
+            for future in as_completed(futures):
+                proxy = futures[future]
+                try:
+                    html = future.result()
+                    print(f"    AUTO_PROXY_SELECTED={self._mask_proxy(proxy)}")
+                    return html, proxy
+                except Exception:
+                    continue
+
+        raise RuntimeError("no working proxy found")
+
+    def _load_candidate_proxies(self) -> list[str]:
+        proxies: list[str] = []
+        seen: set[str] = set()
+
+        for source_url in PROXY_LIST_URLS:
+            try:
+                response = requests.get(
+                    source_url,
+                    timeout=12,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+
+                if response.status_code == 404:
+                    continue
+
+                response.raise_for_status()
+
+                for raw in response.text.splitlines():
+                    proxy = self._normalize_proxy(raw)
+                    if proxy and proxy not in seen:
+                        seen.add(proxy)
+                        proxies.append(proxy)
+
+            except Exception as exc:
+                print(f"    WARN: proxy source failed: {source_url} :: {exc}")
+
+        random.shuffle(proxies)
+        print(f"    AUTO_PROXY_LOADED={len(proxies)}")
+        return proxies
+
+    def _try_proxy_once(self, url: str, proxy: str, timeout: int) -> str:
+        return self._request(url, proxy=proxy, timeout=timeout)
+
+    def _request(self, url: str, proxy: str | None, timeout: int) -> str:
+        session = requests.Session()
+        session.trust_env = False
+        session.headers.update(self.session.headers if self.session else {})
+
+        if proxy:
+            session.proxies.update({"http": proxy, "https": proxy})
+
+        response = session.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+
+        html = response.text or ""
+
+        if not _looks_like_registry_page(html):
+            preview = clean_text(make_soup(html).get_text(" "))[:500]
+            raise RuntimeError(f"page does not look like registry; preview={preview!r}")
+
+        return html
+
+    @staticmethod
+    def _normalize_proxy(value: str) -> str | None:
+        value = (value or "").strip()
+
+        if not value:
+            return None
+
+        if value.startswith("#"):
+            return None
+
+        if value.startswith("socks4://") or value.startswith("socks5://") or value.startswith("socks5h://"):
+            return None
+
+        if value.startswith("https://"):
+            value = "http://" + value[len("https://") :]
+
+        if not value.startswith("http://"):
+            value = "http://" + value
+
+        parsed = urlparse(value)
+
+        if not parsed.hostname or not parsed.port:
+            return None
+
+        return value
+
+    @staticmethod
+    def _mask_proxy(proxy: str) -> str:
+        parsed = urlparse(proxy)
+        if not parsed.hostname or not parsed.port:
+            return "***"
+        return f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
 
     @staticmethod
     def parse_page_list(value: str | None) -> list[int] | None:
