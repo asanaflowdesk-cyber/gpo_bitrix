@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import os
 import re
 import socket
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Iterable
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode
 
 import requests
 from bs4 import BeautifulSoup, FeatureNotFound
@@ -17,10 +16,6 @@ from .models import Application
 
 
 def _force_ipv4() -> None:
-    """
-    GitHub Actions иногда выбирает неудачный сетевой маршрут.
-    Принудительно используем IPv4 для requests/urllib3.
-    """
     urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
 
 
@@ -28,22 +23,6 @@ _force_ipv4()
 
 
 BASE_URL = "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list"
-
-
-DOC_TYPE_FILTER_VALUES = {
-    "Заявка на разведку ТПИ": "ТпиЗаявкаНаРазведку",
-}
-
-
-STATUS_FILTER_VALUES = {
-    "Отправлено на рассмотрение": "НаРассмотрении",
-    "Принято": "Принято",
-    "Выдана лицензия": "ВыданаЛицензия",
-    "Отклонено": "Отклонено",
-    "Отозвано": "Отозвано",
-    "Аннулировано": "Аннулировано",
-    "Завершено": "Завершено",
-}
 
 
 KNOWN_DOC_TYPES = [
@@ -141,7 +120,7 @@ class PageLog:
 class EqazynaScraper:
     timeout: int = 30
     polite_delay_seconds: float = 0.5
-    max_retries: int = 2
+    max_retries: int = 1
     retry_base_sleep_seconds: float = 1.0
     continue_on_page_error: bool = True
     max_consecutive_page_errors: int = 1
@@ -160,127 +139,50 @@ class EqazynaScraper:
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/143.0.0.0 Safari/537.36"
                 ),
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
                 "Connection": "close",
             }
         )
 
-    def build_url(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> str:
-        params: list[tuple[str, str]] = [
-            ("oq", ""),
-            ("flMineralUserXin", ""),
-        ]
-
-        for status in statuses or []:
-            status = status.strip()
-            filter_status = STATUS_FILTER_VALUES.get(status)
-            if filter_status:
-                params.append(("flStatus", filter_status))
-
-        params.append(("flDocNum", ""))
-
-        doc_type = doc_type.strip() if doc_type else None
-        if doc_type:
-            filter_doc_type = DOC_TYPE_FILTER_VALUES.get(doc_type)
-            if filter_doc_type:
-                params.append(("flDocType", filter_doc_type))
+    def build_url(self, page: int, doc_type: str | None = None, statuses: Iterable[str] | None = None) -> str:
+        params: list[tuple[str, str]] = []
 
         if page > 1:
             params.append(("p", str(page)))
+
+        if not params:
+            return BASE_URL
 
         return f"{BASE_URL}?{urlencode(params, doseq=True)}"
 
     def fetch_page(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> tuple[str, str]:
         url = self.build_url(page, doc_type, statuses)
-        errors: list[str] = []
-
-        fetchers: list[tuple[str, object]] = []
-
-        # Если задан свой proxy, используем его первым.
-        # Иначе GitHub будет зря ждать прямой timeout до e-Qazyna.
-        if os.getenv("EQAZYNA_PROXY_URL"):
-            fetchers.append(("custom_proxy", lambda: self._fetch_custom_proxy(url, page)))
-
-        fetchers.extend(
-            [
-                ("direct", lambda: self._fetch_direct(url, page)),
-                ("allorigins_raw", lambda: self._fetch_allorigins_raw(url, page)),
-                ("allorigins_get", lambda: self._fetch_allorigins_get(url, page)),
-                ("corsproxy", lambda: self._fetch_corsproxy(url, page)),
-                ("jina", lambda: self._fetch_jina(url, page)),
-            ]
-        )
-
-        for name, fetcher in fetchers:
-            try:
-                html, source_url = fetcher()
-
-                if _looks_like_registry_page(html):
-                    if name != "direct":
-                        print(f"    FALLBACK_OK source={name} page={page}")
-                    return html, source_url
-
-                raise RuntimeError(f"{name} returned content without registry markers")
-
-            except Exception as exc:
-                message = f"{name}: {exc}"
-                errors.append(message)
-                print(f"    WARN: {message}")
-
-        raise RuntimeError("All e-Qazyna fetch methods failed: " + " | ".join(errors))
-
-    def _fetch_custom_proxy(self, url: str, page: int) -> tuple[str, str]:
-        proxy_url = os.getenv("EQAZYNA_PROXY_URL")
-        token = os.getenv("EQAZYNA_PROXY_TOKEN")
-
-        if not proxy_url:
-            raise RuntimeError("EQAZYNA_PROXY_URL is not set")
-
-        response = self.session.get(
-            proxy_url,
-            params={
-                "token": token or "",
-                "url": url,
-            },
-            timeout=max(self.timeout, 60),
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor)",
-                "Accept": "text/plain,text/html,*/*",
-            },
-        )
-        response.raise_for_status()
-
-        text = response.text or ""
-
-        if text.startswith("FORBIDDEN"):
-            raise RuntimeError("custom proxy returned FORBIDDEN")
-
-        if text.startswith("BAD_URL"):
-            raise RuntimeError("custom proxy returned BAD_URL")
-
-        if text.startswith("FETCH_ERROR"):
-            raise RuntimeError(text[:700])
-
-        if text.startswith("EMPTY_RESPONSE_CODE"):
-            raise RuntimeError(text[:300])
-
-        return text, url
-
-    def _fetch_direct(self, url: str, page: int) -> tuple[str, str]:
         last_error: Exception | None = None
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = self.session.get(url, timeout=self.timeout)
+                response = self.session.get(
+                    url,
+                    timeout=self.timeout,
+                    allow_redirects=True,
+                )
                 response.raise_for_status()
-                return response.text, url
 
-            except requests.RequestException as exc:
+                html = response.text or ""
+
+                if not _looks_like_registry_page(html):
+                    preview = clean_text(make_soup(html).get_text(" "))[:500]
+                    raise RuntimeError(f"page does not look like registry; preview={preview!r}")
+
+                return html, url
+
+            except Exception as exc:
                 last_error = exc
-
                 print(
-                    f"    WARN: e-Qazyna page {page} failed on attempt "
+                    f"    WARN: e-Qazyna base page {page} failed on attempt "
                     f"{attempt}/{self.max_retries}: {exc}"
                 )
 
@@ -290,61 +192,6 @@ class EqazynaScraper:
                     time.sleep(sleep_for)
 
         raise last_error or RuntimeError(f"e-Qazyna page {page} failed")
-
-    def _fetch_allorigins_raw(self, url: str, page: int) -> tuple[str, str]:
-        proxy_url = "https://api.allorigins.win/raw?url=" + quote(url, safe="")
-        response = self.session.get(
-            proxy_url,
-            timeout=max(self.timeout, 45),
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor)",
-                "Accept": "text/html,text/plain,*/*",
-            },
-        )
-        response.raise_for_status()
-        return response.text or "", proxy_url
-
-    def _fetch_allorigins_get(self, url: str, page: int) -> tuple[str, str]:
-        proxy_url = "https://api.allorigins.win/get?url=" + quote(url, safe="")
-        response = self.session.get(
-            proxy_url,
-            timeout=max(self.timeout, 45),
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor)",
-                "Accept": "application/json,text/plain,*/*",
-            },
-        )
-        response.raise_for_status()
-
-        payload = response.json()
-        contents = payload.get("contents") or ""
-        return contents, proxy_url
-
-    def _fetch_corsproxy(self, url: str, page: int) -> tuple[str, str]:
-        proxy_url = "https://corsproxy.io/?url=" + quote(url, safe="")
-        response = self.session.get(
-            proxy_url,
-            timeout=max(self.timeout, 45),
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor)",
-                "Accept": "text/html,text/plain,*/*",
-            },
-        )
-        response.raise_for_status()
-        return response.text or "", proxy_url
-
-    def _fetch_jina(self, url: str, page: int) -> tuple[str, str]:
-        jina_url = "https://r.jina.ai/" + url
-        response = self.session.get(
-            jina_url,
-            timeout=max(self.timeout, 45),
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor)",
-                "Accept": "text/plain,text/markdown,*/*",
-            },
-        )
-        response.raise_for_status()
-        return response.text or "", jina_url
 
     @staticmethod
     def parse_page_list(value: str | None) -> list[int] | None:
@@ -393,6 +240,7 @@ class EqazynaScraper:
 
         explicit_pages = self.parse_page_list(page_list)
         page_numbers = explicit_pages if explicit_pages else list(range(max(1, page_start), max(1, page_start) + pages))
+
         sequential_mode = explicit_pages is None
         consecutive_failed_pages = 0
 
@@ -501,7 +349,10 @@ class EqazynaScraper:
                 )
             )
 
-            print(f"    page {page}: rows={len(rows)} accepted={accepted_on_page} total={len(results)} url={url}")
+            print(
+                f"    page {page}: rows={len(rows)} "
+                f"accepted={accepted_on_page} total={len(results)} url={url}"
+            )
 
             if stop_by_date and sequential_mode:
                 print(f"    stop: reached min_created_date={min_created_date.isoformat() if min_created_date else None}")
@@ -520,6 +371,7 @@ def _looks_like_registry_page(value: str) -> bool:
         "Дата создания",
         "Номер документа",
         "ИИН/БИН заявителя",
+        "Наименование заявителя",
         "Тип документа",
         "Статус заявки",
     )
@@ -552,10 +404,6 @@ def parse_created_date(value: str) -> date | None:
 
 
 def parse_applications(html: str, source_url: str, doc_types: list[str | None] | None = None) -> list[Application]:
-    parsed_markdown = _parse_markdown_tables(html, source_url)
-    if parsed_markdown:
-        return parsed_markdown
-
     soup = make_soup(html)
 
     parsed_html = _parse_html_tables(soup, source_url)
@@ -564,11 +412,15 @@ def parse_applications(html: str, source_url: str, doc_types: list[str | None] |
 
     text = soup.get_text("\n")
 
-    parsed_markdown_from_text = _parse_markdown_tables(text, source_url)
-    if parsed_markdown_from_text:
-        return parsed_markdown_from_text
+    parsed_text = _parse_text_fallback(text, source_url, doc_types=doc_types)
+    if parsed_text:
+        return parsed_text
 
-    return _parse_text_fallback(text, source_url, doc_types=doc_types)
+    parsed_markdown = _parse_markdown_tables(html, source_url)
+    if parsed_markdown:
+        return parsed_markdown
+
+    return []
 
 
 def _parse_html_tables(soup: BeautifulSoup, source_url: str) -> list[Application]:
@@ -590,7 +442,7 @@ def _parse_html_tables(soup: BeautifulSoup, source_url: str) -> list[Application
         ]:
             continue
 
-        date_raw, doc, bin_number, name, doc_type, status = cells[:6]
+        date_raw, doc_number, bin_number, applicant_name, doc_type, status = cells[:6]
 
         if not re.match(r"\d{2}\.\d{2}\.\d{4}", date_raw):
             continue
@@ -601,9 +453,9 @@ def _parse_html_tables(soup: BeautifulSoup, source_url: str) -> list[Application
         rows.append(
             Application(
                 created_at_raw=date_raw,
-                doc_number=doc,
+                doc_number=doc_number,
                 bin=bin_number,
-                applicant_name=name,
+                applicant_name=applicant_name,
                 doc_type=doc_type,
                 status=status,
                 source_url=source_url,
@@ -640,7 +492,7 @@ def _parse_markdown_tables(text: str, source_url: str) -> list[Application]:
         ]:
             continue
 
-        date_raw, doc, bin_number, name, doc_type, status = cells[:6]
+        date_raw, doc_number, bin_number, applicant_name, doc_type, status = cells[:6]
 
         if not re.match(r"\d{2}\.\d{2}\.\d{4}", date_raw):
             continue
@@ -651,9 +503,9 @@ def _parse_markdown_tables(text: str, source_url: str) -> list[Application]:
         rows.append(
             Application(
                 created_at_raw=date_raw,
-                doc_number=doc,
+                doc_number=doc_number,
                 bin=bin_number,
-                applicant_name=name,
+                applicant_name=applicant_name,
                 doc_type=doc_type,
                 status=status,
                 source_url=source_url,
@@ -669,7 +521,12 @@ def _parse_text_fallback(text: str, source_url: str, doc_types: list[str | None]
     candidates = [d for d in (doc_types or []) if d] + KNOWN_DOC_TYPES
     candidates = sorted(set(candidates), key=len, reverse=True)
 
-    row_re = re.compile(r"(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2})\s+([A-Z0-9\-]+)\s+(\d{12})\s+(.+)")
+    row_re = re.compile(
+        r"(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2})\s+"
+        r"([A-ZА-Я0-9\-\/]+)\s+"
+        r"(\d{12})\s+"
+        r"(.+)"
+    )
 
     for raw_line in text.splitlines():
         line = clean_text(raw_line)
@@ -682,10 +539,10 @@ def _parse_text_fallback(text: str, source_url: str, doc_types: list[str | None]
 
         status = None
 
-        for s in KNOWN_STATUSES:
-            if tail.endswith(s):
-                status = s
-                tail = tail[: -len(s)].strip()
+        for known_status in KNOWN_STATUSES:
+            if tail.endswith(known_status):
+                status = known_status
+                tail = tail[: -len(known_status)].strip()
                 break
 
         if not status:
