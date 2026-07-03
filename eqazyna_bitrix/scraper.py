@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import socket
 import time
@@ -23,6 +24,22 @@ _force_ipv4()
 
 
 BASE_URL = "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list"
+
+
+DOC_TYPE_FILTER_VALUES = {
+    "Заявка на разведку ТПИ": "ТпиЗаявкаНаРазведку",
+}
+
+
+STATUS_FILTER_VALUES = {
+    "Отправлено на рассмотрение": "НаРассмотрении",
+    "Принято": "Принято",
+    "Выдана лицензия": "ВыданаЛицензия",
+    "Отклонено": "Отклонено",
+    "Отозвано": "Отозвано",
+    "Аннулировано": "Аннулировано",
+    "Завершено": "Завершено",
+}
 
 
 KNOWN_DOC_TYPES = [
@@ -118,9 +135,9 @@ class PageLog:
 
 @dataclass(slots=True)
 class EqazynaScraper:
-    timeout: int = 30
+    timeout: int = 20
     polite_delay_seconds: float = 0.5
-    max_retries: int = 1
+    max_retries: int = 2
     retry_base_sleep_seconds: float = 1.0
     continue_on_page_error: bool = True
     max_consecutive_page_errors: int = 1
@@ -147,14 +164,50 @@ class EqazynaScraper:
             }
         )
 
+        proxy = (os.getenv("EQAZYNA_HTTPS_PROXY") or "").strip()
+
+        if proxy:
+            self.session.trust_env = False
+            self.session.proxies.update(
+                {
+                    "http": proxy,
+                    "https": proxy,
+                }
+            )
+            print("    EQAZYNA_HTTPS_PROXY_ENABLED=yes")
+        else:
+            print("    EQAZYNA_HTTPS_PROXY_ENABLED=no")
+
     def build_url(self, page: int, doc_type: str | None = None, statuses: Iterable[str] | None = None) -> str:
-        params: list[tuple[str, str]] = []
+        mode = (os.getenv("EQAZYNA_FETCH_MODE") or "filtered").strip().lower()
+
+        if mode == "base":
+            params: list[tuple[str, str]] = []
+            if page > 1:
+                params.append(("p", str(page)))
+            return f"{BASE_URL}?{urlencode(params, doseq=True)}" if params else BASE_URL
+
+        params = [
+            ("oq", ""),
+            ("flMineralUserXin", ""),
+        ]
+
+        for status in statuses or []:
+            status = status.strip()
+            filter_status = STATUS_FILTER_VALUES.get(status)
+            if filter_status:
+                params.append(("flStatus", filter_status))
+
+        params.append(("flDocNum", ""))
+
+        doc_type = doc_type.strip() if doc_type else None
+        if doc_type:
+            filter_doc_type = DOC_TYPE_FILTER_VALUES.get(doc_type)
+            if filter_doc_type:
+                params.append(("flDocType", filter_doc_type))
 
         if page > 1:
             params.append(("p", str(page)))
-
-        if not params:
-            return BASE_URL
 
         return f"{BASE_URL}?{urlencode(params, doseq=True)}"
 
@@ -182,7 +235,7 @@ class EqazynaScraper:
             except Exception as exc:
                 last_error = exc
                 print(
-                    f"    WARN: e-Qazyna base page {page} failed on attempt "
+                    f"    WARN: e-Qazyna page {page} failed on attempt "
                     f"{attempt}/{self.max_retries}: {exc}"
                 )
 
