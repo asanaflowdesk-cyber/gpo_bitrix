@@ -216,7 +216,12 @@ class EqazynaScraper:
                 print(f"    WARN: saved proxy failed, will search again: {exc}")
                 self.working_proxy = None
 
-        manual_proxy = self._normalize_proxy(os.getenv("EQAZYNA_HTTPS_PROXY") or "")
+        manual_raw_proxy = os.getenv("EQAZYNA_HTTPS_PROXY") or ""
+        manual_proxy = self._normalize_proxy(manual_raw_proxy)
+
+        if manual_raw_proxy.strip() and not manual_proxy:
+            print("    WARN: EQAZYNA_HTTPS_PROXY is set but invalid; skipped")
+
         if manual_proxy:
             try:
                 html = self._request(url, proxy=manual_proxy, timeout=self.timeout)
@@ -227,6 +232,7 @@ class EqazynaScraper:
                 print(f"    WARN: manual proxy failed: {exc}")
 
         auto_enabled = (os.getenv("EQAZYNA_AUTO_PROXY") or "true").strip().lower() not in {"0", "false", "no"}
+
         if auto_enabled:
             try:
                 html, proxy = self._fetch_with_auto_proxy(url)
@@ -245,7 +251,6 @@ class EqazynaScraper:
             try:
                 html = self._request(url, proxy=None, timeout=self.timeout)
                 return html, url
-
             except Exception as exc:
                 last_error = exc
                 print(
@@ -266,9 +271,9 @@ class EqazynaScraper:
         if not candidates:
             raise RuntimeError("no proxy candidates loaded")
 
-        limit = int(os.getenv("EQAZYNA_PROXY_TEST_LIMIT") or "80")
-        workers = int(os.getenv("EQAZYNA_PROXY_TEST_WORKERS") or "20")
-        proxy_timeout = int(os.getenv("EQAZYNA_PROXY_TEST_TIMEOUT") or "7")
+        limit = int(os.getenv("EQAZYNA_PROXY_TEST_LIMIT") or "100")
+        workers = int(os.getenv("EQAZYNA_PROXY_TEST_WORKERS") or "25")
+        proxy_timeout = int(os.getenv("EQAZYNA_PROXY_TEST_TIMEOUT") or "8")
 
         candidates = candidates[: max(1, limit)]
         print(f"    AUTO_PROXY_TEST candidates={len(candidates)} workers={workers} timeout={proxy_timeout}")
@@ -338,6 +343,9 @@ class EqazynaScraper:
         )
         response.raise_for_status()
 
+        if not response.encoding:
+            response.encoding = "utf-8"
+
         html = response.text or ""
 
         if not _looks_like_registry_page(html):
@@ -353,6 +361,23 @@ class EqazynaScraper:
         if not value:
             return None
 
+        lower_value = value.lower()
+
+        invalid_placeholders = {
+            "http://ip:port",
+            "https://ip:port",
+            "ip:port",
+            "http://host:port",
+            "https://host:port",
+            "host:port",
+            "http://login:password@host:port",
+            "https://login:password@host:port",
+            "login:password@host:port",
+        }
+
+        if lower_value in invalid_placeholders:
+            return None
+
         if value.startswith("#"):
             return None
 
@@ -365,19 +390,27 @@ class EqazynaScraper:
         if not value.startswith("http://"):
             value = "http://" + value
 
-        parsed = urlparse(value)
+        try:
+            parsed = urlparse(value)
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            return None
 
-        if not parsed.hostname or not parsed.port:
+        if not hostname or not port:
             return None
 
         return value
 
     @staticmethod
     def _mask_proxy(proxy: str) -> str:
-        parsed = urlparse(proxy)
-        if not parsed.hostname or not parsed.port:
+        try:
+            parsed = urlparse(proxy)
+            if not parsed.hostname or not parsed.port:
+                return "***"
+            return f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+        except Exception:
             return "***"
-        return f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
 
     @staticmethod
     def parse_page_list(value: str | None) -> list[int] | None:
@@ -435,7 +468,6 @@ class EqazynaScraper:
 
             try:
                 html, url = self.fetch_page(page, doc_type, wanted_statuses_list)
-
             except Exception as exc:
                 error = str(exc)
 
