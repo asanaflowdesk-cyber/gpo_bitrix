@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import re
 import socket
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Iterable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 
 import requests
 from bs4 import BeautifulSoup, FeatureNotFound
@@ -17,9 +18,8 @@ from .models import Application
 
 def _force_ipv4() -> None:
     """
-    GitHub Actions иногда не может подключиться к minerals.e-qazyna.kz
-    по маршруту, который выбирает requests/urllib3 автоматически.
-    Принудительно используем IPv4.
+    GitHub Actions иногда выбирает неудачный сетевой маршрут.
+    Принудительно используем IPv4 для requests/urllib3.
     """
     urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
 
@@ -28,7 +28,6 @@ _force_ipv4()
 
 
 BASE_URL = "https://minerals.e-qazyna.kz/ru/guest/reestr/doc/list"
-JINA_READER_PREFIX = "https://r.jina.ai/"
 
 DOC_TYPE_FILTER_VALUES = {
     "Заявка на разведку ТПИ": "ТпиЗаявкаНаРазведку",
@@ -119,7 +118,7 @@ class PageLog:
     rows: int = 0
     accepted: int = 0
     total_after_page: int = 0
-    status: str = "ok"  # ok | empty | failed | stopped_by_date
+    status: str = "ok"
     error: str | None = None
 
     def as_dict(self) -> dict[str, object]:
@@ -152,8 +151,11 @@ class EqazynaScraper:
 
         self.session.headers.update(
             {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/143.0.0.0 Safari/537.36"
+                ),
                 "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Connection": "close",
@@ -161,8 +163,6 @@ class EqazynaScraper:
         )
 
     def build_url(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> str:
-        # Порядок параметров сделан как в рабочей ссылке из браузера:
-        # oq → flMineralUserXin → flStatus → flDocNum → flDocType → p
         params: list[tuple[str, str]] = [
             ("oq", ""),
             ("flMineralUserXin", ""),
@@ -189,18 +189,32 @@ class EqazynaScraper:
 
     def fetch_page(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> tuple[str, str]:
         url = self.build_url(page, doc_type, statuses)
+        errors: list[str] = []
 
-        try:
-            return self._fetch_direct(url, page)
-        except Exception as direct_exc:
-            print(f"    WARN: direct e-Qazyna failed for page {page}; trying Jina fallback: {direct_exc}")
+        fetchers = [
+            ("direct", lambda: self._fetch_direct(url, page)),
+            ("allorigins_raw", lambda: self._fetch_allorigins_raw(url, page)),
+            ("allorigins_get", lambda: self._fetch_allorigins_get(url, page)),
+            ("corsproxy", lambda: self._fetch_corsproxy(url, page)),
+            ("jina", lambda: self._fetch_jina(url, page)),
+        ]
 
-        jina_url = f"{JINA_READER_PREFIX}{url}"
+        for name, fetcher in fetchers:
+            try:
+                html, source_url = fetcher()
+                if _looks_like_registry_page(html):
+                    if name != "direct":
+                        print(f"    FALLBACK_OK source={name} page={page}")
+                    return html, source_url
 
-        try:
-            return self._fetch_jina(jina_url, page)
-        except Exception as jina_exc:
-            raise jina_exc
+                raise RuntimeError(f"{name} returned content without registry markers")
+
+            except Exception as exc:
+                message = f"{name}: {exc}"
+                errors.append(message)
+                print(f"    WARN: {message}")
+
+        raise RuntimeError("All e-Qazyna fetch methods failed: " + " | ".join(errors))
 
     def _fetch_direct(self, url: str, page: int) -> tuple[str, str]:
         last_error: Exception | None = None
@@ -226,44 +240,60 @@ class EqazynaScraper:
 
         raise last_error or RuntimeError(f"e-Qazyna page {page} failed")
 
-    def _fetch_jina(self, jina_url: str, page: int) -> tuple[str, str]:
-        last_error: Exception | None = None
+    def _fetch_allorigins_raw(self, url: str, page: int) -> tuple[str, str]:
+        proxy_url = "https://api.allorigins.win/raw?url=" + quote(url, safe="")
+        response = self.session.get(
+            proxy_url,
+            timeout=max(self.timeout, 45),
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor)",
+                "Accept": "text/html,text/plain,*/*",
+            },
+        )
+        response.raise_for_status()
+        return response.text or "", proxy_url
 
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                response = self.session.get(
-                    jina_url,
-                    timeout=max(self.timeout, 30),
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor)",
-                        "Accept": "text/plain,text/markdown,*/*",
-                    },
-                )
-                response.raise_for_status()
+    def _fetch_allorigins_get(self, url: str, page: int) -> tuple[str, str]:
+        proxy_url = "https://api.allorigins.win/get?url=" + quote(url, safe="")
+        response = self.session.get(
+            proxy_url,
+            timeout=max(self.timeout, 45),
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor)",
+                "Accept": "application/json,text/plain,*/*",
+            },
+        )
+        response.raise_for_status()
 
-                text = response.text or ""
-                markers = ("Реестр заявок", "Дата создания", "Номер документа", "ИИН/БИН заявителя")
+        payload = response.json()
+        contents = payload.get("contents") or ""
+        return contents, proxy_url
 
-                if not any(marker in text for marker in markers):
-                    raise RuntimeError("Jina fallback returned page without registry markers")
+    def _fetch_corsproxy(self, url: str, page: int) -> tuple[str, str]:
+        proxy_url = "https://corsproxy.io/?url=" + quote(url, safe="")
+        response = self.session.get(
+            proxy_url,
+            timeout=max(self.timeout, 45),
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor)",
+                "Accept": "text/html,text/plain,*/*",
+            },
+        )
+        response.raise_for_status()
+        return response.text or "", proxy_url
 
-                print(f"    JINA_FALLBACK_OK page={page}")
-                return text, jina_url
-
-            except Exception as exc:
-                last_error = exc
-
-                print(
-                    f"    WARN: Jina fallback page {page} failed on attempt "
-                    f"{attempt}/{self.max_retries}: {exc}"
-                )
-
-                if attempt < self.max_retries:
-                    sleep_for = self.retry_base_sleep_seconds
-                    print(f"    sleep {sleep_for:.1f}s")
-                    time.sleep(sleep_for)
-
-        raise last_error or RuntimeError(f"Jina fallback page {page} failed")
+    def _fetch_jina(self, url: str, page: int) -> tuple[str, str]:
+        jina_url = "https://r.jina.ai/" + url
+        response = self.session.get(
+            jina_url,
+            timeout=max(self.timeout, 45),
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor)",
+                "Accept": "text/plain,text/markdown,*/*",
+            },
+        )
+        response.raise_for_status()
+        return response.text or "", jina_url
 
     @staticmethod
     def parse_page_list(value: str | None) -> list[int] | None:
@@ -429,6 +459,19 @@ class EqazynaScraper:
             time.sleep(self.polite_delay_seconds)
 
         return results
+
+
+def _looks_like_registry_page(value: str) -> bool:
+    text = value or ""
+    markers = (
+        "Реестр заявок",
+        "Дата создания",
+        "Номер документа",
+        "ИИН/БИН заявителя",
+        "Тип документа",
+        "Статус заявки",
+    )
+    return any(marker in text for marker in markers)
 
 
 def make_soup(html: str) -> BeautifulSoup:
