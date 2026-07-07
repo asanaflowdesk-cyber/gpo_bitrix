@@ -285,6 +285,7 @@ def choose_historical_target(
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Full historical audit/repair of all existing Bitrix deals by director package")
     parser.add_argument("--source-responsible-ids", default="36,44")
+    parser.add_argument("--protected-owner-ids", default="54", help="Owners that must never be moved away from, comma-separated")
     parser.add_argument("--deal-category-id", default="all")
     parser.add_argument("--target-policy", default="historical_first", help="Compatibility argument. Historical-first is always used.")
     parser.add_argument("--max-deals", type=int, default=0, help="0 = no limit")
@@ -292,6 +293,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--mismatch-out", default="exports/director_package_owner_mismatches.csv")
     parser.add_argument("--unresolved-out", default="exports/director_package_owner_unresolved_deals.csv")
     parser.add_argument("--out", default="exports/director_package_owner_actions.csv")
+    parser.add_argument("--protected-out", default="exports/director_package_owner_protected_skipped.csv")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--repair", action="store_true")
     parser.add_argument("--only-eqazyna", action="store_true")
@@ -300,6 +302,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     bx = Bitrix(BITRIX_WEBHOOK_URL)
     source_ids = parse_csv_set(args.source_responsible_ids)
+    protected_owner_ids = parse_csv_set(args.protected_owner_ids)
     manual_index: Dict[str, str] = {}  # manual_directors.yml is not used by historical repair
     deals = get_deals(bx, args.deal_category_id, args.only_eqazyna, args.include_closed_deals, args.max_deals)
 
@@ -337,6 +340,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary_rows: List[Dict[str, Any]] = []
     mismatch_rows: List[Dict[str, Any]] = []
     action_rows: List[Dict[str, Any]] = []
+    protected_rows: List[Dict[str, Any]] = []
     updated_contacts = updated_companies = updated_deals = error_count = 0
 
     for director_key, package in sorted(packages.items()):
@@ -381,6 +385,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         def record_action(entity_type: str, entity_id: str, title: str, current_owner: str, url_hint: str, extra: Dict[str, Any]) -> None:
             nonlocal updated_contacts, updated_companies, updated_deals, error_count
             if not target_id or not current_owner or current_owner == target_id:
+                return
+            if current_owner in protected_owner_ids:
+                protected_rows.append({
+                    "action": "protected_owner_skipped",
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "entity_title": title,
+                    "current_owner_id": current_owner,
+                    "current_owner_name": bx.get_user_name(current_owner),
+                    "target_owner_id": target_id,
+                    "target_owner_name": target_name,
+                    "reason": "current_owner_is_protected",
+                    "historical_entity_type": evidence.get("historical_entity_type", ""),
+                    "historical_entity_id": evidence.get("historical_entity_id", ""),
+                    "historical_entity_date": evidence.get("historical_entity_date", ""),
+                    "url_hint": url_hint,
+                    **extra,
+                })
                 return
             base = {
                 "director_key": director_key,
@@ -472,7 +494,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     csv_write(args.summary_out, summary_rows, summary_fields)
     csv_write(args.mismatch_out, mismatch_rows, mismatch_fields)
     csv_write(args.unresolved_out, unresolved_rows, unresolved_fields)
+    protected_fields = [
+        "action", "entity_type", "entity_id", "entity_title", "current_owner_id", "current_owner_name",
+        "target_owner_id", "target_owner_name", "reason", "historical_entity_type", "historical_entity_id",
+        "historical_entity_date", "company_id", "deal_id", "stage_id", "closed", "url_hint",
+    ]
+
     csv_write(args.out, action_rows, action_fields)
+    csv_write(args.protected_out, protected_rows, protected_fields)
 
     print("HISTORICAL_DIRECTOR_PACKAGE_OWNER_AUDIT_DONE")
     print(json.dumps({
@@ -482,6 +511,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "summary_rows": len(summary_rows),
         "mismatch_rows": len(mismatch_rows),
         "action_rows": len(action_rows),
+        "protected_skipped_rows": len(protected_rows),
         "dry_run": bool(args.dry_run),
         "repair": bool(args.repair),
         "updated_contacts": updated_contacts,
