@@ -7,21 +7,24 @@ on:
   workflow_dispatch:
     inputs:
       source_user_id:
-        description: "ID менеджера, у которого забираем весь связанный пакет"
+        description: "ID менеджеров, у которых забираем пакет. Можно один ID или список через запятую: 70,110,116"
         required: true
         default: ""
+
       target_user_id:
-        description: "ID пользователя Bitrix, которому передаём весь пакет"
+        description: "ID менеджера/менеджеров, кому передаём. Один ID для всех или список по парам: 54 или 54,72,86"
         required: true
         default: ""
+
       dry_run:
-        description: "Режим: сначала true, после проверки false"
+        description: "Режим: сначала true для проверки, после проверки false для реального переноса"
         required: true
         type: choice
-        default: "False"
+        default: "true"
         options:
           - "true"
           - "false"
+
       max_entities:
         description: "Стоп-лимит на компании + контакты + сделки. Защита от случайного захвата всей CRM"
         required: true
@@ -39,7 +42,7 @@ jobs:
     env:
       BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
       BITRIX_PORTAL_URL: ${{ vars.BITRIX_PORTAL_URL || 'https://b24-izmquv.bitrix24.kz' }}
-      REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
+      REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '30' }}
       PYTHONUNBUFFERED: "1"
       PYTHONFAULTHANDLER: "1"
 
@@ -61,17 +64,53 @@ jobs:
           pip install -r requirements.txt
 
       - name: Validate repository
-        run: python scripts/validate_repo.py
+        run: |
+          python scripts/validate_repo.py
+          python -m eqazyna_bitrix.reassign_crm_owner --help >/dev/null
 
       - name: Reassign complete CRM package
         run: |
+          set -euo pipefail
           mkdir -p exports
+
+          SOURCE_USER_ID="${{ inputs.source_user_id }}"
+          TARGET_USER_ID="${{ inputs.target_user_id }}"
+          DRY_RUN="${{ inputs.dry_run }}"
+          MAX_ENTITIES="${{ inputs.max_entities }}"
+
+          if [ -z "$SOURCE_USER_ID" ]; then
+            echo "ERROR: source_user_id is empty" >&2
+            exit 1
+          fi
+
+          if [ -z "$TARGET_USER_ID" ]; then
+            echo "ERROR: target_user_id is empty" >&2
+            exit 1
+          fi
+
+          if [ "$DRY_RUN" != "true" ] && [ "$DRY_RUN" != "false" ]; then
+            echo "ERROR: dry_run must be true or false" >&2
+            exit 1
+          fi
+
+          if [ -z "${BITRIX_WEBHOOK_URL:-}" ]; then
+            echo "ERROR: BITRIX_WEBHOOK_URL secret is empty" >&2
+            exit 1
+          fi
+
+          echo "SOURCE_USER_ID=$SOURCE_USER_ID"
+          echo "TARGET_USER_ID=$TARGET_USER_ID"
+          echo "DRY_RUN=$DRY_RUN"
+          echo "MAX_ENTITIES=$MAX_ENTITIES"
+          echo "REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30}"
+
           python -u -m eqazyna_bitrix.reassign_crm_owner \
-            --source-user-id "${{ inputs.source_user_id }}" \
-            --target-user-id "${{ inputs.target_user_id }}" \
-            --dry-run "${{ inputs.dry_run }}" \
-            --max-entities "${{ inputs.max_entities }}" \
+            --source-user-id "$SOURCE_USER_ID" \
+            --target-user-id "$TARGET_USER_ID" \
+            --dry-run "$DRY_RUN" \
+            --max-entities "$MAX_ENTITIES" \
             --out "exports/reassign_crm_owner_log.csv"
+
           ls -lah exports
 
       - name: Upload reassignment log
