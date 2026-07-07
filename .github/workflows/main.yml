@@ -6,71 +6,87 @@ on:
       pages:
         description: "Сколько свежих страниц e-Qazyna проверить"
         required: true
-        default: "3"
+        default: "2"
+
       page_start:
         description: "С какой страницы начать"
         required: true
         default: "1"
+
       page_list:
         description: "Конкретные страницы, например 16,22,31-35. Обычно пусто."
         required: false
         default: ""
+
       doc_type:
         description: "Тип документа"
         required: true
         default: "Заявка на разведку ТПИ"
+
       statuses:
         description: "Статусы через запятую"
         required: true
         default: "Отправлено на рассмотрение,Принято"
+
       min_created_date:
         description: "Минимальная дата создания, YYYY-MM-DD. Обычно пусто."
         required: false
         default: ""
+
       push_bitrix:
         description: "true = записывать результат в Bitrix"
         required: true
         default: "true"
+
       dry_run:
         description: "true = тест без записи, false = запись в Bitrix"
         required: true
         default: "false"
+
       no_egov:
         description: "true = отключить eGov-обогащение"
         required: true
         default: "false"
+
       deal_category_id:
         description: "ID воронки сделки"
         required: true
         default: "0"
+
       deal_stage_id:
         description: "Стадия сделки"
         required: true
         default: "NEW"
+
       assignment_limit_per_manager:
         description: "Мягкий лимит сделок на менеджера для новых руководителей"
         required: true
         default: "30"
+
       assignment_load_stage_ids:
-        description: "STAGE_ID, которые входят в лимит. По рабочей логике: NEW,EXECUTING = Новая + В работе"
+        description: "STAGE_ID, которые входят в лимит"
         required: true
         default: "NEW,EXECUTING"
+
       inherit_failed_deals_by_director:
         description: "true = новая сделка наследует провальную финальную стадию и причину по тому же руководителю"
         required: true
         default: "true"
+
       failed_deal_stage_ids:
-        description: "STAGE_ID провальных стадий через запятую. Обычно LOSE"
+        description: "STAGE_ID провальных стадий через запятую"
         required: true
         default: "LOSE"
+
       failed_deal_reason_fields:
-        description: "Поля причины провала через запятую. Для текущей воронки: UF_CRM_1779448756033"
+        description: "Поля причины провала через запятую"
         required: true
         default: "UF_CRM_1779448756033"
+
       max_consecutive_page_errors:
         description: "Сколько подряд ошибок страниц допускаем перед остановкой"
         required: true
-        default: "5"
+        default: "1"
 
 concurrency:
   group: eqazyna-to-bitrix
@@ -85,19 +101,25 @@ env:
 jobs:
   eqazyna-to-bitrix:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
+
     env:
       EGOV_API_KEY: ${{ secrets.EGOV_API_KEY }}
       BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+
       BITRIX_ASSIGNED_BY_ID: ${{ vars.BITRIX_ASSIGNED_BY_ID }}
       BITRIX_REQUISITE_PRESET_ID: ${{ vars.BITRIX_REQUISITE_PRESET_ID }}
       BITRIX_REQUISITE_BIN_FIELD: ${{ vars.BITRIX_REQUISITE_BIN_FIELD || 'RQ_BIN' }}
+
       EGOV_ALLOWED_OKED_PREFIXES: ${{ vars.EGOV_ALLOWED_OKED_PREFIXES || '05,07,08,09' }}
       EGOV_MIN_NAME_MATCH: ${{ vars.EGOV_MIN_NAME_MATCH || '75' }}
       EGOV_RESULT_SIZE: ${{ vars.EGOV_RESULT_SIZE || '20' }}
-      REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '60' }}
-      EQAZYNA_POLITE_DELAY_SECONDS: ${{ vars.EQAZYNA_POLITE_DELAY_SECONDS || '1.2' }}
-      EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS: ${{ vars.EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS || '5' }}
+
+      REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT || '30' }}
+      EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '10' }}
+      EQAZYNA_POLITE_DELAY_SECONDS: ${{ vars.EQAZYNA_POLITE_DELAY_SECONDS || '0.2' }}
+      EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS: ${{ vars.EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS || '1' }}
+
       BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER: ${{ vars.BITRIX_ASSIGNMENT_LIMIT_PER_MANAGER || '30' }}
       BITRIX_ASSIGNMENT_LOAD_STAGE_IDS: ${{ vars.BITRIX_ASSIGNMENT_LOAD_STAGE_IDS || 'NEW,EXECUTING' }}
       BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR: ${{ vars.BITRIX_INHERIT_FAILED_DEALS_BY_DIRECTOR || 'true' }}
@@ -128,29 +150,34 @@ jobs:
           set -euo pipefail
           mkdir -p exports
 
-          PAGES="${{ inputs.pages }}"
-          PAGE_START="${{ inputs.page_start }}"
-          PAGE_LIST="${{ inputs.page_list }}"
-          DOC_TYPE="${{ inputs.doc_type }}"
-          STATUSES="${{ inputs.statuses }}"
-          MIN_CREATED_DATE="${{ inputs.min_created_date }}"
-          PUSH_BITRIX="${{ inputs.push_bitrix }}"
-          DRY_RUN="${{ inputs.dry_run }}"
-          NO_EGOV="${{ inputs.no_egov }}"
-          DEAL_CATEGORY_ID="${{ inputs.deal_category_id }}"
-          DEAL_STAGE_ID="${{ inputs.deal_stage_id }}"
-          ASSIGNMENT_LIMIT_PER_MANAGER="${{ inputs.assignment_limit_per_manager }}"
-          ASSIGNMENT_LOAD_STAGE_IDS="${{ inputs.assignment_load_stage_ids }}"
-          INHERIT_FAILED_DEALS_BY_DIRECTOR="${{ inputs.inherit_failed_deals_by_director }}"
-          FAILED_DEAL_STAGE_IDS="${{ inputs.failed_deal_stage_ids }}"
-          FAILED_DEAL_REASON_FIELDS="${{ inputs.failed_deal_reason_fields }}"
-          MAX_CONSECUTIVE_PAGE_ERRORS="${{ inputs.max_consecutive_page_errors }}"
+          PAGES="${{ github.event.inputs.pages || '2' }}"
+          PAGE_START="${{ github.event.inputs.page_start || '1' }}"
+          PAGE_LIST="${{ github.event.inputs.page_list || '' }}"
+          DOC_TYPE="${{ github.event.inputs.doc_type || 'Заявка на разведку ТПИ' }}"
+          STATUSES="${{ github.event.inputs.statuses || 'Отправлено на рассмотрение,Принято' }}"
+          MIN_CREATED_DATE="${{ github.event.inputs.min_created_date || '' }}"
+          PUSH_BITRIX="${{ github.event.inputs.push_bitrix || 'true' }}"
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          NO_EGOV="${{ github.event.inputs.no_egov || 'false' }}"
+          DEAL_CATEGORY_ID="${{ github.event.inputs.deal_category_id || '0' }}"
+          DEAL_STAGE_ID="${{ github.event.inputs.deal_stage_id || 'NEW' }}"
+          ASSIGNMENT_LIMIT_PER_MANAGER="${{ github.event.inputs.assignment_limit_per_manager || '30' }}"
+          ASSIGNMENT_LOAD_STAGE_IDS="${{ github.event.inputs.assignment_load_stage_ids || 'NEW,EXECUTING' }}"
+          INHERIT_FAILED_DEALS_BY_DIRECTOR="${{ github.event.inputs.inherit_failed_deals_by_director || 'true' }}"
+          FAILED_DEAL_STAGE_IDS="${{ github.event.inputs.failed_deal_stage_ids || 'LOSE' }}"
+          FAILED_DEAL_REASON_FIELDS="${{ github.event.inputs.failed_deal_reason_fields || 'UF_CRM_1779448756033' }}"
+          MAX_CONSECUTIVE_PAGE_ERRORS="${{ github.event.inputs.max_consecutive_page_errors || '1' }}"
+
+          if [ -z "$MAX_CONSECUTIVE_PAGE_ERRORS" ]; then
+            MAX_CONSECUTIVE_PAGE_ERRORS="${EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS:-1}"
+          fi
 
           if [ "$PUSH_BITRIX" = "true" ] && [ "$DRY_RUN" != "true" ] && [ -z "${BITRIX_WEBHOOK_URL:-}" ]; then
             echo "ERROR: BITRIX_WEBHOOK_URL secret is empty. Cannot write to Bitrix." >&2
             exit 1
           fi
 
+          echo "RUNNER=ubuntu-latest"
           echo "PAGES=$PAGES PAGE_START=$PAGE_START PAGE_LIST=$PAGE_LIST"
           echo "PUSH_BITRIX=$PUSH_BITRIX DRY_RUN=$DRY_RUN NO_EGOV=$NO_EGOV"
           echo "CRM_MODE=deal"
@@ -160,6 +187,10 @@ jobs:
           echo "INHERIT_FAILED_DEALS_BY_DIRECTOR=$INHERIT_FAILED_DEALS_BY_DIRECTOR"
           echo "FAILED_DEAL_STAGE_IDS=$FAILED_DEAL_STAGE_IDS"
           echo "FAILED_DEAL_REASON_FIELDS=$FAILED_DEAL_REASON_FIELDS"
+          echo "REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30}"
+          echo "EQAZYNA_REQUEST_TIMEOUT=${EQAZYNA_REQUEST_TIMEOUT:-10}"
+          echo "EQAZYNA_POLITE_DELAY_SECONDS=${EQAZYNA_POLITE_DELAY_SECONDS:-0.2}"
+          echo "MAX_CONSECUTIVE_PAGE_ERRORS=$MAX_CONSECUTIVE_PAGE_ERRORS"
 
           ARGS=(
             python -m eqazyna_bitrix.main
@@ -180,27 +211,113 @@ jobs:
             --json-out "exports/eqazyna_bitrix_log.json"
           )
 
-          if [ -n "$PAGE_LIST" ]; then ARGS+=(--page-list "$PAGE_LIST"); fi
-          if [ -n "$MIN_CREATED_DATE" ]; then ARGS+=(--min-created-date "$MIN_CREATED_DATE"); fi
-          if [ "$PUSH_BITRIX" = "true" ]; then ARGS+=(--push-bitrix); fi
-          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
-          if [ "$NO_EGOV" = "true" ]; then ARGS+=(--no-egov); fi
+          if [ -n "$PAGE_LIST" ]; then
+            ARGS+=(--page-list "$PAGE_LIST")
+          fi
+
+          if [ -n "$MIN_CREATED_DATE" ]; then
+            ARGS+=(--min-created-date "$MIN_CREATED_DATE")
+          fi
+
+          if [ "$PUSH_BITRIX" = "true" ]; then
+            ARGS+=(--push-bitrix)
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+
+          if [ "$NO_EGOV" = "true" ]; then
+            ARGS+=(--no-egov)
+          fi
 
           "${ARGS[@]}"
 
           python - <<'PY'
           import json
           from pathlib import Path
-          p = Path('exports/eqazyna_bitrix_log.json')
-          if p.exists():
-              data = json.loads(p.read_text(encoding='utf-8'))
-              rows = data if isinstance(data, list) else data.get('results', [])
-              errors = [r for r in rows if r.get('error') or str(r.get('action', '')).lower() == 'error']
-              print(f"JSON_SUMMARY rows={len(rows)} errors={len(errors)}")
-              for row in errors[:10]:
-                  print('ERROR_ROW', row)
+
+          failed = []
+
+          pages_path = Path("exports/eqazyna_bitrix_log_pages.json")
+          result_path = Path("exports/eqazyna_bitrix_log.json")
+          marker_path = Path("exports/WORKFLOW_FAILED.txt")
+
+          if marker_path.exists():
+              marker_path.unlink()
+
+          if not pages_path.exists():
+              failed.append("exports/eqazyna_bitrix_log_pages.json was not created")
+          else:
+              try:
+                  pages_data = json.loads(pages_path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  failed.append(f"Cannot read pages json: {exc}")
+                  pages_data = []
+
+              if isinstance(pages_data, dict):
+                  pages = (
+                      pages_data.get("pages")
+                      or pages_data.get("page_logs")
+                      or pages_data.get("results")
+                      or []
+                  )
+              elif isinstance(pages_data, list):
+                  pages = pages_data
+              else:
+                  pages = []
+
+              if not pages:
+                  failed.append("No page logs found")
+
+              for page in pages:
+                  if not isinstance(page, dict):
+                      continue
+
+                  status = str(page.get("status", "")).lower()
+                  page_no = page.get("page", "?")
+                  error = page.get("error", "")
+
+                  if status in {"failed", "empty"}:
+                      failed.append(f"e-Qazyna page {page_no} status={status}; error={error}")
+
+          if not result_path.exists():
+              failed.append("exports/eqazyna_bitrix_log.json was not created")
+          else:
+              try:
+                  result_data = json.loads(result_path.read_text(encoding="utf-8"))
+                  rows = result_data if isinstance(result_data, list) else result_data.get("results", [])
+                  row_errors = [
+                      r for r in rows
+                      if isinstance(r, dict)
+                      and (r.get("error") or str(r.get("action", "")).lower() == "error")
+                  ]
+
+                  print(f"JSON_SUMMARY rows={len(rows)} errors={len(row_errors)}")
+
+                  for row in row_errors[:10]:
+                      print("ERROR_ROW", row)
+
+                  if row_errors:
+                      failed.append(f"Bitrix/eGov processing errors: {len(row_errors)}")
+
+              except Exception as exc:
+                  failed.append(f"Cannot read result json: {exc}")
+
+          if failed:
+              text = "WORKFLOW_FAILED:\n" + "\n".join(f" - {x}" for x in failed) + "\n"
+              print(text)
+              marker_path.write_text(text, encoding="utf-8")
+          else:
+              print("WORKFLOW_OK")
           PY
+
           ls -lah exports
+
+          if [ -f exports/WORKFLOW_FAILED.txt ]; then
+            cat exports/WORKFLOW_FAILED.txt
+            exit 1
+          fi
 
       - name: Upload run logs
         if: always()
@@ -210,5 +327,6 @@ jobs:
           path: |
             exports/*.xlsx
             exports/*.json
+            exports/*.txt
           if-no-files-found: ignore
           retention-days: 14
