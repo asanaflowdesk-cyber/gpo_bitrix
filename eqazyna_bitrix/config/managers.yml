@@ -23,7 +23,7 @@ managers:
   #- id: 110    name: Казрахметова Алия    branch_id: 32    branch: Павлодарский филиал    active: true
 
   # Актауский филиал   
-  #- id: 116    name: Zhanadil Nyssanov    branch_id: 34    branch: Актауский филиал    active: true
+  - id: 116    name: Zhanadil Nyssanov    branch_id: 34    branch: Актауский филиал    active: true
   
   # Центральный Столичный филиал  
   #- id: 92    name: Владислав Тян    branch_id: 22    branch: Центральный Столичный филиал    active: true  
@@ -40,26 +40,6 @@ managers:
   #- id: 90     name: Асхат Шамар    branch_id: 28    branch: Атырауский филиал    active: true
 
   # Талдыкорган
-  - id: 100
-    name: Аралбаев Руслан
-    branch_id: 18
-    branch: Талдыкорган
-    active: true
-  - id: 98
-    name: Исаев Саги
-    branch_id: 18
-    branch: Талдыкорган
-    active: true
-  - id: 72
-    name: Исаев Асет
-    branch_id: 18
-    branch: Талдыкорган
-    active: true
-  - id: 102
-    name: Куандык Ринат
-    branch_id: 18
-    branch: Талдыкорган
-    active: true
   - id: 74
     name: Крижевский Андрей
     branch_id: 18
@@ -75,29 +55,12 @@ managers:
     branch_id: 18
     branch: Талдыкорган
     active: true
-  - id: 80
-    name: Чернышов Роман
-    branch_id: 18
-    branch: Талдыкорган
-    active: true
-  - id: 84
-    name: Петухов Владимир
-    branch_id: 18
-    branch: Талдыкорган
-    active: true
-  - id: 86
-    name: Толекбергенов Еркебулан
-    branch_id: 18
-    branch: Талдыкорган
-    active: true
-  - id: 88
-    name: Имангали Жумак
-    branch_id: 18
-    branch: Талдыкорган
-    active: true
-  - id: 106
-    name: Алина Курбанова
-    branch_id: 18
-    branch: Талдыкорган
-    active: true
-
+  #- id: 80    name: Чернышов Роман    branch_id: 18    branch: Талдыкорган    active: true
+  #- id: 84    name: Петухов Владимир    branch_id: 18    branch: Талдыкорган    active: true
+  #- id: 86    name: Толекбергенов Еркебулан    branch_id: 18    branch: Талдыкорган    active: true
+ # - id: 88    name: Имангали Жумак    branch_id: 18    branch: Талдыкорган    active: true
+ # - id: 106    name: Алина Курбанова    branch_id: 18    branch: Талдыкорган    active: true
+  #- id: 100    name: Аралбаев Руслан    branch_id: 18    branch: Талдыкорган    active: true
+  #- id: 98    name: Исаев Саги    branch_id: 18    branch: Талдыкорган    active: true
+ # - id: 72    name: Исаев Асет    branch_id: 18    branch: Талдыкорган    active: true
+#  - id: 102    name: Куандык Ринат    branch_id: 18    branch: Талдыкорган    active: true
