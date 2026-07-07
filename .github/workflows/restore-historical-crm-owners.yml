@@ -1,7 +1,7 @@
 name: Restore historical CRM owners
 
 run-name: >-
-  Restore historical owners / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }} / category=${{ inputs.deal_category_id }}
+  Restore historical owners / ${{ inputs.dry_run == 'true' && 'dry-run' || 'write' }} / category=${{ inputs.deal_category_id }} / protected=${{ inputs.protected_owner_ids }}
 
 on:
   workflow_dispatch:
@@ -33,6 +33,11 @@ on:
         description: "Технические пользователи, которые не считаются историческими менеджерами"
         required: true
         default: "36,44"
+
+      protected_owner_ids:
+        description: "Исключения: владельцы, с которых ничего не переносим. 54 оставить как есть"
+        required: true
+        default: "54"
 
       max_deals:
         description: "Лимит сделок для проверки. 0 = без лимита"
@@ -94,6 +99,7 @@ jobs:
           REPAIR="${{ inputs.repair }}"
           DEAL_CATEGORY_ID="${{ inputs.deal_category_id }}"
           SOURCE_RESPONSIBLE_IDS="${{ inputs.source_responsible_ids }}"
+          PROTECTED_OWNER_IDS="${{ inputs.protected_owner_ids }}"
           MAX_DEALS="${{ inputs.max_deals }}"
           INCLUDE_CLOSED_DEALS="${{ inputs.include_closed_deals }}"
 
@@ -121,6 +127,7 @@ jobs:
           echo "REPAIR=$REPAIR"
           echo "DEAL_CATEGORY_ID=$DEAL_CATEGORY_ID"
           echo "SOURCE_RESPONSIBLE_IDS=$SOURCE_RESPONSIBLE_IDS"
+          echo "PROTECTED_OWNER_IDS=$PROTECTED_OWNER_IDS"
           echo "MAX_DEALS=$MAX_DEALS"
           echo "INCLUDE_CLOSED_DEALS=$INCLUDE_CLOSED_DEALS"
           echo "REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30}"
@@ -130,10 +137,12 @@ jobs:
             --only-eqazyna
             --deal-category-id "$DEAL_CATEGORY_ID"
             --source-responsible-ids "$SOURCE_RESPONSIBLE_IDS"
+            --protected-owner-ids "$PROTECTED_OWNER_IDS"
             --max-deals "$MAX_DEALS"
             --summary-out "exports/historical_owner_summary.csv"
             --mismatch-out "exports/historical_owner_mismatches.csv"
             --unresolved-out "exports/historical_owner_unresolved_deals.csv"
+            --protected-out "exports/historical_owner_protected_skipped.csv"
             --out "exports/historical_owner_actions.csv"
           )
 
