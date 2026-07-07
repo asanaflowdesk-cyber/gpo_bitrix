@@ -14,6 +14,8 @@ technical_users:
     name: Sachyova Alyona
   - id: 96
     name: Сотрудник Тестовый
+
+managers:
  # Талдыкорган
   - id: 74
     name: Крижевский Андрей
@@ -39,7 +41,6 @@ technical_users:
   # - { id: 86, name: "Толекбергенов Еркебулан", branch_id: 18, branch: "Талдыкорган", active: true }
   # - { id: 88, name: "Имангали Жумак", branch_id: 18, branch: "Талдыкорган", active: true }
   # - { id: 106, name: "Алина Курбанова", branch_id: 18, branch: "Талдыкорган", active: true }
-managers:
   # Усть-Каменогорский филиал и отделение УК
   - id: 70    
     name: Ольга Скребцова    
