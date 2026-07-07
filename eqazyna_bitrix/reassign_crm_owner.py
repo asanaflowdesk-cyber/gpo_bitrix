@@ -1,12 +1,14 @@
-"""One-time Bitrix CRM owner reassignment tool.
+"""Manual Bitrix CRM package reassignment.
 
-Moves CRM entities from one responsible user to another with a dry-run first.
-Intended for rare staff handover cases: companies/contacts/leads, optionally deals.
-
-This version supports safe manual slices:
-- limit / max-total to move only a selected amount;
-- deal stage filter for deals and for company/contact selection by related deal stage;
-- lead status filter for leads.
+Main production mode:
+- source_user_id accepts one ID or comma-separated IDs;
+- target_user_id accepts one ID for all sources, or the same number of comma-separated IDs;
+- moves the CRM package: deals + related companies/contacts + source-owned standalone companies/contacts;
+- deal title gets a leading ❗ marker without duplication;
+- deal stage is reset to NEW / C{CATEGORY_ID}:NEW;
+- lost/failure reason field is cleared;
+- timeline comments are added to updated CRM cards;
+- dry-run writes the same CSV plan without changing Bitrix.
 """
 from __future__ import annotations
 
@@ -16,16 +18,17 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
 
 
 TRUE_VALUES = {"1", "true", "yes", "y", "да", "д", "on"}
 FALSE_VALUES = {"0", "false", "no", "n", "нет", "н", "off"}
-ALL_VALUES = {"", "all", "*", "все", "любой", "любая"}
 NONE_VALUES = {"", "none", "нет", "no", "0", "-"}
+ALL_VALUES = {"", "all", "*", "все", "любой", "любая"}
 DEFAULT_FAILURE_REASON_FIELD = "UF_CRM_1779448756033"
+DEAL_MARKER = "❗"
 
 CLOSE_REASON_OPTIONS: Dict[str, str] = {
     "400": "Дубль сделки",
@@ -44,30 +47,43 @@ CLOSE_REASON_OPTIONS: Dict[str, str] = {
 @dataclass(frozen=True)
 class EntitySpec:
     key: str
+    bitrix_type: str
     title: str
     list_method: str
     update_method: str
     get_method: str
-    id_field: str = "ID"
-    title_fields: Tuple[str, ...] = ("TITLE", "NAME")
-    select_fields: Tuple[str, ...] = (
-        "ID", "TITLE", "NAME", "LAST_NAME", "SECOND_NAME", "ASSIGNED_BY_ID",
-        "COMPANY_ID", "CONTACT_ID", "CATEGORY_ID", "STAGE_ID", "CLOSED",
-    )
+    title_fields: Tuple[str, ...]
+    select_fields: Tuple[str, ...]
 
 
 ENTITY_SPECS: Dict[str, EntitySpec] = {
+    "deals": EntitySpec(
+        key="deals",
+        bitrix_type="deal",
+        title="Deals",
+        list_method="crm.deal.list",
+        update_method="crm.deal.update",
+        get_method="crm.deal.get",
+        title_fields=("TITLE",),
+        select_fields=(
+            "ID", "TITLE", "ASSIGNED_BY_ID", "CATEGORY_ID", "STAGE_ID", "STAGE_SEMANTIC_ID",
+            "CLOSED", "COMPANY_ID", "CONTACT_ID", "ORIGINATOR_ID", "ORIGIN_ID", "DATE_CREATE", "DATE_MODIFY",
+            DEFAULT_FAILURE_REASON_FIELD,
+        ),
+    ),
     "companies": EntitySpec(
         key="companies",
+        bitrix_type="company",
         title="Companies",
         list_method="crm.company.list",
         update_method="crm.company.update",
         get_method="crm.company.get",
         title_fields=("TITLE",),
-        select_fields=("ID", "TITLE", "ASSIGNED_BY_ID", "DATE_CREATE", "DATE_MODIFY"),
+        select_fields=("ID", "TITLE", "ASSIGNED_BY_ID", "ORIGINATOR_ID", "ORIGIN_ID", "DATE_CREATE", "DATE_MODIFY"),
     ),
     "contacts": EntitySpec(
         key="contacts",
+        bitrix_type="contact",
         title="Contacts",
         list_method="crm.contact.list",
         update_method="crm.contact.update",
@@ -77,23 +93,19 @@ ENTITY_SPECS: Dict[str, EntitySpec] = {
     ),
     "leads": EntitySpec(
         key="leads",
+        bitrix_type="lead",
         title="Leads",
         list_method="crm.lead.list",
         update_method="crm.lead.update",
         get_method="crm.lead.get",
         title_fields=("TITLE",),
-        select_fields=("ID", "TITLE", "ASSIGNED_BY_ID", "STATUS_ID", "STATUS_SEMANTIC_ID", "COMPANY_ID", "CONTACT_ID", "DATE_CREATE", "DATE_MODIFY"),
-    ),
-    "deals": EntitySpec(
-        key="deals",
-        title="Deals",
-        list_method="crm.deal.list",
-        update_method="crm.deal.update",
-        get_method="crm.deal.get",
-        title_fields=("TITLE",),
-        select_fields=("ID", "TITLE", "ASSIGNED_BY_ID", "CATEGORY_ID", "STAGE_ID", "STAGE_SEMANTIC_ID", "CLOSED", "COMPANY_ID", "CONTACT_ID", "DATE_CREATE", "DATE_MODIFY"),
+        select_fields=("ID", "TITLE", "ASSIGNED_BY_ID", "STATUS_ID", "COMPANY_ID", "CONTACT_ID", "DATE_CREATE", "DATE_MODIFY"),
     ),
 }
+
+
+class BitrixError(RuntimeError):
+    pass
 
 
 def parse_bool(value: Any, *, default: bool = False) -> bool:
@@ -106,6 +118,8 @@ def parse_bool(value: Any, *, default: bool = False) -> bool:
         return True
     if s in FALSE_VALUES:
         return False
+    if s == "":
+        return default
     raise ValueError(f"Invalid boolean value: {value!r}")
 
 
@@ -134,6 +148,38 @@ def parse_csv_values(value: Any) -> List[str]:
     return parts
 
 
+def parse_id_list(value: Any, field_name: str) -> List[int]:
+    values = parse_csv_values(value)
+    if not values:
+        raise ValueError(f"{field_name} is empty")
+    ids: List[int] = []
+    for raw in values:
+        try:
+            parsed = int(str(raw).strip())
+        except Exception as exc:
+            raise ValueError(f"Invalid {field_name} value: {raw!r}") from exc
+        if parsed <= 0:
+            raise ValueError(f"Invalid {field_name} value: {raw!r}")
+        ids.append(parsed)
+    return ids
+
+
+def build_reassign_pairs(source_user_id: Any, target_user_id: Any) -> List[Tuple[int, int]]:
+    sources = parse_id_list(source_user_id, "source_user_id")
+    targets = parse_id_list(target_user_id, "target_user_id")
+
+    if len(targets) == 1:
+        return [(source, targets[0]) for source in sources]
+
+    if len(sources) != len(targets):
+        raise ValueError(
+            "source_user_id and target_user_id must have the same number of IDs, "
+            "or target_user_id must contain one ID for all sources"
+        )
+
+    return list(zip(sources, targets))
+
+
 def parse_close_reason_id(value: Any) -> str:
     """Return normalized Bitrix close-reason enum ID or an empty string."""
     if value is None:
@@ -141,7 +187,6 @@ def parse_close_reason_id(value: Any) -> str:
     raw = str(value).strip()
     if raw.lower() in NONE_VALUES:
         return ""
-    # Supports both plain values ("394") and UI-friendly strings ("394 - Клиент отказался").
     reason_id = raw.split("-", 1)[0].strip()
     if reason_id not in CLOSE_REASON_OPTIONS:
         allowed = ", ".join(f"{k}={v}" for k, v in CLOSE_REASON_OPTIONS.items())
@@ -153,18 +198,57 @@ def close_reason_name(reason_id: str) -> str:
     return CLOSE_REASON_OPTIONS.get(str(reason_id).strip(), "")
 
 
-def add_multi_filter(params: List[Tuple[str, Any]], field: str, values: Sequence[str]) -> None:
-    if not values:
-        return
-    if len(values) == 1:
-        params.append((f"filter[{field}]", values[0]))
-        return
+def unique_keep_order(values: Iterable[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
     for value in values:
-        params.append((f"filter[{field}][]", value))
+        value = str(value or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def entity_title(spec: EntitySpec, item: Dict[str, Any]) -> str:
+    for field in spec.title_fields:
+        value = item.get(field)
+        if value:
+            return str(value).strip()
+    if spec.key == "contacts":
+        return " ".join(str(item.get(k) or "").strip() for k in ("LAST_NAME", "NAME", "SECOND_NAME") if item.get(k)).strip()
+    return ""
+
+
+def target_stage_for_deal(deal: Dict[str, Any]) -> str:
+    category_id = str(deal.get("CATEGORY_ID") or "0").strip()
+    if category_id in {"", "0"}:
+        return "NEW"
+    return f"C{category_id}:NEW"
+
+
+def marked_deal_title(title: str) -> str:
+    title = str(title or "").strip()
+    if title.startswith(DEAL_MARKER):
+        return title
+    return f"{DEAL_MARKER} {title}" if title else DEAL_MARKER
+
+
+def crm_url_hint(entity_type: str, entity_id: str, portal_base_url: str) -> str:
+    portal = (portal_base_url or "").rstrip("/")
+    if not portal or not entity_id:
+        return ""
+    mapping = {
+        "deals": "deal",
+        "companies": "company",
+        "contacts": "contact",
+        "leads": "lead",
+    }
+    part = mapping.get(entity_type, entity_type)
+    return f"{portal}/crm/{part}/details/{entity_id}/"
 
 
 class BitrixClient:
-    def __init__(self, webhook_url: str, timeout: int = 60, sleep_seconds: float = 0.15) -> None:
+    def __init__(self, webhook_url: str, timeout: int = 30, sleep_seconds: float = 0.05) -> None:
         if not webhook_url:
             raise ValueError("BITRIX_WEBHOOK_URL is empty")
         self.base_url = webhook_url.rstrip("/") + "/"
@@ -173,23 +257,17 @@ class BitrixClient:
         self.session = requests.Session()
 
     def call_full(self, method: str, params: Optional[Sequence[Tuple[str, Any]]] = None) -> Dict[str, Any]:
-        """Call Bitrix and return the full payload, including top-level pagination.
-
-        Bitrix list methods normally return `result` as a list and `next` on the
-        top level. Returning only `result` silently drops pages after the first 50
-        records, so admin reassignment must use the full payload for list calls.
-        """
         url = self.base_url + method + ".json"
         response = self.session.post(url, data=list(params or []), timeout=self.timeout)
         if self.sleep_seconds:
             time.sleep(self.sleep_seconds)
         try:
             payload = response.json()
-        except Exception:
+        except Exception as exc:
             response.raise_for_status()
-            raise RuntimeError(f"Bitrix returned non-JSON response for {method}: {response.text[:500]}")
+            raise BitrixError(f"Bitrix returned non-JSON response for {method}: {response.text[:500]}") from exc
         if response.status_code >= 400 or "error" in payload:
-            raise RuntimeError(f"Bitrix API error in {method}: status={response.status_code}, payload={payload}")
+            raise BitrixError(f"Bitrix API error in {method}: status={response.status_code}, payload={payload}")
         return payload
 
     def call(self, method: str, params: Optional[Sequence[Tuple[str, Any]]] = None) -> Any:
@@ -218,625 +296,492 @@ class BitrixClient:
             start = next_start
         return rows
 
-    def list_entities(
-        self,
-        spec: EntitySpec,
-        source_user_id: int,
-        *,
-        include_closed_deals: bool = False,
-        deal_category_id: str = "all",
-        deal_stage_ids: Sequence[str] = (),
-        lead_status_ids: Sequence[str] = (),
-        limit: int = 0,
-    ) -> List[Dict[str, Any]]:
+    def list_by_owner(self, spec: EntitySpec, owner_id: int, *, limit: int = 0) -> List[Dict[str, Any]]:
         params: List[Tuple[str, Any]] = [
             ("order[ID]", "ASC"),
-            ("filter[ASSIGNED_BY_ID]", str(source_user_id)),
+            ("filter[ASSIGNED_BY_ID]", str(owner_id)),
         ]
-        if spec.key == "deals":
-            if deal_category_id and str(deal_category_id).lower() not in ALL_VALUES:
-                params.append(("filter[CATEGORY_ID]", str(deal_category_id)))
-            add_multi_filter(params, "STAGE_ID", deal_stage_ids)
-        if spec.key == "leads":
-            add_multi_filter(params, "STATUS_ID", lead_status_ids)
         for field in spec.select_fields:
             params.append(("select[]", field))
-        rows = self._paged_list(spec.list_method, params, limit=0)
-        filtered: List[Dict[str, Any]] = []
-        for row in rows:
-            if spec.key == "deals" and not include_closed_deals and str(row.get("CLOSED", "")).upper() == "Y":
-                continue
-            filtered.append(row)
-            if limit and len(filtered) >= limit:
-                return filtered
-        return filtered
+        return self._paged_list(spec.list_method, params, limit=limit)
 
-    def related_deals_exist(
-        self,
-        *,
-        source_user_id: int,
-        company_id: Optional[str] = None,
-        contact_id: Optional[str] = None,
-        deal_category_id: str = "all",
-        deal_stage_ids: Sequence[str] = (),
-        include_closed_deals: bool = False,
-    ) -> bool:
-        params: List[Tuple[str, Any]] = [
-            ("order[ID]", "ASC"),
-            ("filter[ASSIGNED_BY_ID]", str(source_user_id)),
-        ]
-        if company_id:
-            params.append(("filter[COMPANY_ID]", str(company_id)))
-        if contact_id:
-            params.append(("filter[CONTACT_ID]", str(contact_id)))
-        if deal_category_id and str(deal_category_id).lower() not in ALL_VALUES:
-            params.append(("filter[CATEGORY_ID]", str(deal_category_id)))
-        add_multi_filter(params, "STAGE_ID", deal_stage_ids)
-        for field in ("ID", "STAGE_ID", "CLOSED", "CATEGORY_ID"):
-            params.append(("select[]", field))
-        rows = self._paged_list("crm.deal.list", params, limit=10)
-        for row in rows:
-            if not include_closed_deals and str(row.get("CLOSED", "")).upper() == "Y":
-                continue
-            return True
-        return False
-
-    def update_owner(self, spec: EntitySpec, entity_id: str, target_user_id: int, extra_fields: Optional[Dict[str, Any]] = None) -> Any:
-        params = [("id", str(entity_id)), ("fields[ASSIGNED_BY_ID]", str(target_user_id))]
-        for field_name, value in (extra_fields or {}).items():
-            params.append((f"fields[{field_name}]", value))
-        return self.call(spec.update_method, params)
-
-    def get_entity(self, spec: EntitySpec, entity_id: Any) -> Dict[str, Any]:
+    def get_entity(self, spec: EntitySpec, entity_id: str) -> Dict[str, Any]:
         result = self.call(spec.get_method, [("id", str(entity_id))])
         return dict(result or {})
+
+    def update_entity(self, spec: EntitySpec, entity_id: str, fields: Dict[str, Any]) -> Any:
+        params: List[Tuple[str, Any]] = [("id", str(entity_id))]
+        for key, value in fields.items():
+            params.append((f"fields[{key}]", value))
+        params.append(("params[REGISTER_SONET_EVENT]", "Y"))
+        return self.call(spec.update_method, params)
+
+    def add_timeline_comment(self, spec: EntitySpec, entity_id: str, comment: str) -> str:
+        result = self.call(
+            "crm.timeline.comment.add",
+            [
+                ("fields[ENTITY_ID]", str(entity_id)),
+                ("fields[ENTITY_TYPE]", spec.bitrix_type),
+                ("fields[COMMENT]", comment),
+            ],
+        )
+        return str(result or "")
 
     def get_user_name(self, user_id: int) -> str:
         try:
             result = self.call("user.get", [("ID", str(user_id))])
-            row = result[0] if isinstance(result, list) and result else result if isinstance(result, dict) else {}
-            parts = [row.get("LAST_NAME"), row.get("NAME"), row.get("SECOND_NAME")]
-            name = " ".join(str(x).strip() for x in parts if x and str(x).strip())
-            return name or str(user_id)
+            if isinstance(result, list) and result:
+                user = result[0]
+                parts = [user.get("LAST_NAME"), user.get("NAME"), user.get("SECOND_NAME")]
+                name = " ".join(str(part).strip() for part in parts if part).strip()
+                return name or str(user.get("LOGIN") or user_id)
         except Exception:
-            return str(user_id)
+            pass
+        return str(user_id)
 
 
-def entity_title(spec: EntitySpec, row: Dict[str, Any]) -> str:
-    if spec.key == "contacts":
-        parts = [row.get("LAST_NAME"), row.get("NAME"), row.get("SECOND_NAME")]
-        name = " ".join(str(x).strip() for x in parts if x and str(x).strip())
-        if name:
-            return name
-    for field in spec.title_fields:
-        value = row.get(field)
-        if value:
-            return str(value)
-    return f"{spec.key}:{row.get('ID')}"
+def collect_package_for_source(
+    *,
+    client: BitrixClient,
+    source_user_id: int,
+    include_leads: bool,
+    max_entities: int,
+) -> Dict[str, List[Dict[str, Any]]]:
+    deal_spec = ENTITY_SPECS["deals"]
+    company_spec = ENTITY_SPECS["companies"]
+    contact_spec = ENTITY_SPECS["contacts"]
+    lead_spec = ENTITY_SPECS["leads"]
 
+    deals = client.list_by_owner(deal_spec, source_user_id, limit=0)
+    source_companies = client.list_by_owner(company_spec, source_user_id, limit=0)
+    source_contacts = client.list_by_owner(contact_spec, source_user_id, limit=0)
+    leads = client.list_by_owner(lead_spec, source_user_id, limit=0) if include_leads else []
 
-def crm_url_hint(entity_type: str, entity_id: Any, portal_base_url: str = "") -> str:
-    portal = portal_base_url.rstrip("/") if portal_base_url else ""
-    paths = {
-        "companies": f"/crm/company/details/{entity_id}/",
-        "contacts": f"/crm/contact/details/{entity_id}/",
-        "leads": f"/crm/lead/details/{entity_id}/",
-        "deals": f"/crm/deal/details/{entity_id}/",
+    company_ids = unique_keep_order([str(deal.get("COMPANY_ID") or "") for deal in deals])
+    contact_ids = unique_keep_order([str(deal.get("CONTACT_ID") or "") for deal in deals])
+
+    companies_by_id: Dict[str, Dict[str, Any]] = {str(row.get("ID")): row for row in source_companies if row.get("ID")}
+    contacts_by_id: Dict[str, Dict[str, Any]] = {str(row.get("ID")): row for row in source_contacts if row.get("ID")}
+
+    for company_id in company_ids:
+        if company_id not in companies_by_id:
+            try:
+                companies_by_id[company_id] = client.get_entity(company_spec, company_id)
+            except Exception as exc:
+                companies_by_id[company_id] = {"ID": company_id, "_load_error": str(exc)}
+
+    for contact_id in contact_ids:
+        if contact_id not in contacts_by_id:
+            try:
+                contacts_by_id[contact_id] = client.get_entity(contact_spec, contact_id)
+            except Exception as exc:
+                contacts_by_id[contact_id] = {"ID": contact_id, "_load_error": str(exc)}
+
+    package = {
+        "deals": deals,
+        "companies": list(companies_by_id.values()),
+        "contacts": list(contacts_by_id.values()),
+        "leads": leads,
     }
-    path = paths.get(entity_type, "")
-    return (portal + path) if portal else path
+
+    total = sum(len(values) for values in package.values())
+    if max_entities and total > max_entities:
+        raise RuntimeError(
+            f"Stop-limit exceeded for source_user_id={source_user_id}: selected entities={total}, max_entities={max_entities}"
+        )
+
+    return package
 
 
-def selected_entities(args: argparse.Namespace) -> List[str]:
-    keys: List[str] = []
-    if parse_bool(args.include_companies, default=True):
-        keys.append("companies")
-    if parse_bool(args.include_contacts, default=True):
-        keys.append("contacts")
-    if parse_bool(args.include_leads, default=False):
-        keys.append("leads")
-    if parse_bool(args.include_deals, default=False):
-        keys.append("deals")
-    return keys
+def build_comment(
+    *,
+    base_comment: str,
+    source_user_id: int,
+    source_user_name: str,
+    target_user_id: int,
+    target_user_name: str,
+    entity_type: str,
+    entity_id: str,
+    dry_run: bool,
+    deal_stage_reset: str = "",
+    deal_title_marked: bool = False,
+    failure_reason_cleared: bool = False,
+) -> str:
+    lines = [
+        "Служебная отметка о перераспределении.",
+        "",
+        base_comment.strip() or "Административное перераспределение пакета ответственному.",
+        f"Ответственный изменён: {source_user_name} (ID {source_user_id}) → {target_user_name} (ID {target_user_id}).",
+        f"CRM-объект: {entity_type} #{entity_id}.",
+    ]
+    if deal_stage_reset:
+        lines.append(f"Стадия сделки сброшена в: {deal_stage_reset}.")
+    if deal_title_marked:
+        lines.append("В название сделки добавлена метка ❗.")
+    if failure_reason_cleared:
+        lines.append(f"Очищена причина проигрыша: {DEFAULT_FAILURE_REASON_FIELD}.")
+    if dry_run:
+        lines.append("Режим: dry-run, изменения не записаны.")
+    else:
+        lines.append("Режим: write, изменения записаны.")
+    return "\n".join(lines)
+
+
+def make_base_row(
+    *,
+    spec: EntitySpec,
+    item: Dict[str, Any],
+    source_user_id: int,
+    source_user_name: str,
+    target_user_id: int,
+    target_user_name: str,
+    dry_run: bool,
+    portal_base_url: str,
+) -> Dict[str, Any]:
+    entity_id = str(item.get("ID") or "")
+    return {
+        "entity_type": spec.key,
+        "entity_id": entity_id,
+        "entity_title_before": entity_title(spec, item),
+        "entity_title_after": "",
+        "source_user_id": source_user_id,
+        "source_user_name": source_user_name,
+        "target_user_id": target_user_id,
+        "target_user_name": target_user_name,
+        "dry_run": str(dry_run).lower(),
+        "before_owner_id": str(item.get("ASSIGNED_BY_ID") or ""),
+        "verified_owner_id": "",
+        "owner_verified": "",
+        "stage_before": str(item.get("STAGE_ID") or ""),
+        "stage_after": "",
+        "stage_verified": "",
+        "title_marked": "",
+        "failure_reason_cleared": "",
+        "timeline_comment_id": "",
+        "timeline_comment_status": "",
+        "action": "",
+        "error": "",
+        "company_id": str(item.get("COMPANY_ID") or ""),
+        "contact_id": str(item.get("CONTACT_ID") or ""),
+        "category_id": str(item.get("CATEGORY_ID") or ""),
+        "closed": str(item.get("CLOSED") or ""),
+        "originator_id": str(item.get("ORIGINATOR_ID") or ""),
+        "origin_id": str(item.get("ORIGIN_ID") or ""),
+        "crm_url_hint": crm_url_hint(spec.key, entity_id, portal_base_url),
+    }
+
+
+def update_one_entity(
+    *,
+    client: BitrixClient,
+    spec: EntitySpec,
+    item: Dict[str, Any],
+    source_user_id: int,
+    source_user_name: str,
+    target_user_id: int,
+    target_user_name: str,
+    dry_run: bool,
+    portal_base_url: str,
+    base_comment: str,
+    add_timeline_comment: bool,
+    mark_deal_title: bool,
+    reset_deal_stage: bool,
+    clear_failure_reason: bool,
+) -> Dict[str, Any]:
+    row = make_base_row(
+        spec=spec,
+        item=item,
+        source_user_id=source_user_id,
+        source_user_name=source_user_name,
+        target_user_id=target_user_id,
+        target_user_name=target_user_name,
+        dry_run=dry_run,
+        portal_base_url=portal_base_url,
+    )
+
+    entity_id = str(item.get("ID") or "").strip()
+    if not entity_id:
+        row.update({"action": "skip_no_id", "error": "Entity ID is empty"})
+        return row
+
+    if item.get("_load_error"):
+        row.update({"action": "load_error", "error": str(item.get("_load_error"))})
+        return row
+
+    before_owner_id = str(item.get("ASSIGNED_BY_ID") or "").strip()
+    if before_owner_id == str(target_user_id):
+        row.update({"action": "skip_already_target_owner", "verified_owner_id": before_owner_id, "owner_verified": "true"})
+        return row
+
+    if before_owner_id and before_owner_id != str(source_user_id):
+        row.update({"action": "skip_not_source_owner", "error": f"ASSIGNED_BY_ID={before_owner_id}"})
+        return row
+
+    fields: Dict[str, Any] = {"ASSIGNED_BY_ID": str(target_user_id)}
+    comment_stage_reset = ""
+    comment_title_marked = False
+    comment_failure_cleared = False
+
+    if spec.key == "deals":
+        if mark_deal_title:
+            new_title = marked_deal_title(str(item.get("TITLE") or ""))
+            fields["TITLE"] = new_title
+            row["entity_title_after"] = new_title
+            row["title_marked"] = "true" if new_title != str(item.get("TITLE") or "") else "already_marked"
+            comment_title_marked = True
+        if reset_deal_stage:
+            target_stage = target_stage_for_deal(item)
+            fields["STAGE_ID"] = target_stage
+            row["stage_after"] = target_stage
+            comment_stage_reset = target_stage
+        if clear_failure_reason:
+            fields[DEFAULT_FAILURE_REASON_FIELD] = ""
+            row["failure_reason_cleared"] = "true"
+            comment_failure_cleared = True
+
+    if dry_run:
+        row["action"] = "dry_run_update"
+        return row
+
+    try:
+        client.update_entity(spec, entity_id, fields)
+        row["action"] = "updated"
+    except Exception as exc:
+        row.update({"action": "update_error", "error": str(exc)})
+        return row
+
+    try:
+        verified = client.get_entity(spec, entity_id)
+        verified_owner = str(verified.get("ASSIGNED_BY_ID") or "")
+        row["verified_owner_id"] = verified_owner
+        row["owner_verified"] = "true" if verified_owner == str(target_user_id) else "false"
+        if spec.key == "deals":
+            verified_stage = str(verified.get("STAGE_ID") or "")
+            row["stage_verified"] = "true" if not reset_deal_stage or verified_stage == row["stage_after"] else "false"
+            row["entity_title_after"] = str(verified.get("TITLE") or row["entity_title_after"] or "")
+        if row.get("owner_verified") == "false" or row.get("stage_verified") == "false":
+            row["action"] = "updated_but_verify_failed"
+            row["error"] = f"verified_owner_id={verified_owner}; verified_stage={verified.get('STAGE_ID', '')}"
+    except Exception as exc:
+        row["action"] = "updated_but_verify_error"
+        row["error"] = str(exc)
+
+    if add_timeline_comment:
+        comment = build_comment(
+            base_comment=base_comment,
+            source_user_id=source_user_id,
+            source_user_name=source_user_name,
+            target_user_id=target_user_id,
+            target_user_name=target_user_name,
+            entity_type=spec.key,
+            entity_id=entity_id,
+            dry_run=dry_run,
+            deal_stage_reset=comment_stage_reset,
+            deal_title_marked=comment_title_marked,
+            failure_reason_cleared=comment_failure_cleared,
+        )
+        try:
+            comment_id = client.add_timeline_comment(spec, entity_id, comment)
+            row["timeline_comment_id"] = comment_id
+            row["timeline_comment_status"] = "added" if comment_id else "empty_result"
+        except Exception as exc:
+            row["timeline_comment_status"] = "error"
+            row["error"] = (str(row.get("error") or "") + f"; timeline_comment_error={exc}").strip("; ")
+            if row["action"] == "updated":
+                row["action"] = "updated_but_comment_error"
+
+    return row
 
 
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
-        "entity_type", "entity_id", "entity_title", "source_user_id", "source_user_name",
-        "target_user_id", "target_user_name", "action", "dry_run", "error",
-        "filter_deal_stage_ids", "filter_lead_status_ids", "max_total", "company_id",
-        "contact_id", "category_id", "stage_id", "target_stage_id", "failure_reason_field", "failure_reason_text", "failure_reason_id", "failure_reason_name", "failure_reason_value_written", "status_id", "closed", "selection_mode", "crm_url_hint",
+        "entity_type",
+        "entity_id",
+        "entity_title_before",
+        "entity_title_after",
+        "source_user_id",
+        "source_user_name",
+        "target_user_id",
+        "target_user_name",
+        "dry_run",
+        "before_owner_id",
+        "verified_owner_id",
+        "owner_verified",
+        "stage_before",
+        "stage_after",
+        "stage_verified",
+        "title_marked",
+        "failure_reason_cleared",
+        "timeline_comment_id",
+        "timeline_comment_status",
+        "action",
+        "error",
+        "company_id",
+        "contact_id",
+        "category_id",
+        "closed",
+        "originator_id",
+        "origin_id",
+        "crm_url_hint",
     ]
-    with path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            writer.writerow({key: row.get(key, "") for key in fields})
 
 
-def should_skip_by_related_deal_stage(
-    *,
-    client: BitrixClient,
-    spec: EntitySpec,
-    item: Dict[str, Any],
-    source_user_id: int,
-    filter_company_contact_by_deal_stage: bool,
-    deal_stage_ids: Sequence[str],
-    deal_category_id: str,
-    include_closed_deals: bool,
-) -> Tuple[bool, str]:
-    if not filter_company_contact_by_deal_stage or not deal_stage_ids:
-        return False, ""
-    if spec.key == "companies":
-        company_id = str(item.get("ID") or "").strip()
-        if not company_id:
-            return True, "skip_no_company_id"
-        ok = client.related_deals_exist(
-            source_user_id=source_user_id, company_id=company_id,
-            deal_category_id=deal_category_id, deal_stage_ids=deal_stage_ids,
-            include_closed_deals=include_closed_deals,
-        )
-        return (not ok), "skip_no_related_deal_in_stage" if not ok else ""
-    if spec.key == "contacts":
-        contact_id = str(item.get("ID") or "").strip()
-        if not contact_id:
-            return True, "skip_no_contact_id"
-        ok = client.related_deals_exist(
-            source_user_id=source_user_id, contact_id=contact_id,
-            deal_category_id=deal_category_id, deal_stage_ids=deal_stage_ids,
-            include_closed_deals=include_closed_deals,
-        )
-        return (not ok), "skip_no_related_deal_in_stage" if not ok else ""
-    return False, ""
-
-
-def base_log_row(
-    *,
-    key: str,
-    spec: EntitySpec,
-    item: Dict[str, Any],
-    source_user_id: int,
-    source_user_name: str,
-    target_user_id: int,
-    target_user_name: str,
-    dry_run: bool,
-    deal_stage_ids: Sequence[str],
-    lead_status_ids: Sequence[str],
-    max_total: int,
-    portal_base_url: str,
-    selection_mode: str,
-    target_stage_id: str = "",
-    failure_reason_field: str = "",
-    failure_reason_text: str = "",
-    failure_reason_id: str = "",
-) -> Dict[str, Any]:
-    entity_id = str(item.get("ID") or "")
-    row = {
-        "entity_type": key,
-        "entity_id": entity_id,
-        "entity_title": entity_title(spec, item),
-        "source_user_id": source_user_id,
-        "source_user_name": source_user_name,
-        "target_user_id": target_user_id,
-        "target_user_name": target_user_name,
-        "dry_run": dry_run,
-        "filter_deal_stage_ids": ",".join(deal_stage_ids),
-        "filter_lead_status_ids": ",".join(lead_status_ids),
-        "max_total": max_total,
-        "company_id": item.get("COMPANY_ID", ""),
-        "contact_id": item.get("CONTACT_ID", ""),
-        "category_id": item.get("CATEGORY_ID", ""),
-        "stage_id": item.get("STAGE_ID", ""),
-        "target_stage_id": target_stage_id,
-        "failure_reason_field": failure_reason_field,
-        "failure_reason_text": failure_reason_text,
-        "failure_reason_id": failure_reason_id,
-        "failure_reason_name": close_reason_name(failure_reason_id),
-        "failure_reason_value_written": failure_reason_id or failure_reason_text,
-        "status_id": item.get("STATUS_ID", ""),
-        "closed": item.get("CLOSED", ""),
-        "crm_url_hint": crm_url_hint(key, entity_id, portal_base_url),
+def action_is_error(action: str) -> bool:
+    return action in {
+        "load_error",
+        "update_error",
+        "updated_but_verify_failed",
+        "updated_but_verify_error",
+        "updated_but_comment_error",
     }
-    row["selection_mode"] = selection_mode
-    return row
-
-
-def update_or_log(
-    *,
-    client: BitrixClient,
-    spec: EntitySpec,
-    key: str,
-    item: Dict[str, Any],
-    source_user_id: int,
-    source_user_name: str,
-    target_user_id: int,
-    target_user_name: str,
-    dry_run: bool,
-    deal_stage_ids: Sequence[str],
-    lead_status_ids: Sequence[str],
-    max_total: int,
-    portal_base_url: str,
-    selection_mode: str,
-    rows_out: List[Dict[str, Any]],
-    require_source_owner: bool = True,
-    target_stage_id: str = "",
-    failure_reason_field: str = "",
-    failure_reason_text: str = "",
-    failure_reason_id: str = "",
-) -> Tuple[int, int]:
-    """Return (updated_count, error_count)."""
-    entity_id = str(item.get("ID") or "")
-    base = base_log_row(
-        key=key, spec=spec, item=item,
-        source_user_id=source_user_id, source_user_name=source_user_name,
-        target_user_id=target_user_id, target_user_name=target_user_name,
-        dry_run=dry_run, deal_stage_ids=deal_stage_ids, lead_status_ids=lead_status_ids,
-        max_total=max_total, portal_base_url=portal_base_url, selection_mode=selection_mode,
-        target_stage_id=target_stage_id if key == "deals" else "",
-        failure_reason_field=failure_reason_field if key == "deals" else "",
-        failure_reason_text=failure_reason_text if key == "deals" else "",
-        failure_reason_id=failure_reason_id if key == "deals" else "",
-    )
-    if not entity_id:
-        rows_out.append({**base, "action": "skip_no_id", "error": "Entity ID is empty"})
-        return 0, 1
-    owner = str(item.get("ASSIGNED_BY_ID") or "").strip()
-    if owner == str(target_user_id):
-        rows_out.append({**base, "action": "skip_already_target_owner", "error": ""})
-        return 0, 0
-    if require_source_owner and owner != str(source_user_id):
-        rows_out.append({**base, "action": "skip_not_source_owner", "error": f"ASSIGNED_BY_ID={owner}"})
-        return 0, 0
-    if dry_run:
-        rows_out.append({**base, "action": "dry_run_update", "error": ""})
-        return 0, 0
-    try:
-        extra_fields: Dict[str, Any] = {}
-        if key == "deals" and target_stage_id:
-            extra_fields["STAGE_ID"] = target_stage_id
-        failure_reason_value = failure_reason_id or failure_reason_text
-        if key == "deals" and failure_reason_field and failure_reason_value:
-            extra_fields[failure_reason_field] = failure_reason_value
-        client.update_owner(spec, entity_id, target_user_id, extra_fields=extra_fields)
-        rows_out.append({**base, "action": "updated", "error": ""})
-        return 1, 0
-    except Exception as exc:
-        rows_out.append({**base, "action": "update_error", "error": str(exc)})
-        return 0, 1
-
-
-def run_deal_package_mode(
-    *,
-    args: argparse.Namespace,
-    client: BitrixClient,
-    source_user_id: int,
-    target_user_id: int,
-    source_user_name: str,
-    target_user_name: str,
-    dry_run: bool,
-    include_closed_deals: bool,
-    deal_stage_ids: Sequence[str],
-    lead_status_ids: Sequence[str],
-    per_entity_limit: int,
-    max_total: int,
-    portal_base_url: str,
-    rows_out: List[Dict[str, Any]],
-    target_stage_id: str = "",
-    failure_reason_field: str = "",
-    failure_reason_text: str = "",
-    failure_reason_id: str = "",
-) -> Tuple[int, int, int, int]:
-    """Deal-first reassignment.
-
-    When include_deals=true, max_total means max selected deals/applications, not max CRM entities.
-    Related companies and contacts are updated after the selected deals and do not consume the deal limit.
-    """
-    selection_mode = "deal_package"
-    deal_spec = ENTITY_SPECS["deals"]
-    deal_limit = max_total or per_entity_limit or 0
-    deals = client.list_entities(
-        deal_spec,
-        source_user_id,
-        include_closed_deals=include_closed_deals,
-        deal_category_id=str(args.deal_category_id or "all"),
-        deal_stage_ids=deal_stage_ids,
-        lead_status_ids=lead_status_ids,
-        limit=deal_limit,
-    )
-
-    total_found = len(deals)
-    total_selected = len(deals)
-    total_updated = 0
-    total_errors = 0
-    company_ids: List[str] = []
-    contact_ids: List[str] = []
-
-    include_companies = parse_bool(args.include_companies, default=True)
-    include_contacts = parse_bool(args.include_contacts, default=True)
-    include_leads = parse_bool(args.include_leads, default=False)
-
-    for deal in deals:
-        cid = str(deal.get("COMPANY_ID") or "").strip()
-        tid = str(deal.get("CONTACT_ID") or "").strip()
-        if cid and cid not in company_ids:
-            company_ids.append(cid)
-        if tid and tid not in contact_ids:
-            contact_ids.append(tid)
-        upd, err = update_or_log(
-            client=client, spec=deal_spec, key="deals", item=deal,
-            source_user_id=source_user_id, source_user_name=source_user_name,
-            target_user_id=target_user_id, target_user_name=target_user_name,
-            dry_run=dry_run, deal_stage_ids=deal_stage_ids, lead_status_ids=lead_status_ids,
-            max_total=max_total, portal_base_url=portal_base_url, selection_mode=selection_mode,
-            rows_out=rows_out, require_source_owner=True,
-            target_stage_id=target_stage_id,
-            failure_reason_field=failure_reason_field,
-            failure_reason_text=failure_reason_text,
-            failure_reason_id=failure_reason_id,
-        )
-        total_updated += upd
-        total_errors += err
-
-    if include_companies:
-        spec = ENTITY_SPECS["companies"]
-        for company_id in company_ids:
-            try:
-                item = client.get_entity(spec, company_id)
-                total_found += 1
-                upd, err = update_or_log(
-                    client=client, spec=spec, key="companies", item=item,
-                    source_user_id=source_user_id, source_user_name=source_user_name,
-                    target_user_id=target_user_id, target_user_name=target_user_name,
-                    dry_run=dry_run, deal_stage_ids=deal_stage_ids, lead_status_ids=lead_status_ids,
-                    max_total=max_total, portal_base_url=portal_base_url, selection_mode=selection_mode,
-                    rows_out=rows_out, require_source_owner=True,
-                )
-                total_updated += upd
-                total_errors += err
-            except Exception as exc:
-                total_errors += 1
-                rows_out.append({
-                    "entity_type": "companies", "entity_id": company_id, "entity_title": "",
-                    "source_user_id": source_user_id, "source_user_name": source_user_name,
-                    "target_user_id": target_user_id, "target_user_name": target_user_name,
-                    "action": "get_error", "dry_run": dry_run, "error": str(exc),
-                    "filter_deal_stage_ids": ",".join(deal_stage_ids),
-                    "filter_lead_status_ids": ",".join(lead_status_ids),
-                    "max_total": max_total, "selection_mode": selection_mode,
-                    "crm_url_hint": crm_url_hint("companies", company_id, portal_base_url),
-                })
-
-    if include_contacts:
-        spec = ENTITY_SPECS["contacts"]
-        for contact_id in contact_ids:
-            try:
-                item = client.get_entity(spec, contact_id)
-                total_found += 1
-                upd, err = update_or_log(
-                    client=client, spec=spec, key="contacts", item=item,
-                    source_user_id=source_user_id, source_user_name=source_user_name,
-                    target_user_id=target_user_id, target_user_name=target_user_name,
-                    dry_run=dry_run, deal_stage_ids=deal_stage_ids, lead_status_ids=lead_status_ids,
-                    max_total=max_total, portal_base_url=portal_base_url, selection_mode=selection_mode,
-                    rows_out=rows_out, require_source_owner=True,
-                )
-                total_updated += upd
-                total_errors += err
-            except Exception as exc:
-                total_errors += 1
-                rows_out.append({
-                    "entity_type": "contacts", "entity_id": contact_id, "entity_title": "",
-                    "source_user_id": source_user_id, "source_user_name": source_user_name,
-                    "target_user_id": target_user_id, "target_user_name": target_user_name,
-                    "action": "get_error", "dry_run": dry_run, "error": str(exc),
-                    "filter_deal_stage_ids": ",".join(deal_stage_ids),
-                    "filter_lead_status_ids": ",".join(lead_status_ids),
-                    "max_total": max_total, "selection_mode": selection_mode,
-                    "crm_url_hint": crm_url_hint("contacts", contact_id, portal_base_url),
-                })
-
-    if include_leads:
-        spec = ENTITY_SPECS["leads"]
-        leads = client.list_entities(
-            spec, source_user_id,
-            include_closed_deals=include_closed_deals,
-            deal_category_id=str(args.deal_category_id or "all"),
-            deal_stage_ids=deal_stage_ids,
-            lead_status_ids=lead_status_ids,
-            limit=per_entity_limit,
-        )
-        for lead in leads:
-            total_found += 1
-            total_selected += 1
-            upd, err = update_or_log(
-                client=client, spec=spec, key="leads", item=lead,
-                source_user_id=source_user_id, source_user_name=source_user_name,
-                target_user_id=target_user_id, target_user_name=target_user_name,
-                dry_run=dry_run, deal_stage_ids=deal_stage_ids, lead_status_ids=lead_status_ids,
-                max_total=max_total, portal_base_url=portal_base_url, selection_mode=selection_mode,
-                rows_out=rows_out, require_source_owner=True,
-            )
-            total_updated += upd
-            total_errors += err
-
-    return total_found, total_selected, total_updated, total_errors
 
 
 def run(args: argparse.Namespace) -> int:
+    pairs = build_reassign_pairs(args.source_user_id, args.target_user_id)
     dry_run = parse_bool(args.dry_run, default=True)
-    source_user_id = parse_int(args.source_user_id, "source_user_id")
-    target_user_id = parse_int(args.target_user_id, "target_user_id")
-    if not source_user_id or not target_user_id:
-        raise ValueError("source_user_id and target_user_id are required")
-    if source_user_id == target_user_id:
-        raise ValueError("source_user_id and target_user_id must be different")
+    max_entities = parse_int(args.max_entities, "max_entities", default=5000) or 5000
+    include_leads = parse_bool(args.include_leads, default=False)
+    add_timeline_comment = parse_bool(args.add_timeline_comment, default=True)
+    mark_deal_title = parse_bool(args.mark_deal_title, default=True)
+    reset_deal_stage = parse_bool(args.reset_deal_stage, default=True)
+    clear_failure_reason = parse_bool(args.clear_failure_reason, default=True)
+    portal_base_url = str(args.portal_base_url or os.getenv("BITRIX_PORTAL_URL") or "")
+    timeout = parse_int(os.getenv("REQUEST_TIMEOUT", "30"), "REQUEST_TIMEOUT", default=30) or 30
 
-    per_entity_limit = parse_int(args.limit, "limit", default=0) or 0
-    max_total = parse_int(args.max_total, "max_total", default=0) or 0
-    include_closed_deals = parse_bool(args.include_closed_deals, default=False)
-    filter_company_contact_by_deal_stage = parse_bool(args.filter_company_contact_by_deal_stage, default=False)
-    deal_stage_ids = parse_csv_values(args.deal_stage_ids)
-    lead_status_ids = parse_csv_values(args.lead_status_ids)
-    include_deals = parse_bool(args.include_deals, default=False)
-    target_stage_id = str(args.target_deal_stage_id or "").strip()
-    failure_reason_id = parse_close_reason_id(getattr(args, "failure_reason_id", ""))
-    failure_reason_field = str(args.failure_reason_field or "").strip()
-    failure_reason_text = str(args.failure_reason_text or "").strip()
-    if failure_reason_id and not failure_reason_field:
-        failure_reason_field = DEFAULT_FAILURE_REASON_FIELD
-    if failure_reason_text and not failure_reason_field:
-        raise ValueError("failure_reason_field is required when failure_reason_text is provided")
-    if failure_reason_id and failure_reason_text:
-        raise ValueError("Use either failure_reason_id or failure_reason_text, not both")
-
-    portal_base_url = args.portal_base_url or os.getenv("BITRIX_PORTAL_URL", "")
-    timeout = parse_int(os.getenv("REQUEST_TIMEOUT", "60"), "REQUEST_TIMEOUT", default=60) or 60
     client = BitrixClient(os.environ.get("BITRIX_WEBHOOK_URL", ""), timeout=timeout)
+    user_name_cache: Dict[int, str] = {}
 
-    source_user_name = client.get_user_name(source_user_id)
-    target_user_name = client.get_user_name(target_user_id)
+    def user_name(user_id: int) -> str:
+        if user_id not in user_name_cache:
+            user_name_cache[user_id] = client.get_user_name(user_id)
+        return user_name_cache[user_id]
 
     rows_out: List[Dict[str, Any]] = []
+    total_errors = 0
+    total_updated = 0
+    total_selected = 0
 
-    if include_deals:
-        total_found, total_selected, total_updated, total_errors = run_deal_package_mode(
-            args=args, client=client,
-            source_user_id=source_user_id, target_user_id=target_user_id,
-            source_user_name=source_user_name, target_user_name=target_user_name,
-            dry_run=dry_run, include_closed_deals=include_closed_deals,
-            deal_stage_ids=deal_stage_ids, lead_status_ids=lead_status_ids,
-            per_entity_limit=per_entity_limit, max_total=max_total,
-            portal_base_url=portal_base_url, rows_out=rows_out,
-            target_stage_id=target_stage_id,
-            failure_reason_field=failure_reason_field,
-            failure_reason_text=failure_reason_text,
-            failure_reason_id=failure_reason_id,
+    for source_user_id, target_user_id in pairs:
+        source_user_name = user_name(source_user_id)
+        target_user_name = user_name(target_user_id)
+
+        print(f"PAIR source={source_user_id} ({source_user_name}) -> target={target_user_id} ({target_user_name})")
+
+        try:
+            package = collect_package_for_source(
+                client=client,
+                source_user_id=source_user_id,
+                include_leads=include_leads,
+                max_entities=max_entities,
+            )
+        except Exception as exc:
+            total_errors += 1
+            rows_out.append({
+                "entity_type": "package",
+                "entity_id": "",
+                "entity_title_before": "",
+                "entity_title_after": "",
+                "source_user_id": source_user_id,
+                "source_user_name": source_user_name,
+                "target_user_id": target_user_id,
+                "target_user_name": target_user_name,
+                "dry_run": str(dry_run).lower(),
+                "action": "package_collect_error",
+                "error": str(exc),
+            })
+            continue
+
+        pair_selected = sum(len(items) for items in package.values())
+        total_selected += pair_selected
+        print(
+            "PACKAGE_SELECTED "
+            f"deals={len(package['deals'])} "
+            f"companies={len(package['companies'])} "
+            f"contacts={len(package['contacts'])} "
+            f"leads={len(package['leads'])} "
+            f"total={pair_selected}"
         )
-        selection_mode = "deal_package"
-    else:
-        selection_mode = "legacy_entity_order"
-        total_found = 0
-        total_selected = 0
-        total_updated = 0
-        total_errors = 0
 
-        for key in selected_entities(args):
-            if max_total and total_selected >= max_total:
-                break
+        for key in ("deals", "companies", "contacts", "leads"):
             spec = ENTITY_SPECS[key]
-            remaining = (max_total - total_selected) if max_total else 0
-            effective_limit = per_entity_limit
-            if remaining and (not effective_limit or remaining < effective_limit):
-                effective_limit = remaining
-            fetch_limit = 0 if (spec.key in {"companies", "contacts"} and filter_company_contact_by_deal_stage and deal_stage_ids) else effective_limit
-            try:
-                items = client.list_entities(
-                    spec,
-                    source_user_id,
-                    include_closed_deals=include_closed_deals,
-                    deal_category_id=str(args.deal_category_id or "all"),
-                    deal_stage_ids=deal_stage_ids,
-                    lead_status_ids=lead_status_ids,
-                    limit=fetch_limit,
+            for item in package[key]:
+                row = update_one_entity(
+                    client=client,
+                    spec=spec,
+                    item=item,
+                    source_user_id=source_user_id,
+                    source_user_name=source_user_name,
+                    target_user_id=target_user_id,
+                    target_user_name=target_user_name,
+                    dry_run=dry_run,
+                    portal_base_url=portal_base_url,
+                    base_comment=str(args.comment or ""),
+                    add_timeline_comment=add_timeline_comment,
+                    mark_deal_title=mark_deal_title,
+                    reset_deal_stage=reset_deal_stage,
+                    clear_failure_reason=clear_failure_reason,
                 )
-            except Exception as exc:
-                total_errors += 1
-                rows_out.append({
-                    "entity_type": key, "entity_id": "", "entity_title": "",
-                    "source_user_id": source_user_id, "source_user_name": source_user_name,
-                    "target_user_id": target_user_id, "target_user_name": target_user_name,
-                    "action": "list_error", "dry_run": dry_run, "error": str(exc),
-                    "filter_deal_stage_ids": ",".join(deal_stage_ids),
-                    "filter_lead_status_ids": ",".join(lead_status_ids), "max_total": max_total,
-                    "selection_mode": selection_mode,
-                })
-                continue
-
-            for item in items:
-                if max_total and total_selected >= max_total:
-                    break
-                total_found += 1
-                skip, reason = should_skip_by_related_deal_stage(
-                    client=client, spec=spec, item=item, source_user_id=source_user_id,
-                    filter_company_contact_by_deal_stage=filter_company_contact_by_deal_stage,
-                    deal_stage_ids=deal_stage_ids, deal_category_id=str(args.deal_category_id or "all"),
-                    include_closed_deals=include_closed_deals,
-                )
-                if skip:
-                    base = base_log_row(
-                        key=key, spec=spec, item=item,
-                        source_user_id=source_user_id, source_user_name=source_user_name,
-                        target_user_id=target_user_id, target_user_name=target_user_name,
-                        dry_run=dry_run, deal_stage_ids=deal_stage_ids, lead_status_ids=lead_status_ids,
-                        max_total=max_total, portal_base_url=portal_base_url, selection_mode=selection_mode,
-                    )
-                    rows_out.append({**base, "action": reason, "error": ""})
-                    continue
-                total_selected += 1
-                upd, err = update_or_log(
-                    client=client, spec=spec, key=key, item=item,
-                    source_user_id=source_user_id, source_user_name=source_user_name,
-                    target_user_id=target_user_id, target_user_name=target_user_name,
-                    dry_run=dry_run, deal_stage_ids=deal_stage_ids, lead_status_ids=lead_status_ids,
-                    max_total=max_total, portal_base_url=portal_base_url, selection_mode=selection_mode,
-                    rows_out=rows_out, require_source_owner=True,
-                )
-                total_updated += upd
-                total_errors += err
+                rows_out.append(row)
+                if row.get("action") == "updated":
+                    total_updated += 1
+                if action_is_error(str(row.get("action") or "")):
+                    total_errors += 1
 
     out_path = Path(args.out)
     write_csv(out_path, rows_out)
 
     print("REASSIGN_CRM_OWNER_DONE")
-    print(f"source_user_id={source_user_id} source_user_name={source_user_name}")
-    print(f"target_user_id={target_user_id} target_user_name={target_user_name}")
+    print(f"pairs={';'.join(f'{s}->{t}' for s, t in pairs)}")
     print(f"dry_run={dry_run}")
-    print(f"entities={','.join(selected_entities(args))}")
-    print(f"selection_mode={selection_mode}")
-    print(f"deal_stage_ids={','.join(deal_stage_ids) or 'all'}")
-    print(f"lead_status_ids={','.join(lead_status_ids) or 'all'}")
-    print(f"filter_company_contact_by_deal_stage={filter_company_contact_by_deal_stage}")
-    print(f"target_deal_stage_id={target_stage_id or 'keep_current'}")
-    print(f"failure_reason_field={failure_reason_field or 'not_set'}")
-    print(f"failure_reason_id={failure_reason_id or 'not_set'}")
-    print(f"failure_reason_name={close_reason_name(failure_reason_id) or 'not_set'}")
-    print(f"failure_reason_text_set={bool(failure_reason_text)}")
-    print(f"limit_per_entity={per_entity_limit}")
-    print(f"max_total={max_total}")
-    if include_deals:
-        print("max_total_meaning=selected_deals")
-    else:
-        print("max_total_meaning=selected_entities")
-    print(f"found={total_found}")
+    print(f"max_entities={max_entities}")
+    print(f"add_timeline_comment={add_timeline_comment}")
+    print(f"mark_deal_title={mark_deal_title}")
+    print(f"reset_deal_stage={reset_deal_stage}")
+    print(f"clear_failure_reason={clear_failure_reason}")
     print(f"selected={total_selected}")
     print(f"updated={total_updated}")
     print(f"errors={total_errors}")
     print(f"out={out_path}")
+
     return 1 if total_errors else 0
 
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Reassign Bitrix CRM entities from one responsible user to another")
-    parser.add_argument("--source-user-id", required=True, help="Current responsible user ID")
-    parser.add_argument("--target-user-id", required=True, help="New responsible user ID")
-    parser.add_argument("--dry-run", action="store_true", help="Do not write to Bitrix")
-    parser.add_argument("--include-companies", default="true")
-    parser.add_argument("--include-contacts", default="true")
+    parser = argparse.ArgumentParser(description="Reassign complete Bitrix CRM packages from one or more users to one or more target users")
+    parser.add_argument("--source-user-id", required=True, help="One ID or comma-separated source user IDs")
+    parser.add_argument("--target-user-id", required=True, help="One target ID for all sources, or comma-separated target IDs pairwise")
+    parser.add_argument("--dry-run", default="true", help="true = no writes; false = write to Bitrix")
+    parser.add_argument("--max-entities", default="5000", help="Stop-limit per source package")
+    parser.add_argument("--comment", default="Административное перераспределение пакета ответственному.")
+    parser.add_argument("--add-timeline-comment", default="true")
+    parser.add_argument("--mark-deal-title", default="true")
+    parser.add_argument("--reset-deal-stage", default="true")
+    parser.add_argument("--clear-failure-reason", default="true")
     parser.add_argument("--include-leads", default="false")
-    parser.add_argument("--include-deals", default="false")
-    parser.add_argument("--include-closed-deals", default="false")
-    parser.add_argument("--deal-category-id", default="all")
-    parser.add_argument("--deal-stage-ids", default="all", help="Comma-separated deal STAGE_ID values; all = no deal-stage filter")
-    parser.add_argument("--lead-status-ids", default="all", help="Comma-separated lead STATUS_ID values; all = no lead-status filter")
-    parser.add_argument("--filter-company-contact-by-deal-stage", default="false", help="For companies/contacts, update only if they have related source-user deal in selected deal stages")
-    parser.add_argument("--limit", default="0", help="Max rows per entity type; 0 = no per-type limit")
-    parser.add_argument("--max-total", default="0", help="Max total rows to update across all selected entity types; 0 = unlimited")
-    parser.add_argument("--target-deal-stage-id", default="", help="Optional target STAGE_ID for selected deals. Empty = keep current stage")
-    parser.add_argument("--failure-reason-field", default="", help=f"Optional deal field for failure reason. Defaults to {DEFAULT_FAILURE_REASON_FIELD} when --failure-reason-id is used")
-    parser.add_argument("--failure-reason-id", default="", help="Optional CloseReasonID enum value for selected deals")
-    parser.add_argument("--failure-reason-text", default="", help="Optional raw value to write into failure_reason_field for selected deals")
     parser.add_argument("--portal-base-url", default="https://b24-izmquv.bitrix24.kz")
     parser.add_argument("--out", default="exports/reassign_crm_owner_log.csv")
+
+    # Compatibility with older runs. These options are accepted but not used by the new package mode.
+    parser.add_argument("--include-companies", default="true")
+    parser.add_argument("--include-contacts", default="true")
+    parser.add_argument("--include-deals", default="true")
+    parser.add_argument("--include-closed-deals", default="true")
+    parser.add_argument("--deal-category-id", default="all")
+    parser.add_argument("--deal-stage-ids", default="all")
+    parser.add_argument("--lead-status-ids", default="all")
+    parser.add_argument("--filter-company-contact-by-deal-stage", default="false")
+    parser.add_argument("--limit", default="0")
+    parser.add_argument("--max-total", default="0")
+    parser.add_argument("--target-deal-stage-id", default="")
+    parser.add_argument("--failure-reason-field", default="")
+    parser.add_argument("--failure-reason-id", default="")
+    parser.add_argument("--failure-reason-text", default="")
     return parser
 
 
