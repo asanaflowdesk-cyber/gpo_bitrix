@@ -15,7 +15,7 @@ technical_users:
   - id: 96
     name: Сотрудник Тестовый
  # Талдыкорган
-    - id: 74
+  - id: 74
     name: Крижевский Андрей
     branch_id: 18
     branch: Талдыкорган
