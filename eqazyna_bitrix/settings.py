@@ -21,8 +21,13 @@ class Settings:
     bitrix_requisite_preset_id: str | None
     bitrix_requisite_bin_field: str
     request_timeout: int = 45
-    polite_delay_seconds: float = 0.7
-    max_consecutive_page_errors: int = 5
+    eqazyna_request_timeout: int = 10
+    bitrix_request_timeout: int = 30
+    egov_request_timeout: int = 20
+    polite_delay_seconds: float = 0.2
+    bitrix_polite_delay_seconds: float = 0.05
+    egov_polite_delay_seconds: float = 0.05
+    max_consecutive_page_errors: int = 1
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -35,6 +40,11 @@ class Settings:
             bitrix_requisite_preset_id=os.getenv("BITRIX_REQUISITE_PRESET_ID") or None,
             bitrix_requisite_bin_field=os.getenv("BITRIX_REQUISITE_BIN_FIELD", "RQ_BIN"),
             request_timeout=int(os.getenv("REQUEST_TIMEOUT", "45")),
-            polite_delay_seconds=float(os.getenv("EQAZYNA_POLITE_DELAY_SECONDS", "0.7")),
-            max_consecutive_page_errors=int(os.getenv("EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS", "5")),
+            eqazyna_request_timeout=int(os.getenv("EQAZYNA_REQUEST_TIMEOUT", os.getenv("REQUEST_TIMEOUT", "10"))),
+            bitrix_request_timeout=int(os.getenv("BITRIX_REQUEST_TIMEOUT", os.getenv("REQUEST_TIMEOUT", "30"))),
+            egov_request_timeout=int(os.getenv("EGOV_REQUEST_TIMEOUT", os.getenv("REQUEST_TIMEOUT", "20"))),
+            polite_delay_seconds=float(os.getenv("EQAZYNA_POLITE_DELAY_SECONDS", "0.2")),
+            bitrix_polite_delay_seconds=float(os.getenv("BITRIX_POLITE_DELAY_SECONDS", "0.05")),
+            egov_polite_delay_seconds=float(os.getenv("EGOV_POLITE_DELAY_SECONDS", "0.05")),
+            max_consecutive_page_errors=int(os.getenv("EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS", "1")),
         )

@@ -38,7 +38,7 @@ class CandidateScore:
 class EgovClient:
     api_key: str | None
     timeout: int = 30
-    polite_delay_seconds: float = 0.3
+    polite_delay_seconds: float = 0.05
     session: requests.Session | None = None
 
     def __post_init__(self) -> None:

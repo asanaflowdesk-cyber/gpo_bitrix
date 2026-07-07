@@ -63,25 +63,27 @@ class BitrixPipeline:
         self._assignment_cache: dict[str, tuple[int, str]] = {}
         self._projected_load_delta: Counter[int] = Counter()
 
-    def process(self, app: Application, enrichment: CompanyEnrichment) -> ProcessResult:
+    def process(self, app: Application, enrichment: CompanyEnrichment, existing_deal_prechecked: bool = False) -> ProcessResult:
         if (self.config.crm_mode or "deal").lower() == "lead":
             return self.process_lead(app, enrichment)
         try:
             # Deal origin is the immutable application key. If the application was
             # already loaded earlier, the row is intentionally skipped: no company
             # update, no owner rewrite, no stage rewrite, no contact/requisite work.
-            existing_deal = self.client.find_deal_by_origin(app.application_key)
-            if existing_deal:
-                return ProcessResult(
-                    app,
-                    enrichment,
-                    action="existing_deal_skipped",
-                    company_id=str(existing_deal.get("COMPANY_ID") or "") or None,
-                    deal_id=str(existing_deal.get("ID") or "") or None,
-                    assigned_by_id=self._record_assigned_by_id(existing_deal),
-                    assigned_by_name=self._user_name(self._record_assigned_by_id(existing_deal)),
-                    assignment_reason="existing_deal_no_update",
-                )
+            if not existing_deal_prechecked:
+                existing_deal = self.client.find_deal_by_origin(app.application_key)
+                if existing_deal:
+                    assigned_by_id = self._record_assigned_by_id(existing_deal)
+                    return ProcessResult(
+                        app,
+                        enrichment,
+                        action="existing_deal_skipped",
+                        company_id=str(existing_deal.get("COMPANY_ID") or "") or None,
+                        deal_id=str(existing_deal.get("ID") or "") or None,
+                        assigned_by_id=assigned_by_id,
+                        assigned_by_name=self._user_name(assigned_by_id),
+                        assignment_reason="existing_deal_no_update",
+                    )
 
             company = self.client.find_company_by_origin(app.bin)
             if not company:
@@ -384,6 +386,22 @@ class BitrixPipeline:
             else:
                 self._eqazyna_deals_cache = self.client.list_eqazyna_deals()
         return self._eqazyna_deals_cache
+
+    def existing_deals_by_origin(self, origin_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """Fast precheck map from the already cached e-Qazyna deal history.
+
+        This avoids one crm.deal.list call per parsed row and also prevents
+        process() from checking the same ORIGIN_ID a second time.
+        """
+        wanted = {str(value or "").strip() for value in origin_ids if str(value or "").strip()}
+        if not wanted:
+            return {}
+        found: dict[str, dict[str, Any]] = {}
+        for deal in self._list_eqazyna_deals_cached():
+            origin_id = str(deal.get("ORIGIN_ID") or "").strip()
+            if origin_id in wanted and origin_id not in found:
+                found[origin_id] = deal
+        return found
 
     def _historical_sort_key(self, record: dict[str, Any]) -> tuple[datetime, int]:
         """Sort oldest CRM entities first, with ID as deterministic fallback."""

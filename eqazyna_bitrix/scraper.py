@@ -120,12 +120,12 @@ class PageLog:
 
 @dataclass(slots=True)
 class EqazynaScraper:
-    timeout: int = 30
-    polite_delay_seconds: float = 0.5
-    max_retries: int = 5
-    retry_base_sleep_seconds: float = 3.0
+    timeout: int = 10
+    polite_delay_seconds: float = 0.2
+    max_retries: int = 2
+    retry_base_sleep_seconds: float = 1.0
     continue_on_page_error: bool = True
-    max_consecutive_page_errors: int = 5
+    max_consecutive_page_errors: int = 1
     session: requests.Session | None = None
     page_logs: list[PageLog] = field(default_factory=list)
     failed_pages: list[int] = field(default_factory=list)
@@ -135,9 +135,15 @@ class EqazynaScraper:
             self.session = requests.Session()
         self.session.headers.update(
             {
-                "User-Agent": "Mozilla/5.0 (compatible; FlowDesk e-Qazyna monitor; +https://github.com/)",
-                "Accept-Language": "ru,en;q=0.8",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/143.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
                 "Connection": "close",
             }
         )
@@ -146,20 +152,21 @@ class EqazynaScraper:
         params: list[tuple[str, str]] = [
             ("oq", ""),
             ("flMineralUserXin", ""),
-            ("flDocNum", ""),
         ]
-
-        doc_type = doc_type.strip() if doc_type else None
-        if doc_type:
-            filter_doc_type = DOC_TYPE_FILTER_VALUES.get(doc_type)
-            if filter_doc_type:
-                params.append(("flDocType", filter_doc_type))
 
         for status in statuses or []:
             status = status.strip()
             filter_status = STATUS_FILTER_VALUES.get(status)
             if filter_status:
                 params.append(("flStatus", filter_status))
+
+        params.append(("flDocNum", ""))
+
+        doc_type = doc_type.strip() if doc_type else None
+        if doc_type:
+            filter_doc_type = DOC_TYPE_FILTER_VALUES.get(doc_type)
+            if filter_doc_type:
+                params.append(("flDocType", filter_doc_type))
 
         if page > 1:
             params.append(("p", str(page)))
@@ -171,17 +178,22 @@ class EqazynaScraper:
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = self.session.get(url, timeout=self.timeout)
+                response = self.session.get(url, timeout=self.timeout, allow_redirects=True)
                 response.raise_for_status()
-                return response.text, url
+                if not response.encoding:
+                    response.encoding = "utf-8"
+                html = response.text or ""
+                return html, url
             except requests.RequestException as exc:
                 last_error = exc
-                sleep_for = min(self.retry_base_sleep_seconds * attempt, 30)
                 print(
                     f"    WARN: e-Qazyna page {page} failed on attempt "
-                    f"{attempt}/{self.max_retries}: {exc}; sleep {sleep_for:.1f}s"
+                    f"{attempt}/{self.max_retries}: {exc}"
                 )
-                time.sleep(sleep_for)
+                if attempt < self.max_retries:
+                    sleep_for = self.retry_base_sleep_seconds
+                    print(f"    sleep {sleep_for:.1f}s")
+                    time.sleep(sleep_for)
         raise last_error or RuntimeError(f"e-Qazyna page {page} failed")
 
     @staticmethod

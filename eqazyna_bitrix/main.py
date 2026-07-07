@@ -5,7 +5,6 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from collections import defaultdict
 
 from .bitrix_client import BitrixClient
 from .egov_client import EgovClient
@@ -43,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--requisite-preset-id", default=os.getenv("BITRIX_REQUISITE_PRESET_ID") or None)
     parser.add_argument("--requisite-bin-field", default=os.getenv("BITRIX_REQUISITE_BIN_FIELD", "RQ_BIN"))
     parser.add_argument("--strict-page-errors", action="store_true", help="Fail the whole run if any e-Qazyna page fails")
-    parser.add_argument("--max-consecutive-page-errors", type=int, default=int(os.getenv("EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS", "5")), help="Stop scraping after N consecutive failed pages and process already collected rows. Use 0 to never stop early.")
+    parser.add_argument("--max-consecutive-page-errors", type=int, default=int(os.getenv("EQAZYNA_MAX_CONSECUTIVE_PAGE_ERRORS", "1")), help="Stop scraping after N consecutive failed pages and process already collected rows. Use 0 to never stop early.")
     return parser.parse_args()
 
 
@@ -83,9 +82,15 @@ def main() -> int:
     if args.min_created_date:
         min_created_date = datetime.strptime(args.min_created_date, "%Y-%m-%d").date()
 
-    print(f"[1/4] Scraping e-Qazyna: page_start={args.page_start}, pages={args.pages}, page_list={args.page_list!r}, max_consecutive_page_errors={args.max_consecutive_page_errors}, doc_type={args.doc_type!r}, statuses={statuses}, min_created_date={min_created_date}")
+    eqazyna_timeout = getattr(settings, "eqazyna_request_timeout", settings.request_timeout)
+    bitrix_timeout = getattr(settings, "bitrix_request_timeout", settings.request_timeout)
+    egov_timeout = getattr(settings, "egov_request_timeout", settings.request_timeout)
+    bitrix_polite_delay = getattr(settings, "bitrix_polite_delay_seconds", 0.05)
+    egov_polite_delay = getattr(settings, "egov_polite_delay_seconds", 0.05)
+
+    print(f"[1/4] Scraping e-Qazyna: page_start={args.page_start}, pages={args.pages}, page_list={args.page_list!r}, timeout={eqazyna_timeout}, max_consecutive_page_errors={args.max_consecutive_page_errors}, doc_type={args.doc_type!r}, statuses={statuses}, min_created_date={min_created_date}")
     scraper = EqazynaScraper(
-        timeout=settings.request_timeout,
+        timeout=eqazyna_timeout,
         polite_delay_seconds=settings.polite_delay_seconds,
         continue_on_page_error=not args.strict_page_errors,
         max_consecutive_page_errors=args.max_consecutive_page_errors,
@@ -102,14 +107,22 @@ def main() -> int:
     if scraper.failed_pages:
         print(f"FAILED_PAGES={','.join(map(str, scraper.failed_pages))}")
 
-    egov = EgovClient(None if args.no_egov else settings.egov_api_key, timeout=settings.request_timeout)
+    egov = EgovClient(
+        None if args.no_egov else settings.egov_api_key,
+        timeout=egov_timeout,
+        polite_delay_seconds=egov_polite_delay,
+    )
 
     bitrix_pipeline: BitrixPipeline | None = None
     if args.push_bitrix:
         if not settings.bitrix_webhook_url:
             raise SystemExit("BITRIX_WEBHOOK_URL is required when --push-bitrix is used")
         bitrix_pipeline = BitrixPipeline(
-            BitrixClient(settings.bitrix_webhook_url, timeout=settings.request_timeout),
+            BitrixClient(
+                settings.bitrix_webhook_url,
+                timeout=bitrix_timeout,
+                polite_delay_seconds=bitrix_polite_delay,
+            ),
             BitrixPipelineConfig(
                 crm_mode=args.crm_mode,
                 deal_category_id=args.deal_category_id,
@@ -131,40 +144,42 @@ def main() -> int:
     print("[2/4] Existing-deal precheck, staged eGov enrichment and Bitrix processing")
 
     existing_deal_results: dict[str, ProcessResult] = {}
+    existing_deal_precheck_ok = False
     applications_for_enrichment: list = []
     if bitrix_pipeline and (args.crm_mode or "deal").lower() == "deal":
-        for app in applications:
-            try:
-                existing_deal = bitrix_pipeline.client.find_deal_by_origin(app.application_key)
-            except Exception as exc:  # noqa: BLE001
-                existing_deal_results[app.application_key] = ProcessResult(
-                    app,
-                    CompanyEnrichment(bin=app.bin),
-                    action="existing_deal_precheck_error",
-                    error=str(exc),
-                )
-                continue
-            if existing_deal:
-                assigned_by_id = bitrix_pipeline._record_assigned_by_id(existing_deal)
-                existing_deal_results[app.application_key] = ProcessResult(
-                    app,
-                    CompanyEnrichment(
-                        bin=app.bin,
-                        match_reason="eGov skipped: Bitrix deal already exists by ORIGIN_ID/application_key",
-                    ),
-                    action="existing_deal_skipped",
-                    company_id=str(existing_deal.get("COMPANY_ID") or "") or None,
-                    deal_id=str(existing_deal.get("ID") or "") or None,
-                    assigned_by_id=assigned_by_id,
-                    assigned_by_name=bitrix_pipeline._user_name(assigned_by_id),
-                    assignment_reason="existing_deal_no_update_precheck",
-                )
-            else:
-                applications_for_enrichment.append(app)
-        print(
-            f"    existing Bitrix deals skipped before eGov: {len(existing_deal_results)}; "
-            f"applications sent to eGov: {len(applications_for_enrichment)}"
-        )
+        try:
+            existing_by_origin = bitrix_pipeline.existing_deals_by_origin(app.application_key for app in applications)
+            existing_deal_precheck_ok = True
+        except Exception as exc:  # noqa: BLE001
+            print(f"    WARN: bulk existing-deal precheck failed, fallback to row check inside pipeline: {exc}")
+            existing_by_origin = {}
+
+        if existing_deal_precheck_ok:
+            for app in applications:
+                existing_deal = existing_by_origin.get(app.application_key)
+                if existing_deal:
+                    assigned_by_id = bitrix_pipeline._record_assigned_by_id(existing_deal)
+                    existing_deal_results[app.application_key] = ProcessResult(
+                        app,
+                        CompanyEnrichment(
+                            bin=app.bin,
+                            match_reason="eGov skipped: Bitrix deal already exists by ORIGIN_ID/application_key",
+                        ),
+                        action="existing_deal_skipped",
+                        company_id=str(existing_deal.get("COMPANY_ID") or "") or None,
+                        deal_id=str(existing_deal.get("ID") or "") or None,
+                        assigned_by_id=assigned_by_id,
+                        assigned_by_name=bitrix_pipeline._user_name(assigned_by_id),
+                        assignment_reason="existing_deal_no_update_bulk_precheck",
+                    )
+                else:
+                    applications_for_enrichment.append(app)
+            print(
+                f"    existing Bitrix deals skipped before eGov: {len(existing_deal_results)}; "
+                f"applications sent to eGov: {len(applications_for_enrichment)}"
+            )
+        else:
+            applications_for_enrichment = list(applications)
     else:
         applications_for_enrichment = list(applications)
 
@@ -178,7 +193,16 @@ def main() -> int:
         else:
             enrichment = enrichment_map.get(_enrichment_key(app.bin, app.applicant_name)) or CompanyEnrichment(bin=app.bin, error="enrichment_missing")
             if bitrix_pipeline:
-                result = bitrix_pipeline.process(app, enrichment)
+                try:
+                    result = bitrix_pipeline.process(
+                        app,
+                        enrichment,
+                        existing_deal_prechecked=existing_deal_precheck_ok and (args.crm_mode or "deal").lower() == "deal",
+                    )
+                except TypeError as exc:
+                    if "existing_deal_prechecked" not in str(exc):
+                        raise
+                    result = bitrix_pipeline.process(app, enrichment)
             else:
                 result = ProcessResult(app, enrichment, action="excel_only")
         if result.error:
