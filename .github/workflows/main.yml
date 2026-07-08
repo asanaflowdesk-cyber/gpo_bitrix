@@ -6,7 +6,7 @@ on:
       pages:
         description: "Сколько свежих страниц e-Qazyna проверить"
         required: true
-        default: "2"
+        default: "1"
 
       page_start:
         description: "С какой страницы начать"
@@ -150,7 +150,7 @@ jobs:
           set -euo pipefail
           mkdir -p exports
 
-          PAGES="${{ github.event.inputs.pages || '2' }}"
+          PAGES="${{ github.event.inputs.pages || '1' }}"
           PAGE_START="${{ github.event.inputs.page_start || '1' }}"
           PAGE_LIST="${{ github.event.inputs.page_list || '' }}"
           DOC_TYPE="${{ github.event.inputs.doc_type || 'Заявка на разведку ТПИ' }}"
