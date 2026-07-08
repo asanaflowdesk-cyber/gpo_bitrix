@@ -150,9 +150,17 @@ jobs:
           set -euo pipefail
           mkdir -p exports
 
-          PAGES="${{ github.event.inputs.pages || '1' }}"
+          RAW_PAGES="${{ github.event.inputs.pages || '1' }}"
           PAGE_START="${{ github.event.inputs.page_start || '1' }}"
           PAGE_LIST="${{ github.event.inputs.page_list || '' }}"
+
+          # Auto-safe mode: regular trigger must never crawl deeper than page 1.
+          # For manual deep checks use page_list, e.g. 2-5 or 16,22,31-35.
+          PAGES="$RAW_PAGES"
+          if [ -z "$PAGE_LIST" ] && [ "$PAGES" != "1" ]; then
+            echo "WARN: PAGE_LIST is empty; forcing PAGES=1 instead of PAGES=$PAGES"
+            PAGES="1"
+          fi
           DOC_TYPE="${{ github.event.inputs.doc_type || 'Заявка на разведку ТПИ' }}"
           STATUSES="${{ github.event.inputs.statuses || 'Отправлено на рассмотрение,Принято' }}"
           MIN_CREATED_DATE="${{ github.event.inputs.min_created_date || '' }}"
