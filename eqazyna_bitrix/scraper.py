@@ -122,7 +122,7 @@ class PageLog:
 class EqazynaScraper:
     timeout: int = 10
     polite_delay_seconds: float = 0.2
-    max_retries: int = 2
+    max_retries: int = 1
     retry_base_sleep_seconds: float = 1.0
     continue_on_page_error: bool = True
     max_consecutive_page_errors: int = 1
@@ -183,6 +183,9 @@ class EqazynaScraper:
                 if not response.encoding:
                     response.encoding = "utf-8"
                 html = response.text or ""
+                if not _looks_like_registry_page(html):
+                    preview = clean_text(make_soup(html).get_text(" "))[:500]
+                    raise RuntimeError(f"page does not look like registry; preview={preview!r}")
                 return html, url
             except requests.RequestException as exc:
                 last_error = exc
@@ -313,6 +316,20 @@ class EqazynaScraper:
                 break
             time.sleep(self.polite_delay_seconds)
         return results
+
+
+def _looks_like_registry_page(value: str) -> bool:
+    text = value or ""
+    markers = (
+        "Реестр заявок",
+        "Дата создания",
+        "Номер документа",
+        "ИИН/БИН заявителя",
+        "Наименование заявителя",
+        "Тип документа",
+        "Статус заявки",
+    )
+    return any(marker in text for marker in markers)
 
 
 def make_soup(html: str) -> BeautifulSoup:
